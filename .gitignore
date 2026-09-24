@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+# local state and secrets never belong in the repo
+data/
+secrets/
+*.token
+*.seed
+*.jsonl
+.env

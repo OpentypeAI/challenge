@@ -1,0 +1,49 @@
+name: ci
+
+# Pushes to main run this through images.yml, which publishes only after it passes.
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.11.17"
+          python-version: "3.12"
+      - run: uv sync --locked --all-extras --group dev
+      - run: uv run ruff format --check
+      - run: uv run ruff check
+      - run: uv run mypy
+      - run: uv run pytest
+
+  # The supervisor canary: the server image, no secrets, tmpfs /data, must answer /version.
+  canary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: docker build --target server -t opentype-challenge:ci .
+      - name: Canary
+        run: |
+          docker run -d --name canary --read-only --user 65532:65532 --cap-drop ALL \
+            --security-opt no-new-privileges --tmpfs /tmp --tmpfs /data:uid=65532,gid=65532 \
+            -p 127.0.0.1:18000:8000 opentype-challenge:ci
+          for _ in $(seq 60); do curl -fsS http://127.0.0.1:18000/version && break; sleep 1; done
+          curl -fsS http://127.0.0.1:18000/version | jq -e '.slug == "opentype" and .contract == 1'
+          [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18000/health)" = 503 ]
+          docker inspect opentype-challenge:ci --format '{{json .Config.Labels}}' \
+            | jq -e '."io.cortex.challenge.slug" == "opentype" and ."io.cortex.challenge.contract" == "1"'
+      - if: always()
+        run: docker logs canary || true
