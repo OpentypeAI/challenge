@@ -1,33 +1,42 @@
-"""SQLite state: windows, submissions, duel jobs, results, champions, ledger and epochs."""
+"""SQLite state: windows and their banks, submissions, duel jobs, results, judgments,
+champions, ledger and epochs (docs/tracks.md §8, §11)."""
 
 from __future__ import annotations
 
 import json
+import random
 import secrets
 import sqlite3
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from . import bank, ledger, pins, scoring
+from . import bank, harness, ledger, paint, pins, scoring, tracks
 from .crypto import manifest_digest
 from .generator import Case
+from .tracks import TrackPlan
 
 LEASE_SECONDS = 1800  # renewed by every answers batch
 MAX_ATTEMPTS = 3  # infrastructure retries of one job before the submission fails
 DEFAULT_LADDER = {"order": [1, 2, 3, 4, 5, 6, 7, 8], "width": 2}
+DEFAULT_DUEL_CASES = 40_000
+PAGE_BYTES = 6 * 1024 * 1024  # case and bank pages stay under this much JSON
+CASE_CACHE_BYTES = 128 * 1024 * 1024
+BANK_CACHE = 4  # parsed banks kept in memory (one per window)
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS windows (
   id INTEGER PRIMARY KEY, secret BLOB NOT NULL, commitment TEXT NOT NULL,
-  opened_at INTEGER NOT NULL, closed_at INTEGER);
+  opened_at INTEGER NOT NULL, closed_at INTEGER, bank TEXT NOT NULL DEFAULT '[]',
+  bank_digest TEXT NOT NULL DEFAULT '{EMPTY_DIGEST}');
 CREATE TABLE IF NOT EXISTS nonces (
   nonce TEXT PRIMARY KEY, hotkey TEXT NOT NULL, exp INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS submissions (
@@ -47,13 +56,21 @@ CREATE TABLE IF NOT EXISTS jobs (
   window_id INTEGER NOT NULL, seed TEXT NOT NULL, mix TEXT NOT NULL, retired TEXT NOT NULL,
   cases INTEGER NOT NULL, state TEXT NOT NULL, lease TEXT, lease_expires INTEGER,
   attempts INTEGER NOT NULL DEFAULT 0, stopped INTEGER NOT NULL DEFAULT 0, verdict TEXT,
-  evidence TEXT, reason TEXT, created_at INTEGER NOT NULL, finished_at INTEGER);
+  evidence TEXT, reason TEXT, created_at INTEGER NOT NULL, finished_at INTEGER,
+  plan TEXT NOT NULL DEFAULT '', beacon TEXT, beacon_fetched INTEGER NOT NULL DEFAULT 0,
+  judge INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs (state);
 CREATE TABLE IF NOT EXISTS results (
   job_id TEXT NOT NULL, case_index INTEGER NOT NULL, side TEXT NOT NULL, level INTEGER NOT NULL,
   loss REAL NOT NULL, decisions INTEGER NOT NULL, determined INTEGER NOT NULL,
   correct INTEGER NOT NULL, under_loss REAL NOT NULL, under INTEGER NOT NULL,
+  track TEXT NOT NULL DEFAULT 'decisions',
   PRIMARY KEY (job_id, case_index, side)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS judgments (
+  job_id TEXT NOT NULL, case_index INTEGER NOT NULL, side TEXT NOT NULL,
+  track TEXT NOT NULL, level INTEGER NOT NULL, seed INTEGER NOT NULL, png BLOB NOT NULL,
+  brief TEXT NOT NULL, rubric TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', loss REAL,
+  PRIMARY KEY (job_id, case_index, side));
 CREATE TABLE IF NOT EXISTS entitlements (
   id INTEGER PRIMARY KEY, hotkey TEXT NOT NULL, champion_id INTEGER NOT NULL,
   window_id INTEGER NOT NULL, amount INTEGER NOT NULL, paid INTEGER NOT NULL DEFAULT 0,
@@ -62,7 +79,26 @@ CREATE TABLE IF NOT EXISTS epochs (epoch INTEGER PRIMARY KEY, body TEXT NOT NULL
 CREATE TABLE IF NOT EXISTS payments (
   epoch INTEGER NOT NULL, entitlement_id INTEGER NOT NULL, amount INTEGER NOT NULL,
   PRIMARY KEY (epoch, entitlement_id));
+""".replace("{EMPTY_DIGEST}", bank.EMPTY_BANK.digest)
+
+# v1 -> v2 in place: v1 has these tables without the new columns (user_version 0).
+MIGRATE_V1 = f"""
+BEGIN;
+ALTER TABLE windows ADD COLUMN bank TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE windows ADD COLUMN bank_digest TEXT NOT NULL DEFAULT '{bank.EMPTY_BANK.digest}';
+ALTER TABLE jobs ADD COLUMN plan TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN beacon TEXT;
+ALTER TABLE jobs ADD COLUMN beacon_fetched INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN judge INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE results ADD COLUMN track TEXT NOT NULL DEFAULT 'decisions';
+PRAGMA user_version={SCHEMA_VERSION};
+COMMIT;
 """
+RESULT_COLUMNS = (
+    "job_id, case_index, side, level, loss, decisions, determined, correct, under_loss, under, "
+    "track"
+)
+WINDOW_COLUMNS = "id, secret, commitment, opened_at, closed_at, bank_digest"
 
 
 class StoreError(Exception):
@@ -73,9 +109,18 @@ class StoreError(Exception):
 
 @dataclass(frozen=True)
 class Settings:
-    duel_cases: int = 40_000
+    duel_cases: int = DEFAULT_DUEL_CASES
     max_pending: int = 4
     window_cap: float | None = None
+    plan: Mapping[str, TrackPlan] | None = None
+
+    def track_plan(self) -> Mapping[str, TrackPlan]:
+        """The configured plan; v1's duel_cases gives a decisions-only plan (tests)."""
+        if self.plan is not None:
+            return self.plan
+        if self.duel_cases != DEFAULT_DUEL_CASES:
+            return {"decisions": TrackPlan(1.0, self.duel_cases)}
+        return tracks.DEFAULT_PLAN
 
 
 def _iso(ts: float) -> str:
@@ -86,22 +131,93 @@ def _dumps(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
-@lru_cache(maxsize=1024)
-def _cached_case(seed: str, mix: str, index: int) -> Case:
-    return bank.job_case(seed, json.loads(mix), index)
+def plan_to_json(plan: Mapping[str, TrackPlan]) -> dict[str, dict[str, Any]]:
+    return {t: {"weight": p.weight, "cases": p.cases} for t, p in sorted(plan.items())}
+
+
+def plan_from_json(value: Mapping[str, Any]) -> dict[str, TrackPlan]:
+    return {t: TrackPlan(float(p["weight"]), int(p["cases"])) for t, p in sorted(value.items())}
+
+
+def _job_plan(job: sqlite3.Row) -> dict[str, TrackPlan]:
+    """The job's effective plan; a v1 job (no plan) is decisions-only."""
+    if not job["plan"]:
+        return {"decisions": TrackPlan(1.0, job["cases"])}
+    return plan_from_json(json.loads(job["plan"]))
+
+
+class _CaseCache:
+    """LRU of built cases bounded by the bytes of their served JSON (plus private data)."""
+
+    def __init__(self, limit: int = CASE_CACHE_BYTES):
+        self.limit, self.size = limit, 0
+        self._items: OrderedDict[tuple[Any, ...], tuple[Case, int]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key: tuple[Any, ...], build: Callable[[], Case]) -> tuple[Case, int]:
+        """(case, length of its body's JSON)."""
+        with self._lock:
+            hit = self._items.get(key)
+            if hit is not None:
+                self._items.move_to_end(key)
+                return hit
+        case = build()  # outside the lock: building a case can take a while
+        length = len(_dumps(case.body))
+        cost = length + len(_dumps(case.private)) + 1024
+        with self._lock:
+            if key not in self._items:
+                self._items[key] = (case, length)
+                self.size += cost
+                while self.size > self.limit and len(self._items) > 1:
+                    _, (old, old_length) = self._items.popitem(last=False)
+                    self.size -= old_length + len(_dumps(old.private)) + 1024
+        return case, length
+
+
+def _final_png(case: Case, transcript: Sequence[str]) -> bytes:
+    """The container's own render of a paint episode replayed from the raw outputs."""
+    state, _ = harness.replay(tracks.ENVS[case.track], case.body, transcript)
+    return paint.render_png([command for draw in state["draws"] for command in draw])
+
+
+def judge_order(seed: int) -> tuple[str, str]:
+    """The side judged first, drawn from the case seed (§6)."""
+    if random.Random(f"judge|{seed}").random() < 0.5:
+        return ("champion", "challenger")
+    return ("challenger", "champion")
 
 
 class Store:
-    def __init__(self, state_dir: Path, settings: Settings, clock: Callable[[], float] = time.time):
+    def __init__(
+        self,
+        state_dir: Path,
+        settings: Settings,
+        clock: Callable[[], float] = time.time,
+        *,
+        judge: bool = False,
+        beacon: Callable[[], dict[str, Any] | None] = bank.drand_beacon,
+    ):
         state_dir.mkdir(parents=True, exist_ok=True)
         self.path = state_dir / "opentype.sqlite3"
         self.settings, self.clock = settings, clock
+        self.judge, self.beacon = judge, beacon
+        self.teacher_configured = False
+        self.teacher_building = False
         self._lock = threading.Lock()
+        self._cases = _CaseCache()
+        self._banks: OrderedDict[int, bank.Bank] = OrderedDict()
         self._db = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=FULL")
+        version = self._db.execute("PRAGMA user_version").fetchone()[0]
+        v1 = self._db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='windows'"
+        ).fetchone()
+        if version == 0 and v1:
+            self._db.executescript(MIGRATE_V1)
         self._db.executescript(SCHEMA)  # idempotent DDL; executescript commits on its own
+        self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         with self._tx() as db:
             if db.execute("SELECT 1 FROM champions").fetchone() is None:
                 base = (pins.BASE_REPO, pins.BASE_REVISION, pins.BASE_FILES)
@@ -111,7 +227,7 @@ class Store:
                     (*base[:2], _dumps(base[2]), manifest_digest(*base), self._now()),
                 )
             if db.execute("SELECT 1 FROM windows").fetchone() is None:
-                self._open_window(db)
+                self._open_window(db, [])  # the first window opens with the empty bank
             db.execute(
                 "INSERT OR IGNORE INTO meta VALUES ('ladder', ?), ('retired', '[]'), "
                 "('crowns_paused', 'false')",
@@ -150,43 +266,98 @@ class Store:
 
     # -- windows -----------------------------------------------------------
 
-    def _open_window(self, db: sqlite3.Connection) -> None:
+    def _open_window(self, db: sqlite3.Connection, rows: Sequence[Sequence[Any]]) -> None:
+        """A new window with its sealed bank; the commitment and bank digest go public now."""
         secret = secrets.token_bytes(32)
+        sealed = bank.Bank.from_json(rows)
         db.execute(
-            "INSERT INTO windows (secret, commitment, opened_at) VALUES (?, ?, ?)",
-            (secret, bank.commitment(secret), self._now()),
+            "INSERT INTO windows (secret, commitment, opened_at, bank, bank_digest) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (secret, bank.commitment(secret), self._now(), _dumps(sealed.to_json()), sealed.digest),
         )
 
     def _window(self, db: sqlite3.Connection) -> sqlite3.Row:
         row: sqlite3.Row = db.execute(
-            "SELECT * FROM windows WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1"
+            f"SELECT {WINDOW_COLUMNS} FROM windows WHERE closed_at IS NULL "  # noqa: S608
+            "ORDER BY id DESC LIMIT 1"
         ).fetchone()
         return row
 
+    def _bank(self, db: sqlite3.Connection, window_id: int) -> bank.Bank:
+        """A window's bank, parsed once and cached (a window's bank never changes)."""
+        cached = self._banks.get(window_id)
+        if cached is not None:
+            self._banks.move_to_end(window_id)
+            return cached
+        row = db.execute("SELECT bank FROM windows WHERE id=?", (window_id,)).fetchone()
+        loaded = bank.Bank.from_json(json.loads(row["bank"])) if row else bank.EMPTY_BANK
+        self._banks[window_id] = loaded
+        while len(self._banks) > BANK_CACHE:
+            self._banks.popitem(last=False)
+        return loaded
+
+    def _rotate(self, db: sqlite3.Connection) -> dict[str, Any]:
+        """Close the open window (revealing its secret and bank) and promote the next bank,
+        or open with an empty bank when none is ready."""
+        old = self._window(db)
+        row = db.execute("SELECT value FROM meta WHERE key='next_bank'").fetchone()
+        rows = json.loads(row["value"]) if row else []
+        db.execute("DELETE FROM meta WHERE key='next_bank'")
+        db.execute("UPDATE windows SET closed_at=? WHERE id=?", (self._now(), old["id"]))
+        self._open_window(db, rows)
+        new = self._window(db)
+        return {
+            "closed": old["id"],
+            "opened": new["id"],
+            "commitment": new["commitment"],
+            "bank_digest": new["bank_digest"],
+        }
+
     def rotate_window(self) -> dict[str, Any]:
         with self._tx() as db:
-            old = self._window(db)
-            db.execute("UPDATE windows SET closed_at=? WHERE id=?", (self._now(), old["id"]))
-            self._open_window(db)
-            new = self._window(db)
-        return {"closed": old["id"], "opened": new["id"], "commitment": new["commitment"]}
+            return self._rotate(db)
+
+    def auto_rotate(self, min_age: float) -> dict[str, Any] | None:
+        """Rotate once the next bank is ready and the open window is at least min_age old."""
+        with self._tx() as db:
+            ready = db.execute("SELECT 1 FROM meta WHERE key='next_bank'").fetchone()
+            if not ready or self._now() - self._window(db)["opened_at"] < min_age:
+                return None
+            return self._rotate(db)
+
+    def set_next_bank(self, items: Sequence[bank.BankItem]) -> str:
+        """Store the next window's bank; it is sealed when that window opens."""
+        sealed = bank.Bank(tuple(items))
+        with self._tx() as db:
+            self._set_meta(db, "next_bank", sealed.to_json())
+        return sealed.digest
+
+    def next_bank_ready(self) -> bool:
+        with self._lock:
+            row = self._db.execute("SELECT 1 FROM meta WHERE key='next_bank'").fetchone()
+        return row is not None
 
     def windows(self) -> list[dict[str, Any]]:
         with self._lock:
-            rows = self._db.execute("SELECT * FROM windows ORDER BY id").fetchall()
+            rows = self._db.execute(
+                f"SELECT {WINDOW_COLUMNS} FROM windows ORDER BY id"  # noqa: S608
+            ).fetchall()
         return [_window_json(row) for row in rows]
 
     def window(self, window_id: int) -> dict[str, Any]:
         with self._lock:
-            row = self._db.execute("SELECT * FROM windows WHERE id=?", (window_id,)).fetchone()
+            row = self._db.execute(
+                f"SELECT {WINDOW_COLUMNS} FROM windows WHERE id=?",  # noqa: S608
+                (window_id,),
+            ).fetchone()
             if row is None:
                 raise StoreError(404, "unknown window")
             out = _window_json(row)
             if row["closed_at"] is not None:
                 out["secret"] = row["secret"].hex()
                 jobs = self._db.execute(
-                    "SELECT j.id, j.mix, j.cases, j.state, j.evidence, s.digest FROM jobs j "
-                    "JOIN submissions s ON s.id = j.submission_id "
+                    "SELECT j.id, j.mix, j.cases, j.state, j.evidence, j.plan, j.beacon, "
+                    "j.judge, s.digest FROM jobs j JOIN submissions s ON s.id = j.submission_id "
                     "WHERE j.window_id=? AND j.state != 'queued' ORDER BY j.created_at, j.id",
                     (window_id,),
                 ).fetchall()
@@ -195,6 +366,9 @@ class Store:
                         "id": j["id"],
                         "digest": j["digest"],
                         "mix": json.loads(j["mix"]),
+                        "plan": plan_to_json(_job_plan(j)),
+                        "beacon": json.loads(j["beacon"]) if j["beacon"] else None,
+                        "judge": bool(j["judge"]),
                         "cases": j["cases"],
                         "state": j["state"],
                         "cases_sha256": _evidence(j, "cases_sha256"),
@@ -203,6 +377,31 @@ class Store:
                     for j in jobs
                 ]
         return out
+
+    def window_bank(self, window_id: int, offset: int, limit: int) -> dict[str, Any]:
+        """A closed window's bank rows [kind, key, payload], paged under PAGE_BYTES."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT closed_at, bank, bank_digest FROM windows WHERE id=?", (window_id,)
+            ).fetchone()
+        if row is None or row["closed_at"] is None:
+            raise StoreError(404, "the bank of an open or unknown window is not published")
+        rows = json.loads(row["bank"])
+        items: list[Any] = []
+        size = 0
+        for item in rows[offset : offset + limit]:
+            length = len(_dumps(item)) + 1
+            if items and size + length > PAGE_BYTES - 4096:
+                break
+            items.append(item)
+            size += length
+        return {
+            "window": window_id,
+            "bank_digest": row["bank_digest"],
+            "total": len(rows),
+            "offset": offset,
+            "items": items,
+        }
 
     # -- ladder and champion -----------------------------------------------
 
@@ -304,22 +503,31 @@ class Store:
         return job_id
 
     def _target(self, db: sqlite3.Connection, job_id: str) -> None:
-        """Point a job at the current champion and window (fresh seed and level mix)."""
+        """Point a job at the current champion and window: fresh seed (with the job's drand
+        beacon, if any), level mix, effective plan and judge flag."""
         job = db.execute(
-            "SELECT j.id, s.digest FROM jobs j JOIN submissions s ON s.id=j.submission_id "
-            "WHERE j.id=?",
+            "SELECT j.id, j.beacon, s.digest FROM jobs j JOIN submissions s "
+            "ON s.id=j.submission_id WHERE j.id=?",
             (job_id,),
         ).fetchone()
         champion, window = self._champion(db), self._window(db)
         mix, retired = self._mix(db, champion["id"])
+        plan = tracks.effective_plan(
+            self.settings.track_plan(), self._bank(db, window["id"]), self.judge
+        )
+        beacon = json.loads(job["beacon"]) if job["beacon"] else None
         db.execute(
-            "UPDATE jobs SET champion_id=?, window_id=?, seed=?, mix=?, retired=? WHERE id=?",
+            "UPDATE jobs SET champion_id=?, window_id=?, seed=?, mix=?, retired=?, plan=?, "
+            "cases=?, judge=? WHERE id=?",
             (
                 champion["id"],
                 window["id"],
-                bank.job_seed(window["secret"], job_id, job["digest"]),
+                bank.job_seed(window["secret"], job_id, job["digest"], beacon),
                 _dumps(mix),
                 _dumps(retired),
+                _dumps(plan_to_json(plan)),
+                sum(p.cases for p in plan.values()),
+                int(self.judge),
                 job_id,
             ),
         )
@@ -342,9 +550,13 @@ class Store:
         job = db.execute("SELECT * FROM jobs WHERE id=?", (row["job_id"],)).fetchone()
         if job is not None:
             done = self._paired_count(db, job["id"])
+            pending = db.execute(
+                "SELECT count(*) FROM judgments WHERE job_id=? AND state='pending'", (job["id"],)
+            ).fetchone()[0]
             out["job"] = {
                 "id": job["id"],
                 "state": job["state"],
+                "judgments_pending": pending,
                 "champion": job["champion_id"],
                 "window": job["window_id"],
                 "cases": job["cases"],
@@ -363,6 +575,16 @@ class Store:
     # -- worker ---------------------------------------------------------------
 
     def lease(self) -> dict[str, Any] | None:
+        # The drand beacon is fetched once per job, outside the lock (5 s timeout), and
+        # stored on its first lease; retries reuse it.
+        with self._lock:
+            head = self._db.execute(
+                "SELECT j.id, j.beacon_fetched FROM jobs j JOIN submissions s "
+                "ON s.id=j.submission_id WHERE j.state='queued' ORDER BY s.intake LIMIT 1"
+            ).fetchone()
+        beacon = None
+        if head is not None and not head["beacon_fetched"]:
+            beacon = (head["id"], self.beacon())
         now = self._now()
         with self._tx() as db:
             expired = db.execute(
@@ -379,7 +601,16 @@ class Store:
             if job is None:
                 return None
             champion = self._champion(db)
-            self._target(db, job["id"])  # current champion, window and ladder mix
+            if beacon is not None and beacon[0] == job["id"] and not job["beacon_fetched"]:
+                db.execute(
+                    "UPDATE jobs SET beacon=?, beacon_fetched=1 WHERE id=?",
+                    (_dumps(beacon[1]) if beacon[1] else None, job["id"]),
+                )
+            elif not job["beacon_fetched"]:
+                # ponytail: the queue head changed while drand was fetched; this job runs
+                # with v1's seed. Fetch inside a retry loop if that race ever matters.
+                db.execute("UPDATE jobs SET beacon_fetched=1 WHERE id=?", (job["id"],))
+            self._target(db, job["id"])  # current champion, window, mix, plan and seed
             lease = secrets.token_hex(16)
             db.execute(
                 "UPDATE jobs SET state='leased', lease=?, lease_expires=? WHERE id=?",
@@ -394,6 +625,7 @@ class Store:
                 "lease": lease,
                 "lease_expires": _iso(now + LEASE_SECONDS),
                 "cases": job["cases"],
+                "plan": json.loads(job["plan"]),
                 "champion": _manifest(champion),
                 "challenger": _manifest(submission),
                 "base": {"repo": pins.BASE_REPO, "revision": pins.BASE_REVISION},
@@ -403,6 +635,7 @@ class Store:
         """Give a job back to the queue after an infrastructure failure, or fail it."""
         job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         db.execute("DELETE FROM results WHERE job_id=?", (job_id,))
+        db.execute("DELETE FROM judgments WHERE job_id=?", (job_id,))
         attempts = job["attempts"] + 1
         if attempts >= MAX_ATTEMPTS:
             self._terminal(db, job_id, "failed", f"{reason} ({attempts} attempts)")
@@ -443,30 +676,62 @@ class Store:
             )
         return {"lease_expires": _iso(expires), "stale": stale}
 
+    def _case(self, job: sqlite3.Row, index: int) -> tuple[Case, int]:
+        """Case `index` of a job and the length of its body's JSON (byte-bounded cache)."""
+        with self._lock:
+            window_bank = self._bank(self._db, job["window_id"])
+        plan = _job_plan(job)
+        key = (job["seed"], _dumps(plan_to_json(plan)), job["mix"], job["judge"], index)
+        return self._cases.get(
+            key,
+            lambda: tracks.job_case(
+                job["seed"], plan, json.loads(job["mix"]), index, window_bank, bool(job["judge"])
+            ),
+        )
+
     def cases(self, job_id: str, lease: str, offset: int, limit: int) -> list[dict[str, Any]]:
+        """At most `limit` cases and PAGE_BYTES of JSON, and at least one while any remain."""
         with self._lock:
             job = self._leased(self._db, job_id, lease)
-        end = min(offset + limit, job["cases"])
-        return [
-            {"index": i, "body": _cached_case(job["seed"], job["mix"], i).body}
-            for i in range(offset, end)
-        ]
+        out: list[dict[str, Any]] = []
+        size = 16
+        for index in range(offset, min(offset + limit, job["cases"])):
+            case, length = self._case(job, index)
+            length += 64 + len(case.track)
+            if out and size + length > PAGE_BYTES:
+                break
+            out.append({"index": index, "track": case.track, "body": case.body})
+            size += length
+        return out
 
     def record_answers(
         self, job_id: str, lease: str, items: Sequence[Mapping[str, Any]]
     ) -> dict[str, Any]:
         with self._lock:
             job = self._leased(self._db, job_id, lease)
-        rows = []
-        for item in items:
+        rows, judgments = [], []
+        for raw in items:
+            item = {k: v for k, v in raw.items() if v is not None}
             index = item["case_index"]
             if not 0 <= index < job["cases"]:
                 raise StoreError(400, f"case_index {index} is outside the job")
-            case = _cached_case(job["seed"], job["mix"], index)
-            if item.get("error") is not None:
-                score = scoring.score_case(case.gold, None, None)
-            else:
-                score = scoring.score_case(case.gold, item.get("answers"), item.get("reads"))
+            case, _ = self._case(job, index)
+            score = tracks.score_item(case, item)
+            if score is None:  # the loss needs the judge: keep the container's own render
+                judgments.append(
+                    (
+                        job_id,
+                        index,
+                        item["side"],
+                        case.track,
+                        case.level,
+                        int(case.body["seed"]),
+                        _final_png(case, item["transcript"]),
+                        case.private["brief"],
+                        _dumps(list(case.private["rubric"])),
+                    )
+                )
+                continue
             rows.append(
                 (
                     job_id,
@@ -479,29 +744,50 @@ class Store:
                     score.correct,
                     score.under_loss,
                     score.under,
+                    case.track,
                 )
             )
         with self._tx() as db:
             job = self._leased(db, job_id, lease)
             db.executemany(
-                "INSERT OR IGNORE INTO results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows
+                f"INSERT OR IGNORE INTO results ({RESULT_COLUMNS}) "  # noqa: S608
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            db.executemany(
+                "INSERT OR IGNORE INTO judgments (job_id, case_index, side, track, level, seed, "
+                "png, brief, rubric) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                judgments,
             )
             db.execute(
                 "UPDATE jobs SET lease_expires=? WHERE id=?",
                 (self._now() + LEASE_SECONDS, job_id),
             )
-            stopped = bool(job["stopped"]) or self._should_stop(db, job_id, job["retired"])
+            stopped = bool(job["stopped"]) or self._should_stop(db, job)
             if stopped and not job["stopped"]:
                 db.execute("UPDATE jobs SET stopped=1 WHERE id=?", (job_id,))
             stale = job["champion_id"] != self._champion(db)["id"]
             paired = self._paired_count(db, job_id)
+            answered = self._answered_count(db, job_id)
         return {
-            "accepted": len(rows),
+            "accepted": len(rows) + len(judgments),
             "paired": paired,
-            "continue": not (stopped or stale or paired >= job["cases"]),
+            "judging": len(judgments),
+            "continue": not (stopped or stale or answered >= job["cases"]),
             "early_stop": stopped,
             "stale": stale,
         }
+
+    def _answered_count(self, db: sqlite3.Connection, job_id: str) -> int:
+        """Cases both sides answered: scored or waiting for the judge."""
+        return int(
+            db.execute(
+                "SELECT count(*) FROM (SELECT case_index FROM (SELECT case_index, side "
+                "FROM results WHERE job_id=? UNION SELECT case_index, side FROM judgments "
+                "WHERE job_id=?) GROUP BY case_index HAVING count(*) = 2)",
+                (job_id, job_id),
+            ).fetchone()[0]
+        )
 
     def _paired_count(self, db: sqlite3.Connection, job_id: str) -> int:
         return int(
@@ -513,34 +799,37 @@ class Store:
             ).fetchone()[0]
         )
 
-    def _should_stop(self, db: sqlite3.Connection, job_id: str, retired: str) -> bool:
-        """Early stop on the active levels; retired is the job's JSON list of guard levels."""
-        row = db.execute(
-            "SELECT count(*), coalesce(sum(a.decisions), 0), coalesce(sum(a.loss), 0), "
+    def _should_stop(self, db: sqlite3.Connection, job: sqlite3.Row) -> bool:
+        """Early stop on the composite of per-track SQL moments, guard levels excluded."""
+        rows = db.execute(
+            "SELECT a.track, count(*), coalesce(sum(a.decisions), 0), coalesce(sum(a.loss), 0), "
             "coalesce(sum(b.loss), 0), coalesce(sum(a.loss*a.loss), 0), "
             "coalesce(sum(b.loss*b.loss), 0), coalesce(sum(a.loss*b.loss), 0) "
             "FROM results a JOIN results b ON b.job_id=a.job_id AND b.case_index=a.case_index "
             "AND b.side='challenger' WHERE a.job_id=? AND a.side='champion' "
-            "AND a.level NOT IN (SELECT value FROM json_each(?))",
-            (job_id, retired),
-        ).fetchone()
-        n, decisions, sa, sb, saa, sbb, sab = row
-        if decisions < scoring.EARLY_STOP_DECISIONS:
+            "AND NOT (a.track='decisions' AND a.level IN (SELECT value FROM json_each(?))) "
+            "GROUP BY a.track ORDER BY a.track",
+            (job["id"], job["retired"]),
+        ).fetchall()
+        if sum(r[2] for r in rows) < scoring.EARLY_STOP_DECISIONS:
             return False
-        g, se = scoring.log_ratio_moments(n, sa, sb, saa, sbb, sab)
+        moments = {r[0]: (r[1], r[3], r[4], r[5], r[6], r[7]) for r in rows}
+        g, se = scoring.composite(moments, _weights(job))
         return g + scoring.EARLY_STOP_SE * se < 0
 
     def _pairs(self, db: sqlite3.Connection, job_id: str) -> list[scoring.Paired]:
         rows = db.execute(
             "SELECT a.case_index, a.level, a.loss, a.decisions, a.determined, a.correct, "
             "a.under_loss, a.under, b.loss, b.decisions, b.determined, b.correct, "
-            "b.under_loss, b.under FROM results a JOIN results b ON b.job_id=a.job_id "
-            "AND b.case_index=a.case_index AND b.side='challenger' "
+            "b.under_loss, b.under, a.track FROM results a JOIN results b "
+            "ON b.job_id=a.job_id AND b.case_index=a.case_index AND b.side='challenger' "
             "WHERE a.job_id=? AND a.side='champion' ORDER BY a.case_index",
             (job_id,),
         ).fetchall()
         return [
-            scoring.Paired(r[0], r[1], scoring.CaseScore(*r[2:8]), scoring.CaseScore(*r[8:14]))
+            scoring.Paired(
+                r[0], r[1], scoring.CaseScore(*r[2:8]), scoring.CaseScore(*r[8:14]), r[14]
+            )
             for r in rows
         ]
 
@@ -548,20 +837,135 @@ class Store:
         with self._tx() as db:
             job = self._leased(db, job_id, lease)
             stale = job["champion_id"] != self._champion(db)["id"]
-            paired = self._paired_count(db, job_id)
-            if not (job["stopped"] or stale) and paired < job["cases"]:
-                raise StoreError(409, f"{paired} of {job['cases']} cases answered by both sides")
-            pairs = self._pairs(db, job_id)
-            result = scoring.verdict(pairs, set(json.loads(job["retired"])), bool(job["stopped"]))
-            db.execute(
-                "UPDATE jobs SET state='scored', lease=NULL, verdict=?, evidence=?, "
-                "finished_at=? WHERE id=?",
-                (_dumps(result), _dumps(dict(evidence)), self._now(), job_id),
-            )
-            self._add_level_stats(db, job["champion_id"], pairs, "champion")
-            self._retire_levels(db)
-            self._finalize(db)
+            answered = self._answered_count(db, job_id)
+            if not (job["stopped"] or stale) and answered < job["cases"]:
+                raise StoreError(409, f"{answered} of {job['cases']} cases answered by both sides")
+            db.execute("UPDATE jobs SET evidence=? WHERE id=?", (_dumps(dict(evidence)), job_id))
+            pending = db.execute(
+                "SELECT 1 FROM judgments WHERE job_id=? AND state='pending'", (job_id,)
+            ).fetchone()
+            if pending:
+                db.execute(
+                    "UPDATE jobs SET state='judging', lease=NULL, lease_expires=NULL WHERE id=?",
+                    (job_id,),
+                )
+            else:
+                self._settle(db, job_id)
             return self._submission(db, job["submission_id"])
+
+    def _settle(self, db: sqlite3.Connection, job_id: str) -> None:
+        """Score a job whose answers are all in: pairs with an unjudged side are dropped on
+        both sides, then the verdict, the champion's level stats and the crown queue."""
+        job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        unjudged = db.execute(
+            "SELECT DISTINCT case_index FROM judgments WHERE job_id=? AND state='unjudged'",
+            (job_id,),
+        ).fetchall()
+        db.executemany(
+            "DELETE FROM results WHERE job_id=? AND case_index=?",
+            [(job_id, r[0]) for r in unjudged],
+        )
+        pairs = self._pairs(db, job_id)
+        result = scoring.verdict(
+            pairs, set(json.loads(job["retired"])), bool(job["stopped"]), _weights(job)
+        )
+        result["unjudged"] = len(unjudged)
+        db.execute(
+            "UPDATE jobs SET state='scored', lease=NULL, verdict=?, finished_at=? WHERE id=?",
+            (_dumps(result), self._now(), job_id),
+        )
+        self._add_level_stats(db, job["champion_id"], pairs, "champion")
+        self._retire_levels(db)
+        self._finalize(db)
+
+    # -- judging ----------------------------------------------------------------
+
+    def pending_judgments(self, limit: int = 64) -> list[dict[str, Any]]:
+        """Pending judgments of up to `limit` cases, each case's sides in the order drawn
+        from its seed."""
+        with self._lock:
+            cases = self._db.execute(
+                "SELECT DISTINCT job_id, case_index FROM judgments WHERE state='pending' "
+                "ORDER BY job_id, case_index LIMIT ?",
+                (limit,),
+            ).fetchall()
+            rows = [
+                self._db.execute(
+                    "SELECT job_id, case_index, side, seed, png, brief, rubric FROM judgments "
+                    "WHERE job_id=? AND case_index=? AND state='pending'",
+                    (c["job_id"], c["case_index"]),
+                ).fetchall()
+                for c in cases
+            ]
+        out = []
+        for group in rows:
+            by_side = {r["side"]: r for r in group}
+            for side in judge_order(group[0]["seed"]):
+                if side in by_side:
+                    r = by_side[side]
+                    out.append(
+                        {
+                            "job": r["job_id"],
+                            "case_index": r["case_index"],
+                            "side": side,
+                            "png": bytes(r["png"]),
+                            "brief": r["brief"],
+                            "rubric": json.loads(r["rubric"]),
+                        }
+                    )
+        return out
+
+    def record_judgment(self, job_id: str, case_index: int, side: str, loss: float | None) -> None:
+        """A judged side becomes a result; None marks the case unjudged (dropped on both
+        sides when the job settles)."""
+        with self._tx() as db:
+            row = db.execute(
+                "SELECT * FROM judgments WHERE job_id=? AND case_index=? AND side=? "
+                "AND state='pending'",
+                (job_id, case_index, side),
+            ).fetchone()
+            if row is None:
+                return  # the job was released or requeued meanwhile
+            if loss is None:
+                db.execute(
+                    "UPDATE judgments SET state='unjudged' WHERE job_id=? AND case_index=?",
+                    (job_id, case_index),
+                )
+                return
+            score = scoring.harness_score(loss)
+            db.execute(
+                "UPDATE judgments SET state='judged', loss=? WHERE job_id=? AND case_index=? "
+                "AND side=?",
+                (score.loss, job_id, case_index, side),
+            )
+            db.execute(
+                f"INSERT OR IGNORE INTO results ({RESULT_COLUMNS}) "  # noqa: S608
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    case_index,
+                    side,
+                    row["level"],
+                    score.loss,
+                    score.decisions,
+                    score.determined,
+                    score.correct,
+                    score.under_loss,
+                    score.under,
+                    row["track"],
+                ),
+            )
+
+    def settle_judged(self) -> list[str]:
+        """Settle every judging job with no pending judgment, exactly like complete."""
+        with self._tx() as db:
+            jobs = db.execute(
+                "SELECT id FROM jobs WHERE state='judging' AND NOT EXISTS (SELECT 1 FROM "
+                "judgments WHERE judgments.job_id=jobs.id AND state='pending') ORDER BY id"
+            ).fetchall()
+            for job in jobs:
+                self._settle(db, job["id"])
+        return [job["id"] for job in jobs]
 
     def fail(
         self, job_id: str, lease: str, reason: str, retry: bool, evidence: Mapping[str, Any]
@@ -584,6 +988,7 @@ class Store:
             if job["state"] == "crowned":
                 raise StoreError(409, "a crowned job cannot be requeued")
             db.execute("DELETE FROM results WHERE job_id=?", (job_id,))
+            db.execute("DELETE FROM judgments WHERE job_id=?", (job_id,))
             self._terminal(db, job_id, "superseded", "requeued by the operator")
             db.execute(
                 "UPDATE submissions SET state='queued', reason=NULL WHERE id=?",
@@ -599,6 +1004,8 @@ class Store:
     ) -> None:
         totals: dict[int, list[int]] = {}
         for pair in pairs:
+            if pair.track != "decisions":  # the ladder is the decisions track's
+                continue
             score = getattr(pair, side)
             entry = totals.setdefault(pair.level, [0, 0])
             entry[0] += score.correct
@@ -655,7 +1062,7 @@ class Store:
                 blocked = db.execute(
                     "SELECT 1 FROM jobs j JOIN submissions s ON s.id=j.submission_id "
                     "WHERE j.champion_id=? AND s.intake < ? "
-                    "AND j.state IN ('queued', 'leased', 'scored')",
+                    "AND j.state IN ('queued', 'leased', 'judging', 'scored')",
                     (champion["id"], job["intake"]),
                 ).fetchone()
                 if paused or blocked:
@@ -791,6 +1198,27 @@ class Store:
                     }
                 )
             mix, _ = self._mix(db, champion["id"])
+            plan = tracks.effective_plan(
+                self.settings.track_plan(), self._bank(db, window["id"]), self.judge
+            )
+            teacher = (
+                "off"
+                if not self.teacher_configured
+                else "building"
+                if self.teacher_building
+                else "ready"
+                if db.execute("SELECT 1 FROM meta WHERE key='next_bank'").fetchone()
+                else "configured"
+            )
+            track_counts = {
+                r[0]: r[1]
+                for r in db.execute(
+                    "SELECT track, count(*) FROM results GROUP BY track ORDER BY track"
+                ).fetchall()
+            }
+            judging = db.execute("SELECT count(*) FROM judgments WHERE state='pending'").fetchone()[
+                0
+            ]
             return {
                 "champion": _champion_json(champion),
                 "queue": [dict(row) for row in queue],
@@ -799,14 +1227,21 @@ class Store:
                 "window": {
                     "id": window["id"],
                     "commitment": window["commitment"],
+                    "bank_digest": window["bank_digest"],
                     "opened_at": _iso(window["opened_at"]),
                 },
+                "plan": plan_to_json(plan),
+                "tracks": {
+                    t: {"weight": p.weight, "cases": p.cases, "results": track_counts.get(t, 0)}
+                    for t, p in sorted(plan.items())
+                },
+                "teacher": {"state": teacher, "judge": self.judge, "judgments_pending": judging},
                 "crowns_paused": self._meta(db, "crowns_paused"),
                 "constants": {
                     "g_min": scoring.G_MIN,
                     "z": scoring.Z99,
                     "guard_max": scoring.GUARD_MAX,
-                    "duel_cases": self.settings.duel_cases,
+                    "duel_cases": sum(p.cases for p in plan.values()),
                     "early_stop_decisions": scoring.EARLY_STOP_DECISIONS,
                     "early_stop_se": scoring.EARLY_STOP_SE,
                     "retire_accuracy": scoring.RETIRE_ACCURACY,
@@ -837,6 +1272,10 @@ class Store:
                 total["paid"] += row["paid"] / ledger.UNITS
             crowns.append(entry)
         return {"crowns": crowns, "hotkeys": totals}
+
+
+def _weights(job: sqlite3.Row) -> dict[str, float]:
+    return {t: p.weight for t, p in _job_plan(job).items()}
 
 
 def _evidence(row: sqlite3.Row, key: str) -> Any:
@@ -871,4 +1310,5 @@ def _window_json(row: sqlite3.Row) -> dict[str, Any]:
         "opened_at": _iso(row["opened_at"]),
         "closed_at": _iso(row["closed_at"]) if row["closed_at"] is not None else None,
         "revealed": row["closed_at"] is not None,
+        "bank_digest": row["bank_digest"],
     }

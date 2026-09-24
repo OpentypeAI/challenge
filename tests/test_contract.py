@@ -5,6 +5,7 @@ import json
 import pytest
 
 from opentype_challenge import __version__
+from opentype_challenge.bank import EMPTY_BANK
 
 from .conftest import ADMIN, INTERNAL, SLUG, WORKER, bearer
 
@@ -73,6 +74,22 @@ def test_canary_without_secrets_starts_and_answers_version(tmp_path, clock, mast
         assert canary.get("/v1/status").status_code == 200
 
 
+def test_teacher_without_a_readable_token_is_off(tmp_path, clock, master, monkeypatch):
+    """A configured gateway URL whose token file is missing leaves the teacher off."""
+    import httpx
+    from fastapi.testclient import TestClient
+
+    from opentype_challenge.app import Config, create_app
+
+    monkeypatch.setenv("OPENTYPE_TEACHER_URL", "https://gateway.test")
+    monkeypatch.setenv("OPENTYPE_TEACHER_TOKEN_FILE", str(tmp_path / "missing.token"))
+    config = Config(SLUG, tmp_path / "state", "http://master.test", None, None, None)
+    app = create_app(config, clock, httpx.MockTransport(master.handler), beacon=lambda: None)
+    with TestClient(app) as client:
+        teacher = client.get("/v1/status").json()["teacher"]
+    assert teacher == {"state": "off", "judge": False, "judgments_pending": 0}
+
+
 def test_token_files_are_read_per_request(client, secrets_dir):
     (secrets_dir / "internal.token").write_text("rotated\n")
     assert weights(client, 1).status_code == 401
@@ -122,6 +139,9 @@ def test_public_views(client):
     assert [lv["state"] for lv in status["levels"][:3]] == ["active", "active", "pending"]
     assert sum(status["next_duel_mix"].values()) == pytest.approx(1)
     assert len(status["window"]["commitment"]) == 64
+    assert status["window"]["bank_digest"] == EMPTY_BANK.digest
+    assert status["plan"] == {"decisions": {"weight": 1.0, "cases": 40}}
+    assert status["teacher"] == {"state": "off", "judge": False, "judgments_pending": 0}
     assert client.get("/v1/leaderboard").json()["crowns"][0]["id"] == 1
     assert client.get("/v1/submissions/s_missing").status_code == 404
     assert client.get("/v1/windows/99").status_code == 404
@@ -131,7 +151,14 @@ def test_window_secret_is_revealed_only_after_rotation(client):
     window = client.get("/v1/windows/1").json()
     assert "secret" not in window and window["revealed"] is False
     rotated = client.post("/v1/admin/window/rotate", headers=bearer(ADMIN)).json()
-    assert rotated == {"closed": 1, "opened": 2, "commitment": rotated["commitment"]}
+    assert rotated == {
+        "closed": 1,
+        "opened": 2,
+        "commitment": rotated["commitment"],
+        "bank_digest": EMPTY_BANK.digest,
+    }
+    assert client.get("/v1/windows/1/bank").json()["items"] == []
+    assert client.get("/v1/windows/2/bank").status_code == 404  # open: sealed
     closed = client.get("/v1/windows/1").json()
     import hashlib
 

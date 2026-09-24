@@ -82,13 +82,23 @@ def secrets_dir(tmp_path: Path) -> Path:
     return directory
 
 
+@pytest.fixture(autouse=True)
+def no_teacher(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests never pick up an operator gateway from the environment."""
+    monkeypatch.delenv("OPENTYPE_TEACHER_URL", raising=False)
+
+
 @pytest.fixture
 def make_client(
     tmp_path: Path, secrets_dir: Path, clock: Clock, master: Master
 ) -> Iterator[Callable[..., TestClient]]:
+    """make(judge=, bank_builder=, beacon=, **Settings): judge and bank_builder are the
+    app's async fakes; beacon defaults to "drand unreachable"."""
     clients: list[TestClient] = []
 
-    def make(**settings: Any) -> TestClient:
+    def make(
+        judge: Any = None, bank_builder: Any = None, beacon: Any = None, **settings: Any
+    ) -> TestClient:
         config = Config(
             slug=SLUG,
             state_dir=tmp_path / "data",
@@ -98,7 +108,14 @@ def make_client(
             worker_token_file=secrets_dir / "worker.token",
             settings=Settings(**{"duel_cases": 40, **settings}),
         )
-        app = create_app(config, clock, httpx.MockTransport(master.handler))
+        app = create_app(
+            config,
+            clock,
+            httpx.MockTransport(master.handler),
+            judge=judge,
+            bank_builder=bank_builder,
+            beacon=beacon or (lambda: None),  # never reach drand from tests
+        )
         client = TestClient(app)
         client.__enter__()
         clients.append(client)

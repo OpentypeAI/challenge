@@ -1,8 +1,11 @@
-"""The B300 duel worker: lease, fetch and verify weights, serve both models, read, report.
+"""The B300 duel worker: lease, fetch and verify weights, serve both models, run every case,
+report (docs/tracks.md §7).
 
-The worker reaches the container only through the master proxy, so every call is a public
-path with the worker bearer, each request body stays under 1 MiB and each page of cases
-under 8 MiB.
+Read tracks (decisions, longctx) post the body to the structured server; harness tracks (ops,
+sql, paint) play an episode against vllm's chat endpoint and report the raw outputs, which
+the container replays. The worker reaches the container only through the master proxy, so
+every call is a public path with the worker bearer, each request body stays under 1 MiB and
+each page of cases under 8 MiB.
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from . import __version__, pins
+from . import __version__, harness, pins, tracks
 from .bank import case_line
 from .crypto import manifest_problem
 
@@ -39,6 +42,7 @@ HEALTH_TIMEOUT = 1800.0
 HEARTBEAT_SECONDS = 300.0
 RESOLVED = ".opentype-resolved.json"  # written only after every sha256 matched
 CANVAS = 256
+MAX_MODEL_LEN = 131072  # longctx level 5 (~100k tokens) fits with headroom
 STRUCTURED_SERVER = Path(
     os.environ.get("OPENTYPE_STRUCTURED_SERVER", "/opt/opentype/structured_server.py")
 )
@@ -137,9 +141,14 @@ def base_snapshot(directory: Path, fetch: Fetch) -> Path:
 # Serving. The launcher is injected; tests use a fake systemone server.
 
 
+Urls = Mapping[str, Mapping[str, str]]  # {side: {"reader": url, "chat": url}}
+
+
 class Launcher(Protocol):
-    def __call__(self, models: Mapping[str, Path]) -> AbstractAsyncContextManager[dict[str, str]]:
-        """Serve each side's model; yield {side: systemone base URL}."""
+    def __call__(
+        self, models: Mapping[str, Path]
+    ) -> AbstractAsyncContextManager[dict[str, dict[str, str]]]:
+        """Serve each side's model; yield {side: {"reader": systemone URL, "chat": vllm URL}}."""
         ...
 
     def evidence(self) -> dict[str, Any]:
@@ -152,6 +161,7 @@ class VllmLauncher:
     """Two `vllm serve` processes (BF16, split memory) and one structured_server.py each."""
 
     canvas: int = CANVAS
+    max_model_len: int = MAX_MODEL_LEN
     memory_share: float = 0.45
     port_base: int = 8100
     log_dir: Path = field(default_factory=lambda: Path("/tmp"))  # noqa: S108
@@ -164,6 +174,7 @@ class VllmLauncher:
             "vllm_version": _package_version("vllm"),
             "structured_server_sha256": sha256_file(self.reader),
             "canvas": self.canvas,
+            "max_model_len": self.max_model_len,
         }
 
     def ports(self, side: str) -> tuple[int, int]:
@@ -193,6 +204,10 @@ class VllmLauncher:
                 "--max-logprobs",
                 "32",
                 "--enable-prefix-caching",
+                "--max-model-len",
+                str(self.max_model_len),
+                "--limit-mm-per-prompt",
+                json.dumps({"image": 1}),
             ],
             [
                 sys.executable,
@@ -213,7 +228,9 @@ class VllmLauncher:
         ]
 
     @asynccontextmanager
-    async def __call__(self, models: Mapping[str, Path]) -> AsyncIterator[dict[str, str]]:
+    async def __call__(
+        self, models: Mapping[str, Path]
+    ) -> AsyncIterator[dict[str, dict[str, str]]]:
         processes: list[subprocess.Popen[bytes]] = []
         env = {**os.environ, "HF_HUB_OFFLINE": "1"}
         try:
@@ -225,7 +242,13 @@ class VllmLauncher:
                     await _wait_health(client, f"http://127.0.0.1:{vllm_port}/health", processes)
                     processes.append(self._spawn(reader, env, f"reader-{side}"))
                     await _wait_health(client, f"http://127.0.0.1:{reader_port}/health", processes)
-            yield {side: f"http://127.0.0.1:{self.ports(side)[1]}" for side in models}
+            yield {
+                side: {
+                    "reader": f"http://127.0.0.1:{self.ports(side)[1]}",
+                    "chat": f"http://127.0.0.1:{self.ports(side)[0]}",
+                }
+                for side in models
+            }
         finally:
             for process in reversed(processes):
                 with contextlib.suppress(ProcessLookupError):
@@ -277,6 +300,10 @@ def reads_of(body: Mapping[str, Any]) -> dict[str, Any]:
         for qid, q in questions.items()
         if isinstance(q, dict)
     }
+
+
+class _ItemError(Exception):
+    """A 4xx or malformed model reply: that side forfeits the case, the job goes on."""
 
 
 class Api:
@@ -395,31 +422,66 @@ class Worker:
         record.write_text(json.dumps(resolved, sort_keys=True))
         return directory, resolved
 
-    async def _read(self, job: dict[str, Any], urls: Mapping[str, str]) -> dict[str, Any]:
+    async def _read(self, job: dict[str, Any], urls: Urls) -> dict[str, Any]:
+        """Page through every case, run both sides and post the answer items in batches."""
         client = self.inference or httpx.AsyncClient()
         limit = asyncio.Semaphore(self.concurrency)
         cases_hash = hashlib.sha256()
         fetched = errors = 0
         keep_going = True
 
-        async def read(side: str, index: int, body: dict[str, Any]) -> dict[str, Any]:
+        async def post(side: str, url: str, body: dict[str, Any]) -> httpx.Response:
+            """One inference call; 5xx and transport errors are infrastructure (retry)."""
             async with limit:
                 try:
-                    response = await client.post(
-                        urls[side] + "/v1/systemone", json=body, timeout=READ_TIMEOUT
-                    )
+                    response = await client.post(url, json=body, timeout=READ_TIMEOUT)
                 except httpx.HTTPError as error:
-                    raise JobFailed(f"{side} reader: {error!r}", retry=True) from None
-            item: dict[str, Any] = {"case_index": index, "side": side}
+                    raise JobFailed(f"{side} {url}: {error!r}", retry=True) from None
+            if response.status_code >= 500:
+                raise JobFailed(f"{side} {url} returned {response.status_code}", retry=True)
             if response.status_code != 200:
-                if response.status_code >= 500:
-                    raise JobFailed(f"{side} reader returned {response.status_code}", retry=True)
-                item["error"] = f"{response.status_code}: {response.text[:200]}"
-                return item
-            data = response.json()
+                raise _ItemError(f"{response.status_code}: {response.text[:200]}")
+            return response
+
+        async def read(side: str, body: dict[str, Any]) -> dict[str, Any]:
+            data = (await post(side, urls[side]["reader"] + "/v1/systemone", body)).json()
             answers = data.get("answers") or {}
-            item["answers"] = {qid: slim(a) for qid, a in answers.items()}
-            item["reads"] = reads_of(data)
+            return {
+                "answers": {qid: slim(a) for qid, a in answers.items()},
+                "reads": reads_of(data),
+            }
+
+        async def play(side: str, track: str, body: dict[str, Any]) -> dict[str, Any]:
+            url = urls[side]["chat"] + "/v1/chat/completions"
+            max_tokens = int(body["limits"]["max_tokens"])
+
+            async def generate(messages: list[dict[str, Any]], seed: int) -> str:
+                request = {
+                    "model": side,
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.0,
+                    "seed": seed,
+                }
+                data = (await post(side, url, request)).json()
+                try:
+                    content = data["choices"][0]["message"]["content"]
+                except (KeyError, IndexError, TypeError):
+                    raise _ItemError("chat reply without choices[0].message.content") from None
+                return content if isinstance(content, str) else ""  # null content: no action
+
+            return {"transcript": await harness.run_episode(tracks.ENVS[track], body, generate)}
+
+        async def run(side: str, case: dict[str, Any]) -> dict[str, Any]:
+            item: dict[str, Any] = {"case_index": case["index"], "side": side}
+            track = case.get("track", "decisions")
+            try:
+                if track in tracks.ENVS:
+                    item.update(await play(side, track, case["body"]))
+                else:
+                    item.update(await read(side, case["body"]))
+            except _ItemError as error:  # the model's side forfeits the case
+                item["error"] = error.args[0]
             return item
 
         try:
@@ -437,9 +499,7 @@ class Worker:
                     cases_hash.update(case_line(case["body"]))
                 fetched += len(cases)
                 offset += len(cases)
-                items = await asyncio.gather(
-                    *(read(side, c["index"], c["body"]) for c in cases for side in SIDES)
-                )
+                items = await asyncio.gather(*(run(side, c) for c in cases for side in SIDES))
                 errors += sum("error" in item for item in items)
                 for batch in _batches(items):
                     result = (

@@ -6,7 +6,11 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
+import random
+import secrets
+import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -19,7 +23,7 @@ from fastapi import FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from . import __version__, pins
+from . import __version__, bank, generator, pins, teacher
 from .crypto import (
     CryptoError,
     decode_hotkey,
@@ -29,13 +33,25 @@ from .crypto import (
     submit_message,
     verify,
 )
-from .store import Settings, Store, StoreError
+from .harness import MAX_OUTPUT_CHARS
+from .store import Settings, Store, StoreError, plan_from_json
+
+log = logging.getLogger(__name__)
+
+Judge = Callable[[str, list[str], bytes], Awaitable[float | None]]
+BankBuilder = Callable[[random.Random], Awaitable[list[bank.BankItem]]]
 
 SUBMIT_BODY_MAX = 64 * 1024
 WORKER_BODY_MAX = 1024 * 1024
 RESPONSE_MAX = 8 * 1024 * 1024
 MAX_EXP_SECONDS = 300
 CASES_PAGE_MAX = 200
+BANK_PAGE_MAX = 10_000
+TRANSCRIPT_ITEMS = 64
+BACKGROUND_SECONDS = 30.0  # judging and window-rotation poll period
+BUILDER_POLL_SECONDS = 1.0  # how soon a promoted bank's successor starts building
+BANK_RETRY_SECONDS = 600.0
+COMPLETE_WAIT_SECONDS = 20.0  # complete waits this long for judging before answering
 METAGRAPH_TTL = 30.0
 REPO = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$"
 
@@ -59,10 +75,15 @@ class Submission(Strict):
 
 
 class Answer(Strict):
+    """A read item (answers, reads), a harness item (transcript) or a failure (error)."""
+
     case_index: int = Field(ge=0)
     side: Literal["champion", "challenger"]
     answers: dict[str, Any] | None = None
     reads: dict[str, Any] | None = None
+    transcript: list[Annotated[str, Field(max_length=MAX_OUTPUT_CHARS)]] | None = Field(
+        default=None, max_length=TRANSCRIPT_ITEMS
+    )
     error: str | None = Field(default=None, max_length=500)
 
 
@@ -101,6 +122,7 @@ class Config:
     admin_token_file: Path | None
     worker_token_file: Path | None
     settings: Settings = field(default_factory=Settings)
+    window_hours: float = 24.0
 
     @classmethod
     def from_env(cls) -> Config:
@@ -109,6 +131,7 @@ class Config:
             return Path(value) if value else None
 
         cap = os.environ.get("OPENTYPE_WINDOW_ENTITLEMENT_CAP")
+        plan = os.environ.get("OPENTYPE_PLAN")
         return cls(
             slug=os.environ.get("CHALLENGE_SLUG", "opentype"),
             state_dir=Path(os.environ.get("CHALLENGE_STATE_DIR", "/data")),
@@ -120,7 +143,9 @@ class Config:
                 duel_cases=int(os.environ.get("OPENTYPE_DUEL_CASES", "40000")),
                 max_pending=int(os.environ.get("OPENTYPE_MAX_PENDING", "4")),
                 window_cap=float(cap) if cap else None,
+                plan=plan_from_json(json.loads(plan)) if plan else None,
             ),
+            window_hours=float(os.environ.get("OPENTYPE_WINDOW_HOURS", "24")),
         )
 
 
@@ -178,19 +203,153 @@ class Metagraph:
             return hotkeys
 
 
+def _teacher() -> tuple[teacher.Gateway, Judge, BankBuilder] | None:
+    """The gateway judge and bank builder when the teacher is configured and its token file
+    is readable; None otherwise (the teacher is off, everything else works)."""
+    try:
+        cfg = teacher.TeacherConfig.from_env()
+    except ValueError as error:
+        log.warning("teacher off: %s", error)
+        return None
+    if cfg is None:
+        return None
+    try:
+        if not cfg.token_file.read_text().strip():
+            return None
+    except OSError:
+        log.warning("teacher off: the token file is unreadable")
+        return None
+    gateway = teacher.Gateway(cfg)
+
+    async def judge(brief: str, rubric: list[str], png: bytes) -> float | None:
+        return await teacher.judge_png(gateway, cfg, brief, rubric, png)
+
+    async def build(rng: random.Random) -> list[bank.BankItem]:
+        return await teacher.build_bank(gateway, cfg, rng, cfg.targets, families=generator.FAMILIES)
+
+    return gateway, judge, build
+
+
 def create_app(
     config: Config,
     clock: Callable[[], float] = time.time,
     transport: httpx.AsyncBaseTransport | None = None,
+    *,
+    judge: Judge | None = None,
+    bank_builder: BankBuilder | None = None,
+    beacon: Callable[[], dict[str, Any] | None] | None = None,
 ) -> FastAPI:
-    store = Store(config.state_dir, config.settings, clock)
+    """judge(brief, rubric, png) -> loss | None and bank_builder(rng) -> items are the teacher
+    hooks; both None means "from teacher.TeacherConfig.from_env() when its token is readable".
+    beacon() -> {round, randomness} | None defaults to drand through `transport` when it can
+    serve sync requests."""
+    gateway: teacher.Gateway | None = None
+    if judge is None and bank_builder is None:
+        found = _teacher()
+        if found is not None:
+            gateway, judge, bank_builder = found
+    sync_client: httpx.Client | None = None
+    if beacon is None:
+        if isinstance(transport, httpx.BaseTransport):
+            sync_client = httpx.Client(transport=transport)
+        drand = sync_client
+
+        def beacon() -> dict[str, Any] | None:
+            return bank.drand_beacon(drand)
+
+    store = Store(config.state_dir, config.settings, clock, judge=judge is not None, beacon=beacon)
+    store.teacher_configured = judge is not None or bank_builder is not None
     client = httpx.AsyncClient(transport=transport)
     metagraph = Metagraph(config.master_url, client)
+    # sides being judged; the background loop and a waiting complete never judge one twice
+    claims: set[tuple[str, int, str]] = set()
+    claims_lock = threading.Lock()
+    running: set[asyncio.Future[int]] = set()
+
+    def run(function: Callable[..., Any], *args: Any) -> Awaitable[Any]:
+        return asyncio.to_thread(function, *args)
+
+    async def judge_pending() -> int:
+        """Judge the pending sides (each case's sides in its seed order), then settle the jobs
+        with nothing left to judge. Returns the number of sides judged here."""
+        done = 0
+        while True:
+            batch = await run(store.pending_judgments)
+            with claims_lock:
+                mine = [
+                    item
+                    for item in batch
+                    if (item["job"], item["case_index"], item["side"]) not in claims
+                ]
+                keys = {(item["job"], item["case_index"], item["side"]) for item in mine}
+                claims.update(keys)
+            if not mine:
+                break
+            try:
+                for item in mine:
+                    loss = None
+                    if judge is not None:
+                        try:
+                            loss = await judge(item["brief"], item["rubric"], item["png"])
+                        except Exception:  # an unreadable judge excludes the pair
+                            log.exception("judge call failed")
+                    await run(
+                        store.record_judgment, item["job"], item["case_index"], item["side"], loss
+                    )
+                    done += 1
+            finally:
+                with claims_lock:
+                    claims.difference_update(keys)
+        await run(store.settle_judged)
+        return done
+
+    async def tick() -> None:
+        """One pass of background work: judging, settling and window auto-rotation."""
+        await judge_pending()
+        await run(store.auto_rotate, config.window_hours * 3600)
+
+    async def build_next() -> bool:
+        """Build the next window's bank when none is ready; True when one was built."""
+        if bank_builder is None or await run(store.next_bank_ready):
+            return False
+        store.teacher_building = True
+        try:
+            items = await bank_builder(random.Random(secrets.token_bytes(32)))
+        finally:
+            store.teacher_building = False
+        digest = await run(store.set_next_bank, items)
+        log.info("next window bank ready: %d items, digest %s", len(items), digest)
+        return True
+
+    async def background() -> None:
+        while True:
+            try:
+                await tick()
+            except Exception:
+                log.exception("background pass failed")
+            await asyncio.sleep(BACKGROUND_SECONDS)
+
+    async def builder() -> None:
+        while bank_builder is not None:
+            try:
+                await build_next()
+            except Exception:
+                log.exception("bank build failed")
+                await asyncio.sleep(BANK_RETRY_SECONDS)
+            await asyncio.sleep(BUILDER_POLL_SECONDS)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        tasks = [asyncio.create_task(background()), asyncio.create_task(builder())]
         yield
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await client.aclose()
+        if sync_client is not None:
+            sync_client.close()
+        if gateway is not None:
+            await gateway.aclose()
 
     app = FastAPI(
         title="opentype challenge",
@@ -201,6 +360,8 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.store = store
+    app.state.tick = tick
+    app.state.build_next = build_next
 
     @app.exception_handler(StoreError)
     async def store_error(_: Request, error: StoreError) -> JSONResponse:
@@ -219,9 +380,6 @@ def create_app(
             return model.model_validate_json(bytes(raw))
         except ValidationError as error:
             raise StoreError(422, _first_error(error)) from None
-
-    def run(function: Callable[..., Any], *args: Any) -> Awaitable[Any]:
-        return asyncio.to_thread(function, *args)
 
     # -- contract -------------------------------------------------------------
 
@@ -272,6 +430,15 @@ def create_app(
     async def window(window_id: int) -> dict[str, Any]:
         result: dict[str, Any] = await run(store.window, window_id)
         return result
+
+    @app.get("/v1/windows/{window_id}/bank")
+    async def window_bank(
+        window_id: int,
+        offset: Annotated[int, Query(ge=0)] = 0,
+        limit: Annotated[int, Query(ge=1, le=BANK_PAGE_MAX)] = 1000,
+    ) -> Response:
+        page = await run(store.window_bank, window_id, offset, limit)
+        return Response(json.dumps(page, separators=(",", ":")), media_type="application/json")
 
     @app.post("/v1/submissions", status_code=201)
     async def submit(request: Request) -> dict[str, Any]:
@@ -348,7 +515,7 @@ def create_app(
         worker(authorization)
         items = await run(store.cases, job_id, lease, offset, limit)
         text = json.dumps({"cases": items}, separators=(",", ":"))
-        if len(text) > RESPONSE_MAX:
+        if len(text) > RESPONSE_MAX:  # the store keeps pages under PAGE_BYTES already
             raise StoreError(413, "lower the page limit")
         return Response(text, media_type="application/json")
 
@@ -369,6 +536,17 @@ def create_app(
         worker(authorization)
         item: Finish = await body(request, WORKER_BODY_MAX, Finish)
         result: dict[str, Any] = await run(store.complete, job_id, item.lease, item.evidence)
+        if result.get("job", {}).get("state") == "judging":
+            # ponytail: judges inline for up to COMPLETE_WAIT_SECONDS so a fast judge settles
+            # before the worker moves on; the background loop finishes anything slower.
+            judging = asyncio.ensure_future(judge_pending())
+            running.add(judging)  # keep a reference until it finishes
+            judging.add_done_callback(running.discard)
+            try:
+                await asyncio.wait_for(asyncio.shield(judging), COMPLETE_WAIT_SECONDS)
+            except TimeoutError:
+                pass
+            result = await run(store.submission, result["id"])
         return result
 
     @app.post("/v1/worker/jobs/{job_id}/fail")
