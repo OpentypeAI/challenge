@@ -112,8 +112,8 @@ ops stories, that is the exact intent object. An item is kept only when **every*
 agrees exactly. Any disagreement discards the item. The teacher is never asked to label an
 answer.
 
-Depict negative control: a rubric is kept only when the judge fails **every** item on a
-blank white canvas. `paint.STANDARD_RUBRIC` ("The picture contains no letters, words or
+Depict negative control: a rubric is kept only when the judge fails **every payload item** on a
+blank white canvas (`STANDARD_RUBRIC` is excluded from the control, a blank canvas passes it). `paint.STANDARD_RUBRIC` ("The picture contains no letters, words or
 numbers.") is appended to every rubric at scoring time and is not part of the payload.
 
 Build targets per window (`TeacherConfig.targets`, env `OPENTYPE_BANK_TARGETS` as JSON):
@@ -201,7 +201,7 @@ at 4 characters per token:
 | 2 | 16k | fills | 1–4 | 1–2 |
 | 3 | 32k | fills | 2–6 | 1–3 |
 | 4 | 64k | fills | 3–8 | 2–4 |
-| 5 | 128k | fills | 4–10 | 2–5 |
+| 5 | 100k (fits the worker's 131072-token context with headroom) | fills | 4–10 | 2–5 |
 
 - Amendments are lines placed after the record they amend, of the form
   `Correction to record #48213: the <label> is <value>.` The last amendment wins.
@@ -481,3 +481,23 @@ It never contains the gold, the expected actions or the rubric.
     policy) come from the world, and the agent must look them up with the tools.
   - At higher levels the customer may pressure the agent or make claims that the records
     contradict. The policy decides, not the customer.
+
+## 11. Cross-module helpers (fixed names)
+
+- `teacher.judge_png(gateway, config, brief, rubric, png) -> float | None` returns the
+  judge loss of §6, averaged over `config.judges`. It retries each judge up to 5 times and
+  returns `None` when any judge cannot be read. The container and the depict negative
+  control both use it.
+- `scoring.TrackMoments = tuple[int, float, float, float, float, float]` holds
+  `(n, sa, sb, saa, sbb, sab)` for one track.
+  - `scoring.composite(moments: Mapping[str, TrackMoments], weights: Mapping[str, float])
+    -> tuple[float, float]` returns `(g, se)`, which is v1's `log_ratio_moments` when only
+    one track is present.
+  - `scoring.verdict(pairs, retired, stopped, weights=None)` and
+    `scoring.early_stop(pairs, retired, weights=None)` keep v1 behaviour when `weights` is
+    `None`.
+  - The store computes the moments of each track in SQL for early stop.
+- `store.Settings` gains `plan: Mapping[str, tracks.TrackPlan] | None = None`. `None` means
+  `tracks.DEFAULT_PLAN`. v1's `duel_cases` stays as a test convenience: when `plan` is
+  `None` and `duel_cases` is not the default, the plan is decisions-only with that many
+  cases.
