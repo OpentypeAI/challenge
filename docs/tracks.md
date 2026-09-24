@@ -25,14 +25,14 @@ spec (round trip). Picture tasks are graded by a VLM judge on the container's ow
 | module | owns | public names (exact) |
 | --- | --- | --- |
 | `generator.py` | decisions track, families | existing names + `Case.track`, `family_from_json`, `family_to_json`, `sample_known`, `make_case(rng, family, level, prose=None)`, `solve_known(body, known)` |
-| `longctx.py` (new) | long-context track | `LEVELS`, `make_case(rng, level, bank)`, `solve(body)` |
+| `longctx.py` (new) | long-context track | `LEVELS`, `buildable(bank)`, `make_case(rng, level, bank)`, `solve(body)` |
 | `harness.py` (new, written) | agent loop, replay, action parsing | `Env`, `parse_action`, `run_episode(env, body, generate)`, `replay(env, body, outputs)`, `chat_messages(env, task, history)`, `MAX_OUTPUT_CHARS`, `INVALID` |
-| `ops.py` (new) | ops env | `ENV`, `LEVELS`, `make_case(rng, level, bank)`, `sample_intent`, `INTENT_SCHEMA`, `describe_intent`, `render_intent`, `reference_policy` |
-| `sqltask.py` (new) | sql env | `ENV`, `LEVELS`, `make_case(rng, level, bank)`, `reference_policy` |
-| `paint.py` (new) | paint env, render, checks, judge prompt | `ENV`, `LEVELS`, `make_case(rng, level, bank)`, `render_png`, `judge_request`, `judge_loss`, `reference_policy`, `STANDARD_RUBRIC` |
+| `ops.py` (new) | ops env | `ENV`, `LEVELS`, `buildable(bank)`, `make_case(rng, level, bank)`, `sample_intent(rng, level)`, `INTENT_SCHEMA`, `describe_intent(intent)`, `render_intent(intent)`, `reference_policy(messages)` |
+| `sqltask.py` (new) | sql env | `ENV`, `LEVELS`, `buildable(bank)`, `make_case(rng, level, bank)`, `reference_policy(messages)` |
+| `paint.py` (new) | paint env, render, checks, judge prompt | `ENV`, `LEVELS`, `buildable(bank)`, `make_case(rng, level, bank)`, `render_png(commands)`, `blank_png()`, `judge_request`, `judge_loss`, `reference_policy(messages)`, `STANDARD_RUBRIC` |
 | `teacher.py` (new) | gateway client, bank builder | `Gateway`, `GatewayError`, `TeacherConfig`, `build_bank`, `round_trip`, `BANK_KINDS` |
 | `scoring.py` | per-case loss, duel statistics | existing names + `Paired.track`, `harness_score`, `verdict(pairs, retired, stopped, weights)` |
-| `tracks.py` (new) | track plan and dispatch | `TRACKS`, `ENVS` (`{"ops": ops.ENV, "sql": sqltask.ENV, "paint": paint.ENV}`), `TrackPlan`, `DEFAULT_PLAN`, `track_of`, `job_case`, `score_item` |
+| `tracks.py` (new) | track plan and dispatch | `TRACKS`, `ENVS` (`{"ops": ops.ENV, "sql": sqltask.ENV, "paint": paint.ENV}`), `TrackPlan`, `DEFAULT_PLAN`, `track_of`, `job_case`, `score_item`, `solve_body(body)` |
 | `bank.py` | seeds, windows, bank snapshots | existing names + `Bank`, `bank_digest`, `drand_beacon`, `job_seed(secret, job_id, digest, beacon=None)` |
 | `store.py`, `app.py`, `cli.py` | state, routes, CLI | see §8 |
 | `worker.py` | B300 duel worker | see §7 |
@@ -449,3 +449,35 @@ It never contains the gold, the expected actions or the rubric.
 | weak on one skill, strong on another | the per-track regression guard blocks a crown that regresses significantly on any track |
 | an operator picking seeds | commit-reveal of the window secret and bank digest, plus a drand beacon mixed into the job seed |
 | surface cues in templates | `tests/test_shortcuts.py`: a bag-of-words naive Bayes on public cases must stay within 3 points of the majority baseline |
+
+## 10. Oracles, markers and buildable levels (test and dispatch contract)
+
+- `buildable(bank) -> tuple[int, ...]`, in `longctx`, `ops`, `sqltask` and `paint`, lists
+  the levels that can be built with this bank. For example, `paint` returns `(1, 2)` without
+  `depict` items and `(1, 2, 3)` with them.
+- Every env's `system(task)` starts with the exact line `OpenType harness: <env name>`.
+- **Reference oracles.** `reference_policy(messages) -> str`, in `ops`, `sqltask` and
+  `paint`, returns the next raw output of an agent that sees **only the conversation**
+  (the OpenAI messages that `harness.chat_messages` builds) and solves every
+  template-rendered task of every buildable level perfectly (replay loss 0). It proves
+  that each task is solvable from what the model sees, just as `generator.solve` does for
+  reads. It raises `ValueError` when it cannot, for example on teacher prose or `depict`.
+  Test fakes use the oracles to act as a perfect model.
+- `tracks.solve_body(body) -> dict[str, list[float]]` returns the exact gold of a read
+  body, computed from the text alone. It dispatches on a marker that each read track puts
+  on the first line of `instructions`: the v1 `Record type: ...` for decisions, and
+  `Dossier: ...` for longctx.
+- `generator.solve(body)` also works for **sealed** families. When the title is not
+  public, it rebuilds the family from the facts block of `instructions`.
+- **Ops intents.**
+  - `ops.sample_intent(rng, level) -> dict` returns a self-contained customer request.
+    It holds only what a customer can state: email, order id, action, item names, reason
+    and, for exchanges, the wanted variant. It validates against `INTENT_SCHEMA`.
+  - `describe_intent(intent) -> str` is a factual English description that the teacher
+    paraphrases.
+  - `render_intent(intent) -> str` is the deterministic template message.
+  - `make_case` builds a world consistent with the intent (a bank story's or a sampled
+    one). Records that the customer does not state (dates, statuses, `final_sale`, payment,
+    policy) come from the world, and the agent must look them up with the tools.
+  - At higher levels the customer may pressure the agent or make claims that the records
+    contradict. The policy decides, not the customer.
