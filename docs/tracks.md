@@ -48,7 +48,14 @@ class Case:
     gold: dict[str, Gold]   # read tracks; {} for harness tracks
     realized: dict[str, int]  # tests only, never served
     track: str = "decisions"
+    private: dict[str, Any] = field(default_factory=dict)  # never served: depict {"brief", "rubric"}, oracle aids for tests
 ```
+
+`body["task"]` of a harness case may hold the env's hidden state (the ops world, the SQL
+rows, the paint spec). The worker host sees it and the model never does: the model sees
+only `system(task)` and the observations. Anything that must not leave the container, such
+as a depict rubric, lives in `Case.private`, which the container rebuilds from the seed and
+the bank.
 
 Every `make_case` is a pure function of `(rng, level, bank)`. The same inputs give the same
 `Case` in the container and in `opentype-challenge audit`.
