@@ -3,7 +3,7 @@
     modal secret create opentype-worker OPENTYPE_WORKER_TOKEN=<worker.token>
     modal deploy deploy/modal_worker.py
 
-Needs a worker image with `--until-empty` (2.1.0 or later on the `stable` channel).
+Pins v2.1.0 by digest: Modal caches registry tags rather than refreshing `stable`.
 
 A cron wakes the worker every 10 minutes. It runs duels until the queue is empty and
 exits. Startup and empty-queue checks also incur GPU billing. The work volume keeps the champion's
@@ -21,7 +21,7 @@ API = os.environ.get("OPENTYPE_API", "https://chain.joinbase.ai/challenge/openty
 app = modal.App("opentype-worker")
 image = (
     modal.Image.from_registry(
-        "ghcr.io/opentypeai/challenge-worker:stable",
+        "ghcr.io/opentypeai/challenge-worker@sha256:889ca46057c73c53eb6432a73874beefff686bc3a214c5a20ece40c1e7f3f540",
         # Modal runs its own agent with `python`; the vLLM base only ships `python3`.
         setup_dockerfile_commands=["RUN ln -sf $(command -v python3) /usr/local/bin/python"],
     )
