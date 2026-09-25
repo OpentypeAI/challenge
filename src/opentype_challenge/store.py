@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS submissions (
   intake INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, hotkey TEXT NOT NULL,
   repo TEXT NOT NULL, revision TEXT NOT NULL, files TEXT NOT NULL, digest TEXT NOT NULL,
   state TEXT NOT NULL, reason TEXT, created_at INTEGER NOT NULL, job_id TEXT,
-  lane TEXT NOT NULL DEFAULT 'quality', options TEXT, target INTEGER);
+  lane TEXT NOT NULL DEFAULT 'quality', options TEXT, target INTEGER, profile TEXT);
 CREATE INDEX IF NOT EXISTS submissions_hotkey ON submissions (hotkey, state);
 CREATE INDEX IF NOT EXISTS submissions_lane ON submissions (lane, state);
 CREATE TABLE IF NOT EXISTS champions (
@@ -109,6 +109,7 @@ MIGRATIONS = (
     ("submissions", "lane", "TEXT NOT NULL DEFAULT 'quality'"),
     ("submissions", "options", "TEXT"),
     ("submissions", "target", "INTEGER"),
+    ("submissions", "profile", "TEXT"),
     ("jobs", "lane", "TEXT NOT NULL DEFAULT 'quality'"),
     ("jobs", "incumbent_id", "INTEGER NOT NULL DEFAULT 0"),
     ("jobs", "calibration", "TEXT"),
@@ -122,7 +123,7 @@ WINDOW_COLUMNS = "id, secret, commitment, opened_at, closed_at, bank_digest"
 
 
 RUNTIME_WORKER_SECONDS = 120  # a runtime worker polls every 30 s when idle
-EXPIRED = "the quality champion changed: sign a new runtime submission for the new weights"
+EXPIRED = "the quality champion or the calibrated profile changed: sign a new runtime submission"
 UNJUDGED_MAX = 0.05  # share of judged cases a crowned duel may drop as unreadable
 JUDGE_DEADLINE_SECONDS = 6 * 3600  # a judging job settles without its missing sides after this
 
@@ -355,6 +356,7 @@ class Store:
                 db.execute("DELETE FROM meta WHERE key='runtime_calibration'")
             else:
                 self._set_meta(db, "runtime_calibration", raw)
+            self._expire_runtime(db)  # queued work signed for another profile
             self._finalize(db)
         return None if calibration is None else calibration.public()
 
@@ -411,8 +413,8 @@ class Store:
             submission_id = "r_" + secrets.token_hex(8)
             db.execute(
                 "INSERT INTO submissions (id, hotkey, repo, revision, files, digest, state, "
-                "created_at, lane, options, target) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, 'runtime', ?, ?)",
+                "created_at, lane, options, target, profile) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, 'runtime', ?, ?, ?)",
                 (
                     submission_id,
                     hotkey,
@@ -423,6 +425,7 @@ class Store:
                     self._now(),
                     _dumps(dict(options)),
                     champion["id"],
+                    profile_digest,
                 ),
             )
             self._new_job(db, submission_id)
@@ -776,10 +779,10 @@ class Store:
 
     def _new_job(self, db: sqlite3.Connection, submission_id: str) -> str:
         submission = db.execute(
-            "SELECT lane, target FROM submissions WHERE id=?", (submission_id,)
+            "SELECT lane FROM submissions WHERE id=?", (submission_id,)
         ).fetchone()
-        if submission["lane"] == "runtime" and submission["target"] != self._champion(db)["id"]:
-            # the signed target is never moved: the miner resubmits against the new champion
+        if submission["lane"] == "runtime" and not self._signed_current(db, submission_id):
+            # the signed target is never moved: the miner resubmits against the new one
             db.execute(
                 "UPDATE submissions SET state='expired', reason=? WHERE id=?",
                 (EXPIRED, submission_id),
@@ -797,14 +800,21 @@ class Store:
         return job_id
 
     def _target_current(self, db: sqlite3.Connection, job: sqlite3.Row) -> bool:
-        """A quality job may duel any current champion; a runtime job only the one its
-        submission signed."""
-        if job["lane"] != "runtime":
-            return True
-        target = db.execute(
-            "SELECT target FROM submissions WHERE id=?", (job["submission_id"],)
-        ).fetchone()[0]
-        return bool(target == self._champion(db)["id"])
+        """A quality job may duel any current champion; a runtime job only the champion and
+        profile its submission signed."""
+        return job["lane"] != "runtime" or self._signed_current(db, job["submission_id"])
+
+    def _signed_current(self, db: sqlite3.Connection, submission_id: str) -> bool:
+        """The champion and the profile a runtime submission signed are still current. With
+        no calibration published the profile cannot have moved: the job waits, parked."""
+        signed = db.execute(
+            "SELECT target, profile FROM submissions WHERE id=?", (submission_id,)
+        ).fetchone()
+        calibration = self._calibration(db)
+        return bool(
+            signed["target"] == self._champion(db)["id"]
+            and (calibration is None or signed["profile"] == calibration.profile_digest)
+        )
 
     def _target(self, db: sqlite3.Connection, job_id: str) -> None:
         """Point a job at the current champion and window: fresh seed (with the job's drand
@@ -1592,8 +1602,8 @@ class Store:
         self._expire_runtime(db)
 
     def _expire_runtime(self, db: sqlite3.Connection) -> None:
-        """Queued runtime jobs whose signed target is no longer the champion expire; the target
-        is never moved. A leased one turns stale and expires when it completes or is
+        """Queued runtime jobs whose signed champion or profile is no longer current expire; the
+        target is never moved. A leased one turns stale and expires when it completes or is
         released."""
         for queued in db.execute(
             "SELECT * FROM jobs WHERE lane='runtime' AND state='queued'"

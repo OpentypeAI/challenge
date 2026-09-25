@@ -1234,3 +1234,40 @@ def test_withdrawing_the_calibration_parks_runtime_work(tmp_path):
     store.set_calibration(calibration_json(version="pilot-2"))
     again = store.lease("runtime")
     assert again is not None and again["runtime"]["calibration"]["version"] == "pilot-2"
+
+
+def test_a_new_profile_expires_work_signed_for_the_old_one(tmp_path):
+    store = lane_store(tmp_path)
+    queued = runtime_submit(store, "5Q", {"max_num_seqs": 64})["id"]
+    other = {**PROFILE, "driver": "575.00"}
+    store.set_calibration(calibration_json(profile=other))
+    assert store.submission(queued)["state"] == "expired"  # never measured on an unsigned one
+    # in flight: the job turns stale on completion and expires rather than duelling again
+    store.set_calibration(calibration_json())
+    inflight = runtime_submit(store, "5R", {"max_num_seqs": 128})["id"]
+    lease = store.lease("runtime")
+    assert lease is not None
+    store.set_calibration(calibration_json(profile=other))
+    answer_both(store, lease, {"champion": "exact", "challenger": "exact"})
+    store.complete(lease["job"], lease["lease"], {"runtime": seconds_of(evidence_of())})
+    assert store.submission(inflight)["state"] == "expired"
+    assert store.lease("runtime") is None
+
+
+def _one_cell(**over: Any) -> dict[str, Any]:
+    return {"a": {**calibration_json()["cells"]["short"], "weight": 1.0, **over}}
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"blocks": runtime.MAX_BLOCKS + 1},
+        {"bootstrap_resamples": runtime.MAX_RESAMPLES + 1},
+        {"cells": _one_cell(cases=runtime.MAX_CELL_CASES + 1)},
+        {"cells": _one_cell(concurrency=runtime.MAX_CONCURRENCY + 1)},
+    ],
+)
+def test_calibration_workload_is_bounded(over):
+    with pytest.raises(runtime.RuntimeError_):
+        Calibration.from_json(calibration_json(**over))
+    Calibration.from_json(calibration_json(blocks=runtime.MAX_BLOCKS))  # the timings API's bound

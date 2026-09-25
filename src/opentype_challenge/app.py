@@ -128,7 +128,7 @@ class Timing(Answer):
     """One timed runtime task: the raw output (scored by the container) and its latency."""
 
     side: Literal["B", "C", "B2"]  # type: ignore[assignment]
-    block: int = Field(ge=0, lt=1000)
+    block: int = Field(ge=0, le=runtime.MAX_BLOCKS)
     cell: str = Field(max_length=64)
     ms: float = Field(ge=0, allow_inf_nan=False)
 

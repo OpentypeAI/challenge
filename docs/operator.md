@@ -299,7 +299,12 @@ Every threshold in it comes from your own pilot; this repository ships none.
    control. Each cell is `{"track" (decisions, longctx, ops or sql),
    "cases", "concurrency", "slo_ms", "weight", "warm"}`; weights sum to 1.
 
-Changing the calibration makes every running runtime job duel again under the new one.
+Changing the calibration makes every running runtime job duel again under the new one. A
+submission signs the profile digest: if the new calibration changes the profile, its
+queued and running runtime work expires and miners sign again. Withdrawing the calibration
+(`null`) parks runtime work in the queue until one is published again. Caps:
+`blocks` <= 999, `bootstrap_resamples` <= 100 000, per cell `cases` <= 10 000 and
+`concurrency` <= 1024.
 
 ### Runtime workers
 

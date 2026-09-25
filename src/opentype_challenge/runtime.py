@@ -29,6 +29,12 @@ LANES = ("quality", "runtime")
 BUDGETS = {"quality": 750_000_000, "runtime": 250_000_000}
 KERNELS = "disabled: no GPU backend with verified isolation (docs/operator.md, runtime lane)"
 SIDES = ("B", "C", "B2")
+# Operational caps on a calibration (an oversized one would hold the exclusive GPU for days):
+# MAX_BLOCKS matches the timings API's block bound.
+MAX_BLOCKS = 999
+MAX_CELL_CASES = 10_000
+MAX_CONCURRENCY = 1024
+MAX_RESAMPLES = 100_000
 CELL_TRACKS = ("decisions", "longctx", "ops", "sql")  # no judge in the runtime lane
 
 # Options checked against vllm/engine/arg_utils.py and vllm/config/scheduler.py at the pinned
@@ -169,8 +175,16 @@ class Calibration:
                 )
             if cell["track"] not in CELL_TRACKS:
                 raise RuntimeError_(f"cell {name}: track must be one of {CELL_TRACKS}")
-            if not (_count(cell["cases"]) and _count(cell["concurrency"])):
-                raise RuntimeError_(f"cell {name}: cases and concurrency must be positive ints")
+            if not (
+                _count(cell["cases"])
+                and _count(cell["concurrency"])
+                and cell["cases"] <= MAX_CELL_CASES
+                and cell["concurrency"] <= MAX_CONCURRENCY
+            ):
+                raise RuntimeError_(
+                    f"cell {name}: cases must be an int in [1, {MAX_CELL_CASES}] and "
+                    f"concurrency in [1, {MAX_CONCURRENCY}]"
+                )
             if not (_positive(cell["slo_ms"]) and _positive(cell["weight"])):
                 raise RuntimeError_(f"cell {name}: slo_ms and weight must be positive")
             if not isinstance(cell["warm"], bool):
@@ -178,10 +192,13 @@ class Calibration:
             cells[str(name)] = Cell(**{k: cell[k] for k in Cell.__dataclass_fields__})
         if not math.isclose(sum(c.weight for c in cells.values()), 1.0, abs_tol=1e-9):
             raise RuntimeError_("cell weights must sum to 1 (a missing cell is never renormalized)")
-        if not (_count(raw["blocks"]) and raw["blocks"] >= 3):
-            raise RuntimeError_("blocks must be an integer >= 3")
-        if not (_count(raw["bootstrap_resamples"]) and raw["bootstrap_resamples"] >= 1000):
-            raise RuntimeError_("bootstrap_resamples must be an integer >= 1000")
+        if not (_count(raw["blocks"]) and 3 <= raw["blocks"] <= MAX_BLOCKS):
+            raise RuntimeError_(f"blocks must be an integer in [3, {MAX_BLOCKS}]")
+        resamples = raw["bootstrap_resamples"]
+        if not (_count(resamples) and 1000 <= resamples <= MAX_RESAMPLES):
+            raise RuntimeError_(
+                f"bootstrap_resamples must be an integer in [1000, {MAX_RESAMPLES}]"
+            )
         for key in (
             "max_drift",
             "min_gain",
