@@ -1,4 +1,8 @@
-"""Per-decision half-Brier, the paired duel statistic, the crown rule and the level ladder."""
+"""Per-decision half-Brier, the paired duel statistic, the crown rule and the level ladder.
+
+v2 (docs/tracks.md §8, §11): harness cases score as one decision, and a weighted composite
+of per-track log ratios replaces the single log ratio when `weights` is given.
+"""
 
 from __future__ import annotations
 
@@ -22,10 +26,24 @@ NORM_TOLERANCE = 1e-3
 # Poisson UCB99 of a count observed as zero: a side's summed loss is floored here, so one duel
 # certifies at most ln(champion loss / 4.6) nats however perfect the challenger looks.
 ZERO_LOSS_FLOOR = -math.log(0.01)
+TRACK_GUARD_PAIRS = 30  # a track with at least this many pairs must not regress
+TRACK_REGRESSION = -math.log(1.02)  # UCB99 of a track's g may not fall below this
+# a track's g counts at most this much in a multi-track composite: one track alone (sql is
+# all public templates a miner can overfit) cannot clear the bar or mint several epochs
+TRACK_GAIN_CAP = math.log(2.0)
+# a crown needs this many guarded tracks (>= TRACK_GUARD_PAIRS pairs) whose g has a positive
+# LCB99, when the duel has that many guarded tracks
+GAIN_TRACKS = 2
+
+TrackMoments = tuple[int, float, float, float, float, float]  # (n, sa, sb, saa, sbb, sab)
 
 
 def _finite(value: Any) -> TypeGuard[float]:
-    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return abs(value) < 2**1023  # math.isfinite would raise OverflowError on wider ints
+    return isinstance(value, float) and math.isfinite(value)
 
 
 def _vector(gold: Gold, answer: Any) -> list[float] | None:
@@ -110,6 +128,13 @@ def score_case(
     return CaseScore(loss, len(gold), determined, correct, under_loss, under)
 
 
+def harness_score(loss: float) -> CaseScore:
+    """A harness case is one determined decision; correct only at zero loss."""
+    if not _finite(loss) or not 0.0 <= loss <= 1.0:
+        raise ValueError(f"harness loss {loss!r} is outside [0, 1]")
+    return CaseScore(float(loss), 1, 1, int(loss == 0), 0.0, 0)
+
+
 # ---------------------------------------------------------------------------
 # Paired statistics on cluster sums (cluster = case).
 
@@ -182,14 +207,57 @@ class Paired:
     level: int
     champion: CaseScore
     challenger: CaseScore
+    track: str = "decisions"
 
 
-def early_stop(pairs: Iterable[Paired], retired: set[int]) -> bool:
-    """Stop once 5 000 paired decisions show g < 0 by more than 3 SE."""
-    active = [p for p in pairs if p.level not in retired]
+def moments(pairs: Iterable[Paired]) -> dict[str, TrackMoments]:
+    """Per-track running sums of the paired case losses (a = champion, b = challenger)."""
+    out: dict[str, list[float]] = {}
+    for p in pairs:
+        a, b = p.champion.loss, p.challenger.loss
+        row = out.setdefault(p.track, [0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        for i, value in enumerate((1, a, b, a * a, b * b, a * b)):
+            row[i] += value
+    return {t: (int(r[0]), r[1], r[2], r[3], r[4], r[5]) for t, r in sorted(out.items())}
+
+
+def composite(
+    moments: Mapping[str, TrackMoments], weights: Mapping[str, float]
+) -> tuple[float, float]:
+    """(g, se): the weighted mean of per-track log ratios, each capped at TRACK_GAIN_CAP,
+    over tracks with >= 2 pairs and a positive weight; exactly log_ratio_moments when one
+    track is present."""
+    stats = [
+        (weights[t], *log_ratio_moments(*m))
+        for t, m in sorted(moments.items())
+        if m[0] >= 2 and weights.get(t, 0.0) > 0
+    ]
+    if not stats:
+        return 0.0, math.inf
+    if len(stats) == 1:
+        return stats[0][1], stats[0][2]
+    total = sum(w for w, _, _ in stats)
+    g = sum(w * min(g_t, TRACK_GAIN_CAP) for w, g_t, _ in stats) / total
+    se = math.sqrt(sum((w * se_t) ** 2 for w, _, se_t in stats)) / total
+    return g, se
+
+
+def _is_guard(p: Paired, retired: set[int]) -> bool:
+    return p.track == "decisions" and p.level in retired  # only decisions levels retire
+
+
+def early_stop(
+    pairs: Iterable[Paired], retired: set[int], weights: Mapping[str, float] | None = None
+) -> bool:
+    """Stop once 5 000 paired decisions show g < 0 by more than 3 SE (composite g with
+    weights)."""
+    active = [p for p in pairs if not _is_guard(p, retired)]
     if sum(p.champion.decisions for p in active) < EARLY_STOP_DECISIONS:
         return False
-    g, se = log_ratio([p.champion.loss for p in active], [p.challenger.loss for p in active])
+    if weights is None:
+        g, se = log_ratio([p.champion.loss for p in active], [p.challenger.loss for p in active])
+    else:
+        g, se = composite(moments(active), weights)
     return g + EARLY_STOP_SE * se < 0
 
 
@@ -214,20 +282,69 @@ def _level_metrics(pairs: Sequence[Paired]) -> dict[str, Any]:
     return out
 
 
-def verdict(pairs: Sequence[Paired], retired: set[int], stopped: bool) -> dict[str, Any]:
-    """The crown rule. Halves are the even and odd case indices."""
-    active = [p for p in pairs if p.level not in retired]
-    guard = [p for p in pairs if p.level in retired]
-    a = [p.champion.loss for p in active]
-    b = [p.challenger.loss for p in active]
-    g, se = log_ratio(a, b)
-    halves = [
-        lcb(
-            [p.champion.loss for p in active if p.index % 2 == h],
-            [p.challenger.loss for p in active if p.index % 2 == h],
-        )
-        for h in (0, 1)
-    ]
+def _track_metrics(pairs: Sequence[Paired]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for track, m in moments(pairs).items():
+        rows = [p for p in pairs if p.track == track]
+        g, se = log_ratio_moments(*m)
+        accuracy: dict[str, float | None] = {}
+        for side in ("champion", "challenger"):
+            determined = sum(getattr(p, side).determined for p in rows)
+            correct = sum(getattr(p, side).correct for p in rows)
+            accuracy[side] = correct / determined if determined else None
+        out[track] = {
+            "g": g,
+            "se": se,
+            "pairs": m[0],
+            "champion_loss": m[1],
+            "challenger_loss": m[2],
+            "accuracy": accuracy,
+            "regressed": m[0] >= TRACK_GUARD_PAIRS and g + Z99 * se < TRACK_REGRESSION,
+            "gained": m[0] >= TRACK_GUARD_PAIRS and g - Z99 * se > 0,
+        }
+    return out
+
+
+def _halves(pairs: Sequence[Paired], keep: set[int]) -> tuple[list[Paired], list[Paired]]:
+    """The kept pairs split by the parity of their rank within their track, ranked by case
+    index over all pairs: every track splits evenly, so each half replicates the whole
+    composite whatever the plan's interleave. A decisions-only duel gets v1's halves."""
+    halves: tuple[list[Paired], list[Paired]] = ([], [])
+    rank: dict[str, int] = {}
+    for p in sorted(pairs, key=lambda p: p.index):
+        k = rank.get(p.track, 0)
+        rank[p.track] = k + 1
+        if p.index in keep:
+            halves[k % 2].append(p)
+    return halves
+
+
+def verdict(
+    pairs: Sequence[Paired],
+    retired: set[int],
+    stopped: bool,
+    weights: Mapping[str, float] | None = None,
+) -> dict[str, Any]:
+    """The crown rule. Halves are the even and odd case indices. With weights: the composite
+    g with halves by within-track rank, the retired-level guard on decisions and the
+    per-track regression guard."""
+    active = [p for p in pairs if not _is_guard(p, retired)]
+    guard = [p for p in pairs if _is_guard(p, retired)]
+    if weights is None:  # v1: even and odd case indices
+        g, se = log_ratio([p.champion.loss for p in active], [p.challenger.loss for p in active])
+        halves = [
+            lcb(
+                [p.champion.loss for p in active if p.index % 2 == h],
+                [p.challenger.loss for p in active if p.index % 2 == h],
+            )
+            for h in (0, 1)
+        ]
+    else:
+        g, se = composite(moments(active), weights)
+        halves = []
+        for half in _halves(pairs, {p.index for p in active}):
+            g_h, se_h = composite(moments(half), weights)
+            halves.append(g_h - Z99 * se_h)
     g_lcb = min(halves)
     guard_ucb = ratio_ucb(
         [
@@ -238,7 +355,14 @@ def verdict(pairs: Sequence[Paired], retired: set[int], stopped: bool) -> dict[s
         [p.champion.determined for p in guard],
     )
     crown = not stopped and g_lcb >= G_MIN and guard_ucb <= GUARD_MAX
-    return {
+    tracks = _track_metrics(active) if weights is not None else None
+    if tracks is not None:
+        crown = crown and not any(t["regressed"] for t in tracks.values())
+        # breadth: one overfit track (capped above) must not carry a multi-track duel
+        guarded = sum(t["pairs"] >= TRACK_GUARD_PAIRS for t in tracks.values())
+        gained = sum(t["gained"] for t in tracks.values())
+        crown = crown and gained >= min(GAIN_TRACKS, guarded)
+    result = {
         "crown": crown,
         "early_stop": stopped,
         "g": g,
@@ -252,6 +376,17 @@ def verdict(pairs: Sequence[Paired], retired: set[int], stopped: bool) -> dict[s
         "decisions": sum(p.champion.decisions for p in pairs),
         "levels": _level_metrics(pairs),
     }
+    if tracks is not None:
+        # levels collide across tracks: the ladder metrics are the decisions track's
+        result["levels"] = _level_metrics([p for p in pairs if p.track == "decisions"])
+        result["tracks"] = tracks
+        result["track_guard"] = {
+            "pairs": TRACK_GUARD_PAIRS,
+            "min": TRACK_REGRESSION,
+            "gain_cap": TRACK_GAIN_CAP,
+            "gain_tracks": GAIN_TRACKS,
+        }
+    return result
 
 
 # ---------------------------------------------------------------------------

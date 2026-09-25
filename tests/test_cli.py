@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from opentype_challenge import bank, cli, generator, miner, pins
+from opentype_challenge import bank, cli, generator, harness, miner, pins, tracks
 from opentype_challenge.crypto import decode_hotkey, manifest_digest, submit_message, verify
 
 
@@ -17,6 +17,57 @@ def test_generate_writes_jsonl_with_exact_targets(tmp_path):
         solved = generator.solve(row["request"])
         for qid, (_kind, _options, probs) in row["gold"].items():
             assert solved[qid] == pytest.approx(probs)
+
+
+def test_generate_harness_track_writes_body_and_oracle(tmp_path):
+    out = tmp_path / "paint.jsonl"
+    cli.main(["generate", "--track", "paint", "--level", "1", "--n", "2", "--out", str(out)])
+    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    assert [row["track"] for row in rows] == ["paint", "paint"]
+    for row in rows:
+        body = row["request"]
+        assert body["harness"] == "paint" and "rubric" not in json.dumps(body)
+        _, loss = harness.replay(tracks.ENVS["paint"], body, row["oracle"])
+        assert loss == 0
+    with pytest.raises(SystemExit):  # depict needs a teacher bank
+        cli.main(["generate", "--track", "paint", "--level", "3", "--n", "1"])
+
+
+def test_generate_longctx_has_exact_targets(tmp_path):
+    out = tmp_path / "lc.jsonl"
+    cli.main(["generate", "--track", "longctx", "--level", "1", "--n", "1", "--out", str(out)])
+    row = json.loads(out.read_text())
+    solved = tracks.solve_body(row["request"])
+    for qid, (_kind, _options, probs) in row["gold"].items():
+        assert solved[qid] == pytest.approx(probs)
+
+
+def test_audit_with_plan_beacon_and_bank(capsys, tmp_path):
+    secret = secrets.token_bytes(32)
+    beacon = {"round": 7, "randomness": "ab" * 32}
+    plan = {"decisions": {"weight": 0.5, "cases": 2}, "paint": {"weight": 0.5, "cases": 2}}
+    item = bank.BankItem.make(
+        "depict", {"subject": "a cat", "brief": "A cat.", "rubric": ["a", "b", "c", "d"]}
+    )
+    window_bank = bank.Bank((item,))
+    (tmp_path / "bank.json").write_text(json.dumps(window_bank.to_json()))
+    seed = bank.job_seed(secret, "j_2", "d" * 64, beacon)
+    typed = {t: tracks.TrackPlan(float(p["weight"]), int(p["cases"])) for t, p in plan.items()}
+    expected = bank.cases_digest(
+        tracks.job_case(seed, typed, {"1": 1.0}, i, window_bank, True).body for i in range(4)
+    )
+    args = ["audit", "--window-secret", secret.hex(), "--job", "j_2", "--digest", "d" * 64]
+    args += ["--mix", '{"1": 1.0}', "--cases", "4", "--plan", json.dumps(plan)]
+    args += ["--beacon", json.dumps(beacon), "--judge", "--bank-file", str(tmp_path / "bank.json")]
+    cli.main(args)
+    assert json.loads(capsys.readouterr().out)["cases_sha256"] == expected
+
+
+def test_worker_takes_max_model_len():
+    args = cli.parser().parse_args(
+        ["worker", "--api", "a", "--token-file", "t", "--workdir", "w", "--max-model-len", "65536"]
+    )
+    assert args.max_model_len == 65536
 
 
 def test_audit_regenerates_cases(capsys):

@@ -4,83 +4,104 @@
 
 | Component | Where | Role |
 | --- | --- | --- |
-| challenge container | `ghcr.io/opentypeai/challenge` (target `server`) | Cortex contract v1. Handles intake, windows, the duel queue, scoring, the crown rule, the ledger and `get_weights`. It uses SQLite on `/data` and needs no GPU. |
-| duel worker | `ghcr.io/opentypeai/challenge-worker` (target `worker`) | A B300 host. It leases a job, downloads and verifies both models, serves them with vLLM and the pinned `structured_server.py`, reads every case on both sides and posts the answers. |
-| Cortex master | upstream | Proxies `/challenge/opentype/*`, polls `get_weights` once per completed epoch, signs leaves and seals the epoch. |
+| challenge container | `ghcr.io/opentypeai/challenge` (target `server`) | Cortex contract v1: intake, windows and banks, the duel queue, case building, replay, judging, scoring, the crown rule, the ledger and `get_weights`. SQLite on `/data`, no GPU. |
+| teacher gateway | operator-provided, OpenAI-compatible | `POST /v1/chat/completions` for the teacher, the extractors and the judge. Optional. |
+| duel worker | `ghcr.io/opentypeai/challenge-worker` (target `worker`) | A B300 host. It leases a job, downloads and verifies both models, runs `vllm serve` and the pinned `structured_server.py` for each side, runs every case on both sides and posts the results. |
+| Cortex master | upstream | Proxies `/challenge/opentype/*`, polls `get_weights` once per epoch, signs leaves and seals the epoch. |
 | miner CLI | `opentype-challenge miner` | Builds and signs a manifest of a public HF commit, then posts it. |
-| auditor | `opentype-challenge audit` | Regenerates the cases of a revealed window and compares them with the published digests. |
+| auditor | `opentype-challenge audit` | Rebuilds the cases of a revealed window and compares their digests. |
 
 ## Modules (`src/opentype_challenge/`)
 
 | Module | Contents |
 | --- | --- |
-| `generator.py` | 4 families (support ticket, invoice approval, security alert, agent trace) and levels 1–8. It holds the rule interpreter, the compiled evaluator (N-version), the parser, the renderer and extractor (round trip), the exact posterior, the probes and the text-level reference solver. It uses only the standard library. |
-| `bank.py` | Window commitment, the per-job seed `HMAC(secret_w, job_id \| digest)`, level sampling, `job_case(seed, mix, i)` and the cases digest. |
-| `scoring.py` | Half-Brier with forfeit, the paired log-ratio with delta-method LCB99, the crown rule, the regression guard, early stop, the Wilson retirement bound, the ladder and the duel mix. |
-| `ledger.py` | Integer entitlements (1e-9 epoch-mass) and FIFO payment. |
-| `store.py` | The SQLite state machine: windows, nonces, submissions, jobs, results, champions, per-level champion statistics, entitlements, epochs and payments. |
-| `app.py` | FastAPI routes, auth, body limits and the metagraph cache. |
-| `worker.py` | Weight assembly and verification, the injectable `Launcher` (`VllmLauncher` in production), the paired read loop, heartbeats and failure classification. |
-| `miner.py`, `crypto.py` | Manifests, sr25519 signing and verification, and SS58. |
-| `pins.py` | Base model revision and file digests, vLLM image, `structured_server.py` URL and sha256. |
-| `cli.py` | `serve`, `worker`, `generate`, `audit`, `miner submit`, `miner status`. |
+| `generator.py` | The decisions track: 4 public families, sealed-family JSON (`family_from_json`, `family_to_json`), levels 1–8, the rule interpreter and compiled evaluator (N-version), the parser, the renderer and extractor (round trip), the exact posterior, probes, prose states (`sample_known`, `make_case(..., prose)`) and the text-level solvers `solve` and `solve_known`. Standard library only. |
+| `longctx.py` | The long-context track: dossiers, corrections, near-duplicate ids and `solve(body)`. |
+| `harness.py` | `Env`, `parse_action`, `chat_messages`, `run_episode` (worker side) and `replay` (container side). |
+| `ops.py`, `sqltask.py`, `paint.py` | The three envs: worlds and tasks, tools, `policy` / reference SQL / pixel checks, `reference_policy` oracles. `paint` also holds `render_png` and the judge prompt (`judge_request`, `judge_loss`). |
+| `teacher.py` | The gateway client (retries, structured output, SSE, schema validation, token read per call), `round_trip`, `build_bank` and `judge_png`. |
+| `bank.py` | `BankItem`, `Bank`, `bank_digest`, the window commitment, `drand_beacon`, `job_seed`, level sampling and the cases digest. |
+| `tracks.py` | `TRACKS`, `ENVS`, `TrackPlan`, `DEFAULT_PLAN`, `effective_plan`, `track_of`, `job_case`, `score_item` and `solve_body`. |
+| `scoring.py` | Half-Brier with forfeit, `harness_score`, the paired log ratio, `composite`, the per-track guard, the crown rule, early stop, the Wilson bound, the ladder and the duel mix. |
+| `ledger.py` | Integer entitlements and FIFO payment. |
+| `store.py` | The SQLite state machine: windows and banks, nonces, submissions, jobs (plan, beacon, judge flag), results with `track`, judgments, champions, level statistics, entitlements, epochs. It holds a byte-bounded case cache (128 MiB) and migrates a v1 database in place (`PRAGMA user_version` 2). |
+| `app.py` | FastAPI routes, auth, body limits, the metagraph cache, teacher wiring, and background tasks for judging, settling, auto-rotation and the bank builder. |
+| `worker.py` | Weight assembly and verification, `VllmLauncher` (`--max-model-len`, `--limit-mm-per-prompt`), the read and episode loop, heartbeats and failure classification. |
+| `miner.py`, `crypto.py` | Manifests, sr25519 signing and verification, SS58. |
+| `pins.py` | The base revision and file digests, the vLLM image, the `structured_server.py` URL and sha256. |
+| `cli.py` | `serve`, `worker`, `generate` (every track), `audit`, `miner submit`, `miner status`. |
 
 ## Life of a submission
 
-1. **Intake.** A miner signs `opentype-submit-v1|<pubkey hex>|<manifest digest>|<nonce>|<exp>`
-   with its sr25519 hotkey. The container validates the manifest, then the signature,
-   expiry (at most 300 s) and nonce. It then checks registration (the master's
-   `/v1/metagraph/latest`, cached for 30 s), allows one open submission per hotkey and at
-   most `max_pending` queued in total, and refuses a byte-identical clone of the champion.
-   The submission receives an `intake` number, which is a total order.
-2. **Job.** A job binds the submission to the current champion, the open window and a level
-   mix. Its seed is `HMAC(secret_w, job_id | challenger digest)`. The job is re-targeted at
-   lease time, so a job that waited in the queue always duels the current champion under
-   the current ladder.
-3. **Lease.** The worker receives both manifests and a 30-minute lease. Heartbeats extend
-   the lease every 5 minutes, and every batch of answers renews it.
-4. **Duel.** The worker verifies the pinned base support files once and keeps them, and
-   keeps the current champion's verified weights between jobs. It downloads the challenger
-   anonymously at the committed revision and checks every sha256. It starts
-   `vllm serve` and `structured_server.py` for each side, pages cases (100 per page),
-   reads each case on both sides with the same body and seed, and posts answers in batches
-   under 900 KiB. The container scores every answer as it arrives and returns `continue`.
-   It returns `false` on early stop, when the champion changed, or when every case is
-   paired.
-5. **Complete.** The container computes the verdict and records the champion's per-level
-   statistics, retires mastered levels and settles the queue in intake order. A job scored
-   against a champion that has since changed is superseded and re-queued against the new
-   one. A loser is rejected. A winner is crowned only once every earlier intake against the
-   same champion is settled, so earliest intake wins.
-6. **Crown.** The challenger becomes the champion, and its per-level accuracy seeds the next
-   duel mix. The ledger receives an entitlement of `g_LCB / g_min` epoch-masses.
-7. **Weights.** The master's first `get_weights` call for an epoch pays outstanding
-   entitlements first in, first out, up to one epoch-mass. The rest burns
-   (`full_share_mass = 1.0`). The body is persisted, and every later call returns the same
-   bytes.
-8. **Reveal.** When the operator rotates the window, the old secret is published. Anyone can
-   then regenerate every served case and compare the result with the worker's
-   `cases_sha256`.
+1. **Intake.** The miner signs `opentype-submit-v1|<pubkey hex>|<manifest digest>|<nonce>|<exp>`.
+   The container validates the manifest, the signature, the expiry (at most 300 s) and the
+   nonce. It checks the registration against the master metagraph (cached 30 s), allows one
+   open submission per hotkey and `max_pending` in total, and refuses a clone of the
+   champion. Each submission gets a total-order `intake` number.
+2. **Job.** A job binds the submission to the champion and the open window. At lease time,
+   it is re-targeted to the current champion, window, ladder mix, effective plan and judge
+   flag. The first lease fetches the drand beacon and stores it. The seed is
+   `job_seed(secret_w, job, digest, beacon)`.
+3. **Lease.** The worker receives both manifests, the plan, the case count and a 30-minute
+   lease. Heartbeats extend the lease every 5 minutes, and so does every answers batch.
+4. **Duel.** The worker verifies the base support files and the champion (cached), then
+   downloads the challenger anonymously and checks every sha256. It starts vLLM and the
+   structured server for each side. It pages cases (`{index, track, body}`, 100 per page,
+   under 6 MiB) and runs each case on both sides:
+   - read tracks post the body to `reader/v1/systemone`;
+   - harness tracks run `harness.run_episode` against `chat/v1/chat/completions`
+     (temperature 0, `seed = body.seed + turn`) and keep the raw outputs.
+
+   Items are posted in batches under 900 KiB.
+5. **Scoring as answers arrive.** For every item, the container rebuilds the case from the
+   seed and the bank. Read items are scored with half-Brier. Harness items go through
+   `replay`. A `depict` item is replayed, rendered by the container and stored as a
+   pending judgment. The container answers `continue: false` on early stop, when the
+   champion changes, or when every case has both sides.
+6. **Complete.** When the job has pending judgments, it moves to `judging`. The container
+   judges inline for up to 20 s, and a background task (every 30 s) finishes the rest.
+   Unjudged cases are removed on both sides. The job is then settled: the verdict, the
+   champion's decisions-level statistics, retirement, and the queue in intake order. A job
+   scored against a replaced champion is superseded and re-queued. A loser is rejected. A
+   winner is crowned once every earlier intake against the same champion is settled.
+7. **Crown.** The challenger becomes the champion, and the ledger receives `g_LCB / g_min`
+   epoch-masses.
+8. **Weights.** The first `get_weights` of an epoch pays FIFO up to one epoch-mass, burns
+   the rest and persists the body.
+9. **Reveal.** Rotation, manual or automatic once the next bank is ready and the window is
+   at least `OPENTYPE_WINDOW_HOURS` old, publishes the old secret, its jobs (digest, mix,
+   plan, beacon, judge flag, `cases_sha256`) and its bank. Anyone can then run the audit.
+
+In parallel, when a teacher is configured, the builder task keeps one **next bank** ready.
+It builds the bank, stores it unsealed in `meta.next_bank`, and the next rotation seals it
+into the new window.
 
 ## Failure classes
 
 | Failure | Classified as | Effect |
 | --- | --- | --- |
 | manifest invalid, sha256 mismatch, repo private, gated or missing, `config.json` differs from the base | challenger | rejected, no retry |
-| reader `4xx` on one case (invalid output) | challenger | that case forfeits (loss 1 per decision) |
-| hub or network error, reader `5xx`, a server that never became healthy, any unexpected exception, a champion download problem | infrastructure | re-queued, and `failed` after 3 attempts |
-| lease expired (worker died) | infrastructure | re-queued at the next lease call, with the same 3-attempt limit |
+| reader or chat `4xx` on one case, or a chat reply without `choices[0].message.content` | challenger | that case forfeits for that side (loss 1 per decision) |
+| unparseable action, invalid tool call, turns exhausted | challenger (in-episode) | an error observation, or the episode ends and the final state is scored |
+| a transcript longer than the turn limit or an output over 8,192 characters | worker or challenger | that side forfeits the case |
+| hub or network error, reader or chat `5xx` or transport error, a server that never became healthy, a champion download problem, an unexpected exception | infrastructure | re-queued, and `failed` after 3 attempts |
+| lease expired (worker died) | infrastructure | re-queued at the next lease call, same 3-attempt limit |
+| a judge that cannot give a valid verdict after 5 attempts | judge | the case is `unjudged` and dropped on both sides |
+| a bank build error | teacher | logged and retried after 10 minutes; the current window keeps running and does not rotate automatically |
+| drand unreachable | beacon | the job uses the v1 seed and records a `null` beacon |
 
 ## Contract v1 conformance
 
 - The container serves port 8000 as UID 65532 with a read-only root, a `/tmp` tmpfs and
-  `/data` as the only writable path. The image creates `/data` owned by `65532:65532`.
-- The container reads token files lazily on each request, so `serve` starts without them
-  (supervisor canary). A route whose token file is missing answers `503`.
-- `/version` is liveness and answers without state or secrets. `/health` is readiness: it
-  requires the state volume to be writable and the internal token to be readable.
+  `/data` as the only writable path.
+- Token files are read lazily, so `serve` starts without secrets (supervisor canary). A
+  route whose token file is missing answers `503`. The teacher token is checked at startup,
+  and without it the teacher is off.
+- `/version` is liveness. `/health` is readiness: the state volume must be writable and the
+  internal token readable.
 - `get_weights` requires the internal bearer (`401`) and the slug header (`403`). The first
-  answer for an epoch is final and replayed byte for byte, and `full_share_mass` is `1.0`.
-- The container needs no outbound access except `GET {CHALLENGE_MASTER_URL}/v1/metagraph/latest`.
-  The worker reaches the container only through the master proxy, so worker request bodies
-  stay under 1 MiB and responses under 8 MiB.
+  answer for an epoch is final and replayed byte for byte, with `full_share_mass: 1.0`.
+- Outbound access: `GET {CHALLENGE_MASTER_URL}/v1/metagraph/latest`, plus, optionally,
+  `https://api.drand.sh/public/latest` and `{OPENTYPE_TEACHER_URL}/v1/chat/completions`.
+- The worker reaches the container only through the master proxy. Request bodies stay
+  under 1 MiB and responses under 8 MiB (case pages are capped at 6 MiB).

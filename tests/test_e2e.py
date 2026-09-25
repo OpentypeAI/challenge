@@ -1,23 +1,41 @@
-"""Full duels: intake -> worker (real processes, fake inference) -> crown -> ledger -> weights."""
+"""Full duels: intake -> worker (real processes, fake inference) -> crown -> ledger -> weights.
+
+The multi-track duel runs every track against a fake teacher bank (one sealed family, prose,
+ops stories, depict briefs) and a fake judge; decisions-only duels keep v1's settings.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
+import random
 import secrets
 import socket
 import sys
+import time
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
+from PIL import Image
 
-from opentype_challenge import pins
-from opentype_challenge.bank import cases_digest, job_case, job_seed
+from opentype_challenge import generator as g
+from opentype_challenge import ops, paint, pins, tracks
+from opentype_challenge.app import Config, create_app
+from opentype_challenge.bank import Bank, BankItem, bank_digest, cases_digest, job_seed
+from opentype_challenge.store import Settings
+from opentype_challenge.tracks import TrackPlan
 from opentype_challenge.worker import Api, JobFailed, VllmLauncher, Worker, assemble
 
 from .conftest import ADMIN, INTERNAL, SLUG, WORKER, Miner, bearer, submit
+from .test_generator import sealed_payload
+from .test_ops import STORY_INTENT
+from .test_paint import DEPICT
 
 FAKE = Path(__file__).with_name("fake_inference.py")
 BASE_SUPPORT = {name: f"base support {name}".encode() for name in pins.BASE_SUPPORT_FILES}
@@ -88,6 +106,127 @@ def launcher(tmp_path):
     )
 
 
+PLAN = {
+    "decisions": TrackPlan(0.35, 160),
+    "longctx": TrackPlan(0.25, 16),
+    "ops": TrackPlan(0.15, 32),
+    "sql": TrackPlan(0.10, 32),
+    "paint": TrackPlan(0.15, 40),
+}
+BEACON = {"round": 4242, "randomness": "ab" * 32}
+
+
+def template_prose(rng: random.Random, family: g.Family) -> dict[str, Any]:
+    """A prose payload whose text is template lines (no record header), so the fake reader's
+    text-only solver stays exact on it, as the teacher's round trip guarantees for real prose."""
+    known, hidden = g.sample_known(rng, family, g.LEVELS[2].hidden)
+    for _ in range(g.MAX_ATTEMPTS):
+        text = "\n".join(g.render_state(rng, family, known, g.LEVELS[2]).split("\n")[1:])
+        if g.extract(family, text) == known and "#" not in text:
+            break
+    else:
+        raise AssertionError("no template prose round-trips")
+    return {"family": family.name, "known": known, "hidden": hidden, "text": text, "style": "log"}
+
+
+def fake_bank() -> list[BankItem]:
+    """One sealed family, prose for it and two public families, an ops story (in the template
+    wording, so the oracle can play it), a depict brief."""
+    sealed = g.family_from_json(sealed_payload("e2e0cafe"))
+    story = {"intent": STORY_INTENT, "text": ops.render_intent(STORY_INTENT)}
+    items = [
+        BankItem.make("family", sealed_payload("e2e0cafe")),
+        BankItem.make("ops_story", story),
+        BankItem.make("depict", DEPICT),
+    ]
+    for i, family in enumerate([sealed, *g.FAMILIES[:2]] * 2):
+        items.append(BankItem.make("prose", template_prose(random.Random(f"e2e|{i}"), family)))
+    return items
+
+
+class Teacher:
+    """The injected bank builder and judge: records every call, never touches a gateway."""
+
+    def __init__(self) -> None:
+        self.items = fake_bank()
+        self.builds = 0
+        self.judged: list[tuple[str, list[str], bytes]] = []
+
+    async def bank_builder(self, *_args: Any, **_kwargs: Any) -> list[BankItem]:
+        self.builds += 1
+        return list(self.items)
+
+    async def judge(self, *args: Any, **kwargs: Any) -> float:
+        """0 for any drawing, 1 for a blank canvas (the negative control fails everything).
+        ponytail: finds (brief, rubric, png) by type because §8 fixes only judge=; pin the
+        signature once store.py settles it."""
+        values = [*args, *kwargs.values()]
+        png = next(v for v in values if isinstance(v, bytes))
+        brief = next(v for v in values if isinstance(v, str))
+        rubric = next(list(v) for v in values if isinstance(v, list | tuple))
+        self.judged.append((brief, rubric, png))
+        with Image.open(io.BytesIO(png)) as image:
+            blank = image.convert("RGB").getextrema() == ((255, 255), (255, 255), (255, 255))
+        return 1.0 if blank else 0.0
+
+
+@pytest.fixture
+def teacher() -> Teacher:
+    return Teacher()
+
+
+@pytest.fixture
+def duel_client(tmp_path, secrets_dir, clock, master, teacher, hub) -> Iterator[TestClient]:
+    """The container with the multi-track plan, the fake teacher and a fixed drand beacon."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.drand.sh":
+            return httpx.Response(200, json=BEACON)
+        return master.handler(request)
+
+    config = Config(
+        slug=SLUG,
+        state_dir=tmp_path / "duel-data",
+        master_url="http://master.test",
+        internal_token_file=secrets_dir / "internal.token",
+        admin_token_file=secrets_dir / "admin.token",
+        worker_token_file=secrets_dir / "worker.token",
+        settings=Settings(plan=PLAN),
+    )
+    app = create_app(
+        config,
+        clock,
+        httpx.MockTransport(handler),
+        judge=teacher.judge,
+        bank_builder=teacher.bank_builder,
+    )
+    with TestClient(app) as client:
+        yield client
+
+
+def _open_bank_window(client: TestClient, expected: str) -> dict[str, Any]:
+    """Rotate until the open window carries the fake bank (the builder runs in background)."""
+    for _ in range(100):
+        windows = client.get("/v1/windows").json()["windows"]
+        current = [w for w in windows if w["closed_at"] is None][-1]
+        if current.get("bank_digest") == expected:
+            return current
+        client.post("/v1/admin/window/rotate", headers=bearer(ADMIN))
+        time.sleep(0.05)
+    raise AssertionError(f"no window opened with bank {expected}: {windows}")
+
+
+def _published_bank(client: TestClient, window_id: int) -> Bank:
+    rows: list[Any] = []
+    while True:
+        page = client.get(
+            f"/v1/windows/{window_id}/bank", params={"offset": len(rows), "limit": 100}
+        ).json()
+        rows += page["items"]
+        if not page["items"] or len(rows) >= page.get("total", len(rows)):
+            return Bank.from_json(rows)
+
+
 def _worker(client, tmp_path, hub, launcher) -> tuple[Worker, httpx.AsyncClient]:
     api_client = httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app))
     worker = Worker(
@@ -115,8 +254,10 @@ def weights(client, epoch):
     )
 
 
-def test_duel_crowns_pays_and_audits(make_client, miner, clock, hub, launcher, tmp_path):
-    client = make_client(duel_cases=240)
+def test_duel_crowns_pays_and_audits(duel_client, teacher, miner, clock, hub, launcher, tmp_path):
+    client = duel_client
+    expected_digest = bank_digest(teacher.items)
+    window = _open_bank_window(client, expected_digest)
     manifest = hub.publish("miner/exact", "exact")
     sid = submit(client, miner, manifest, clock).json()["id"]
 
@@ -127,6 +268,20 @@ def test_duel_crowns_pays_and_audits(make_client, miner, clock, hub, launcher, t
     assert verdict["crown"] and verdict["g_lcb"] >= verdict["g_min"]
     challenger = verdict["levels"]["1"]["challenger"]
     assert challenger["accuracy"] == 1.0  # exact gold: 100 % is reachable
+
+    # Per-track metrics: every buildable track is present, and the container's replay of the
+    # harness transcripts gives the oracle (exact) zero loss and the base champion some loss.
+    bank = Bank(tuple(teacher.items))
+    plan = tracks.effective_plan(PLAN, bank, judge=True)
+    assert set(verdict["tracks"]) == set(plan)
+    for track, metrics in verdict["tracks"].items():
+        assert metrics["pairs"] == plan[track].cases, track
+        assert metrics["accuracy"]["challenger"] == 1.0, track
+        if track in tracks.ENVS:
+            assert metrics["challenger_loss"] == 0.0, track
+    assert sum(verdict["tracks"][t]["champion_loss"] for t in tracks.ENVS if t in plan) > 0
+    assert verdict.get("unjudged", 0) == 0
+
     evidence = result["job"]["evidence"]
     assert (
         evidence["challenger_files"]["model.safetensors"] == manifest["files"]["model.safetensors"]
@@ -135,7 +290,9 @@ def test_duel_crowns_pays_and_audits(make_client, miner, clock, hub, launcher, t
         evidence["challenger_files"]["tokenizer.json"] == pins.BASE_SUPPORT_FILES["tokenizer.json"]
     )
     assert evidence["structured_server_sha256"] == hashlib.sha256(FAKE.read_bytes()).hexdigest()
-    assert evidence["cases_fetched"] == 240
+    assert evidence["max_model_len"] == 131072
+    total = sum(p.cases for p in plan.values())
+    assert evidence["cases_fetched"] == total and evidence["errors"] == 0
     assert not (tmp_path / "work" / result["job"]["id"]).exists()  # weights deleted
 
     status = client.get("/v1/status").json()
@@ -151,13 +308,29 @@ def test_duel_crowns_pays_and_audits(make_client, miner, clock, hub, launcher, t
     assert paid == pytest.approx(entitlement, abs=1e-6)
     assert weights(client, 100).json()["weights"] == {miner.hotkey: 1.0}
 
-    # After rotation the secret is revealed and anyone regenerates the exact served cases.
+    # After rotation the secret and the bank are revealed and anyone regenerates the exact
+    # served cases from the secret, the job, the drand beacon and the bank.
     client.post("/v1/admin/window/rotate", headers=bearer(ADMIN))
-    window = client.get("/v1/windows/1").json()
-    job = window["jobs"][0]
-    seed = job_seed(bytes.fromhex(window["secret"]), job["id"], job["digest"])
-    regenerated = cases_digest(job_case(seed, job["mix"], i).body for i in range(job["cases"]))
+    revealed = client.get(f"/v1/windows/{window['id']}").json()
+    assert revealed["bank_digest"] == expected_digest
+    published = _published_bank(client, window["id"])
+    assert published.digest == expected_digest
+    job = revealed["jobs"][0]
+    assert job["beacon"] == BEACON
+    seed = job_seed(bytes.fromhex(revealed["secret"]), job["id"], job["digest"], job["beacon"])
+    cases = [
+        tracks.job_case(seed, PLAN, job["mix"], i, published, judge=True)
+        for i in range(job["cases"])
+    ]
+    regenerated = cases_digest(case.body for case in cases)
     assert regenerated == job["cases_sha256"] == evidence["cases_sha256"]
+
+    # Every depict case was judged once per side, on the container's render with the rubric.
+    depicts = [c for c in cases if c.track == "paint" and paint.LEVELS[c.level] == "depict"]
+    assert len(teacher.judged) == 2 * len(depicts)
+    for brief, rubric, png in teacher.judged:
+        assert brief == DEPICT["brief"] and DEPICT["rubric"][0] in rubric
+        assert png.startswith(b"\x89PNG")
 
 
 def test_worse_challenger_is_rejected_and_early_stopped(
@@ -249,6 +422,9 @@ def test_stale_champion_requeues_and_earliest_intake_wins(
     assert store.submission(b)["job"]["state"] == "scored"
     asyncio.run(_answer_perfectly(client, lease_a))
     assert store.submission(a)["state"] == "crowned"
+    # the duel ran on the empty bank (public templates only): the crown pays nothing
+    board = client.get("/v1/leaderboard").json()["hotkeys"][first.hotkey]
+    assert store.submission(a)["job"]["verdict"]["g_lcb"] > 0 and board["entitlement"] == 0
     job_b = store.submission(b)["job"]
     assert store.submission(b)["state"] == "queued" and job_b["id"] != lease_b["job"]
     assert job_b["champion"] == 2  # re-targeted at the new champion
@@ -262,8 +438,6 @@ def test_stale_champion_requeues_and_earliest_intake_wins(
 async def _answer_perfectly(client, lease) -> None:
     """Answer a leased job with the exact posterior for the challenger and a blurred
     champion, straight through the worker API."""
-    from opentype_challenge.generator import solve
-
     from .fake_inference import answer, blur
 
     headers = bearer(WORKER)
@@ -290,7 +464,7 @@ async def _answer_perfectly(client, lease) -> None:
             offset += len(page)
         items = []
         for case in cases:
-            body, gold = case["body"], solve(case["body"])
+            body, gold = case["body"], tracks.solve_body(case["body"])
             for side, skill in (("champion", "base"), ("challenger", "exact")):
                 items.append(
                     {

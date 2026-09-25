@@ -52,6 +52,9 @@ def test_unparseable_reads_forfeit():
     assert s.decision_loss(CHOICE, good, {"label_mass": 0.4, "argmax_is_label": True})[0] == 1
     assert s.decision_loss(CHOICE, good, {"label_mass": 0.9, "argmax_is_label": False})[0] == 1
     assert s.decision_loss(NOUL, {"noul": float("inf")}, READ)[0] == 1
+    assert s.decision_loss(NOUL, {"noul": 10**400}, READ)[0] == 1
+    assert s.decision_loss(CHOICE, choice([0, 10**400, 0]), READ)[0] == 1
+    assert s.decision_loss(CHOICE, good, {"label_mass": 10**400, "argmax_is_label": True})[0] == 1
     wrong_legend = {"legend": {"0": "mid", "1": "low", "2": "high"}, "probabilities": {}}
     assert s.decision_loss(SCORE, wrong_legend, READ)[0] == 1
 
@@ -186,3 +189,174 @@ def test_ladder_and_mix():
     assert mix[1] == pytest.approx(s.GUARD_SHARE)
     assert mix[2] >= s.MIX_FLOOR * (1 - s.GUARD_SHARE) * 0.9 and mix[3] > mix[2]
     assert s.duel_mix([4], [], {}) == {4: 1.0}
+
+
+# -- v2: tracks, composite, per-track guard (docs/tracks.md §8, §11) -----------------
+
+
+def retrack(pairs, track, offset=0):
+    return [s.Paired(p.index + offset, p.level, p.champion, p.challenger, track) for p in pairs]
+
+
+def harness_duel(rng, n, champion_loss, challenger_loss, track, offset):
+    """Per-case 0/1 harness losses with the given rates."""
+    return [
+        s.Paired(
+            offset + i,
+            1,
+            s.harness_score(float(rng.random() < champion_loss)),
+            s.harness_score(float(rng.random() < challenger_loss)),
+            track,
+        )
+        for i in range(n)
+    ]
+
+
+def test_harness_score_is_one_decision():
+    assert s.harness_score(0.0) == s.CaseScore(0.0, 1, 1, 1, 0.0, 0)
+    assert s.harness_score(0.25) == s.CaseScore(0.25, 1, 1, 0, 0.0, 0)
+    for bad in (-0.1, 1.5, float("nan")):
+        with pytest.raises(ValueError):
+            s.harness_score(bad)
+
+
+def test_composite_of_one_track_is_v1_log_ratio():
+    rng = random.Random(2)
+    a = [rng.random() for _ in range(300)]
+    b = [x * 0.7 + rng.random() * 0.2 for x in a]
+    pairs = [
+        s.Paired(i, 3, s.CaseScore(x, 1, 1, 1, 0, 0), s.CaseScore(y, 1, 1, 1, 0, 0))
+        for i, (x, y) in enumerate(zip(a, b, strict=True))
+    ]
+    m = s.moments(pairs)
+    assert list(m) == ["decisions"]
+    g, se = s.composite(m, {"decisions": 0.35, "ops": 0.15})
+    assert (g, se) == pytest.approx(s.log_ratio(a, b), rel=1e-12)
+    assert s.composite({}, {"decisions": 1.0}) == (0.0, math.inf)
+
+
+def test_composite_weights_tracks():
+    m1 = s.moments(retrack(simulated_duel(random.Random(1), 0.9, 0.5, 6_000), "decisions"))
+    m2 = s.moments(harness_duel(random.Random(2), 400, 0.5, 0.4, "ops", 0))
+    (g1, se1), (g2, se2) = (s.log_ratio_moments(*m1["decisions"]), s.log_ratio_moments(*m2["ops"]))
+    g, se = s.composite({**m1, **m2}, {"decisions": 3.0, "ops": 1.0})
+    assert g == pytest.approx(0.75 * g1 + 0.25 * g2)
+    assert se == pytest.approx(math.sqrt((3 * se1) ** 2 + se2**2) / 4)
+
+
+def test_weights_none_keeps_v1_verdict():
+    pairs = simulated_duel(random.Random(8), 0.9, 0.5, 30_000)
+    v1 = s.verdict(pairs, set(), False)
+    v2 = s.verdict(pairs, set(), False, {"decisions": 1.0})
+    assert "tracks" not in v1 and v2["tracks"]["decisions"]["pairs"] == len(pairs)
+    for key in ("crown", "g", "se", "g_lcb", "guard_ucb", "levels"):
+        assert v2[key] == pytest.approx(v1[key]) if key != "levels" else v2[key] == v1[key]
+
+
+WEIGHTS = {"decisions": 0.35, "longctx": 0.25, "ops": 0.15, "sql": 0.10, "paint": 0.15}
+
+
+def better_everywhere(ops_challenger=0.3, ops_cases=300):
+    rng = random.Random(11)
+    pairs = retrack(simulated_duel(rng, 0.9, 0.5, 30_000), "decisions")
+    pairs += retrack(simulated_duel(rng, 0.9, 0.5, 6_000), "longctx", 100_000)
+    pairs += harness_duel(rng, ops_cases, 0.5, ops_challenger, "ops", 200_000)
+    pairs += harness_duel(rng, 300, 0.5, 0.3, "sql", 300_000)
+    pairs += harness_duel(rng, 200, 0.5, 0.3, "paint", 400_000)
+    return pairs
+
+
+def test_better_on_every_track_is_crowned():
+    result = s.verdict(better_everywhere(), set(), False, WEIGHTS)
+    assert result["crown"], result
+    assert set(result["tracks"]) == set(WEIGHTS)
+    assert all(not t["regressed"] for t in result["tracks"].values())
+    ops = result["tracks"]["ops"]
+    assert ops["pairs"] == 300 and ops["accuracy"]["challenger"] > ops["accuracy"]["champion"]
+    assert s.verdict(better_everywhere(), set(), True, WEIGHTS)["crown"] is False
+
+
+def test_a_track_regression_blocks_the_crown_only_with_30_pairs():
+    regressed = s.verdict(better_everywhere(ops_challenger=0.95), set(), False, WEIGHTS)
+    assert regressed["tracks"]["ops"]["regressed"] and not regressed["crown"]
+    assert regressed["g_lcb"] >= s.G_MIN  # the composite alone would crown
+    few = s.verdict(better_everywhere(ops_challenger=1.0, ops_cases=29), set(), False, WEIGHTS)
+    assert few["tracks"]["ops"]["pairs"] == 29 and not few["tracks"]["ops"]["regressed"]
+    assert few["crown"], few
+
+
+def test_retired_guard_applies_to_decisions_only():
+    pairs = better_everywhere()
+    # level 1 of ops is not a retired decisions level: it stays active
+    result = s.verdict(pairs, {1}, False, WEIGHTS)
+    assert result["tracks"]["ops"]["pairs"] == 300 and result["guard_ucb"] == 0.0
+
+
+def test_early_stop_with_weights_uses_the_composite():
+    rng = random.Random(5)
+    worse = [
+        s.Paired(p.index, p.level, p.challenger, p.champion)
+        for p in simulated_duel(rng, 0.9, 0.5, 6_000)
+    ]
+    assert s.early_stop(worse, set(), {"decisions": 1.0}) == s.early_stop(worse, set())
+    worse_ops = harness_duel(random.Random(3), 2_000, 0.3, 0.8, "ops", 100_000)
+    even = retrack(simulated_duel(random.Random(4), 0.9, 0.0, 6_000), "decisions")
+    assert s.early_stop(even + worse_ops, set(), {"decisions": 0.5, "ops": 0.5})
+    assert not s.early_stop(even + worse_ops, set(), {"decisions": 1.0})
+
+
+@pytest.mark.parametrize(
+    "plan",
+    [
+        {"decisions": (0.5, 300), "ops": (0.5, 300)},
+        {"decisions": (0.4, 20_000), "longctx": (0.2, 800), "ops": (0.2, 300), "sql": (0.2, 300)},
+    ],
+)
+def test_halves_split_every_track_evenly(plan):
+    from opentype_challenge import tracks
+
+    full = {t: tracks.TrackPlan(w, n) for t, (w, n) in plan.items()}
+    zero = s.CaseScore(0.0, 1, 1, 1, 0.0, 0)
+    pairs = [
+        s.Paired(i, 1, zero, zero, tracks.track_of(i, full))
+        for i in range(sum(n for _, n in plan.values()))
+    ]
+    halves = s._halves(pairs, {p.index for p in pairs})
+    for track in plan:
+        counts = [sum(p.track == track for p in half) for half in halves]
+        assert abs(counts[0] - counts[1]) <= 1, (track, counts)
+
+
+def test_default_plan_balances_the_track_errors():
+    """Null duel under DEFAULT_PLAN: no track dominates the composite SE, which is ~0.017
+    (0.027 with the former 20k-decisions plan)."""
+    from opentype_challenge.tracks import DEFAULT_PLAN
+
+    rng = random.Random(0)
+    n = {t: p.cases for t, p in DEFAULT_PLAN.items()}
+    pairs = retrack(simulated_duel(rng, 0.9, 0.0, PER_CASE * n["decisions"]), "decisions")
+    pairs += retrack(simulated_duel(rng, 0.9, 0.0, PER_CASE * n["longctx"]), "longctx", 10**5)
+    for i, track in enumerate(("ops", "sql", "paint")):
+        pairs += harness_duel(rng, n[track], 0.4, 0.4, track, 2 * 10**5 + i * 10**4)
+    weights = {t: p.weight for t, p in DEFAULT_PLAN.items()}
+    result = s.verdict(pairs, set(), False, weights)
+    shares = [weights[t] * m["se"] for t, m in result["tracks"].items()]
+    assert max(shares) < 4 * min(shares), result["tracks"]
+    assert result["se"] < 0.02
+
+
+def test_one_perfect_track_alone_is_not_crowned():
+    """Ties everywhere but sql, where the challenger is perfect: capped, no crown."""
+    rng = random.Random(3)
+    plan = {"decisions": 4000, "longctx": 800, "ops": 1000, "sql": 1000, "paint": 600}
+    pairs, offset = [], 0
+    for track, n in plan.items():
+        for i in range(n):
+            a = s.harness_score(float(rng.random() < 0.5))
+            b = s.harness_score(0.0) if track == "sql" else a
+            pairs.append(s.Paired(offset + i, 1, a, b, track))
+        offset += n
+    result = s.verdict(pairs, set(), False, WEIGHTS)
+    assert result["tracks"]["sql"]["g"] > 4.0  # uncapped, this alone gave g_LCB ~ 0.38
+    assert result["g"] <= WEIGHTS["sql"] * s.TRACK_GAIN_CAP + 1e-12
+    assert not result["crown"], result

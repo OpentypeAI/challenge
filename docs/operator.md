@@ -20,9 +20,17 @@ chown 65532:65532 "$dir"/*.token
 | `internal.token` | the master, for `GET /internal/v1/get_weights` | `get_weights` returns `503`, `/health` reports not ready, and the epoch share burns |
 | `admin.token` | you, for `/v1/admin/*` | the admin routes return `503` |
 | `worker.token` | the duel workers, for `/v1/worker/*` (copy it to each worker host) | the worker routes return `503` |
+| `teacher.token` (optional) | the container, as the bearer for the teacher gateway | the teacher is off: no bank is built, so there are no sealed families, prose, stories or `depict`, and windows rotate only by hand |
 
-Tokens are read on every request, so you can rotate one by rewriting the file without a
-restart.
+```bash
+(umask 077; printf '%s\n' "$GATEWAY_TOKEN" >"$dir/teacher.token"); chown 65532:65532 "$dir/teacher.token"
+```
+
+The three challenge tokens are read on every request, so you can rotate one by rewriting
+the file without a restart. The teacher token is checked once at startup to decide whether
+the teacher runs, then re-read on every gateway call. After startup you can rotate it in
+place, but adding it later needs a restart. The container never logs the token or puts it
+in an error message.
 
 ## 2. Registry entry
 
@@ -41,21 +49,57 @@ pids = 256
 proxy_body_limit = 5242880
 
 [challenge.env]
-OPENTYPE_DUEL_CASES = "40000"       # cases per duel (≈ 230 k decisions)
 OPENTYPE_MAX_PENDING = "4"          # queued submissions across all hotkeys
+OPENTYPE_TEACHER_URL = "https://<gateway>"   # unset = teacher off
+OPENTYPE_TEACHER_TOKEN_FILE = "/run/secrets/teacher.token"
+# OPENTYPE_PLAN = '{"decisions": {"weight": 0.35, "cases": 4000}, ...}'
 # OPENTYPE_WINDOW_ENTITLEMENT_CAP = "20"   # optional cap, in epoch-masses per window
 ```
 
 The image already sets `CHALLENGE_SLUG=opentype`, `CHALLENGE_STATE_DIR=/data` and the three
-`CHALLENGE_*_TOKEN_FILE` paths under `/run/secrets/`. The supervisor verifies the labels
+`CHALLENGE_*_TOKEN_FILE` paths under `/run/secrets/`.
+
+### Environment
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CHALLENGE_MASTER_URL` | `http://cortex-master:8080` | where the metagraph is read |
+| `OPENTYPE_PLAN` | the 5-track default (7,400 cases) | JSON `{track: {"weight", "cases"}}` over `decisions`, `longctx`, `ops`, `sql`, `paint` |
+| `OPENTYPE_DUEL_CASES` | `40000` | v1 knob: used only when `OPENTYPE_PLAN` is unset and the value is not the default, and then gives a decisions-only plan |
+| `OPENTYPE_MAX_PENDING` | `4` | queued submissions across all hotkeys |
+| `OPENTYPE_WINDOW_HOURS` | `24` | minimum window age before auto-rotation to a ready bank |
+| `OPENTYPE_WINDOW_ENTITLEMENT_CAP` | none | cap on the entitlement created per window |
+| `OPENTYPE_TEACHER_URL` | none | gateway base URL; unset turns the teacher off |
+| `OPENTYPE_TEACHER_TOKEN_FILE` | `/run/secrets/teacher.token` | gateway bearer |
+| `OPENTYPE_TEACHER_MODEL` | `cx/gpt-6-sol` | writes families, prose, stories and briefs |
+| `OPENTYPE_EXTRACTOR_MODELS` | `cx/gpt-5.6-luna,cc/claude-sonnet-5` | round-trip extractors; keep 2 or more families |
+| `OPENTYPE_JUDGE_MODELS` | `cx/gpt-6-sol` | depict judges; the loss is their mean |
+| `OPENTYPE_TEACHER_CONCURRENCY` | `8` | concurrent gateway calls of the bank builder |
+| `OPENTYPE_BANK_TARGETS` | `{"family": 4, "prose": 600, "ops_story": 200, "depict": 80}` | items per window; a partial object overrides only the listed kinds |
+
+The gateway must speak the OpenAI chat-completions API. `cx/*` models get
+`response_format: json_schema`. Other models get a `submit` tool. Both plain JSON and SSE
+responses are accepted. A malformed teacher setting turns the teacher off with a warning.
+It does not stop the container.
+
+### Egress
+
+The server container needs outbound HTTPS to:
+
+- `CHALLENGE_MASTER_URL`, for the metagraph;
+- `api.drand.sh`, for the beacon. Without it, jobs fall back to the v1 seed;
+- the teacher gateway host, when the teacher is on.
+
+Nothing else is needed. The supervisor verifies the labels
 (`io.cortex.challenge.slug=opentype`, `io.cortex.challenge.contract=1`, source) and the
 GitHub build-provenance attestation of the pulled digest. It then runs a canary without
 secrets, which must answer `/version`, and replaces the container on the same `/data`
 volume.
 
-State is a single SQLite database, `/data/opentype.sqlite3` (WAL). It holds windows and
-their secrets, submissions, jobs, results, champions, the ledger and every persisted epoch
-body. Back it up with SQLite's online backup API (for example
+State is a single SQLite database, `/data/opentype.sqlite3` (WAL). It holds windows with
+their secrets and banks, the next bank, submissions, jobs, results, pending judgments (with
+PNGs), champions, the ledger and every persisted epoch body. A v1 database is migrated in
+place at startup. Take a backup before you upgrade from 1.x. Back it up with SQLite's online backup API (for example
 `sqlite3.connect(src).backup(dst)`), never with a plain file copy while the container runs.
 
 Burn-in: run with the id registered but absent from the trust root, check
@@ -65,7 +109,7 @@ algorithm-3 profile. `full_share_mass` is `1.0`, so unpaid mass burns.
 ## 3. Duel workers (B300)
 
 One worker host needs 1× B300 (both BF16 models, about 52 GB each, at 0.45 of GPU memory
-per side). It also needs about 250 GB of disk for the kept champion, one challenger and the
+per side, with a 131,072-token context and one image per prompt). It also needs about 250 GB of disk for the kept champion, one challenger and the
 base support files, and outbound HTTPS to `huggingface.co` and the master.
 
 ```bash
@@ -91,8 +135,11 @@ docker run -d --name opentype-worker --restart unless-stopped \
   canvas, resolved file digests of both sides, `cases_sha256`, the error count and timings.
 - Several workers can share the queue. Each lease is exclusive, lasts 30 minutes and is
   renewed by heartbeats.
-- Use `--once` for a single job (useful for phase-0 measurement) and `--concurrency` for
-  in-flight reads per side (default 64).
+- Use `--once` for a single job (useful for phase-0 measurement), `--concurrency` for
+  in-flight requests per side (default 64) and `--max-model-len` for the served context
+  (default 131072, needed by longctx level 5).
+- Harness episodes run up to 12 sequential turns each. Their throughput depends on
+  `--concurrency`, not on page size.
 
 Verify a worker image before you deploy it:
 
@@ -100,40 +147,67 @@ Verify a worker image before you deploy it:
 gh attestation verify oci://ghcr.io/opentypeai/challenge-worker@sha256:<digest> --repo OpentypeAI/challenge
 ```
 
-### Phase 0: before the first crown
+### Phase 0: sizing before the first crown
 
-1. Run one worker job with `--once` and read `timings` in the job evidence. Measure
-   decisions per second at canvas 256.
-2. Measure the base model's accuracy per level from the first duels (`/v1/status` levels).
-   Choose the ladder so the base scores 60–90 % on the active levels
-   (`PUT /v1/admin/ladder`).
-3. Set `OPENTYPE_DUEL_CASES` from the measured throughput and the power table in
-   [mechanism.md](mechanism.md#4-power). Below about 1,000 decisions/s, use 20,000 cases
-   and rely more on the ladder.
+1. Pause crowns (`PUT /v1/admin/crowns {"paused": true}`) and run worker jobs with
+   `--once`. The evidence reports only aggregate `timings` (`serve_seconds`,
+   `read_seconds`), so measure each track with a single-track `OPENTYPE_PLAN` (for example
+   `{"longctx": {"weight": 1, "cases": 100}}`): decisions/s, seconds per longctx case, and
+   ops, sql and paint episodes per hour.
+2. From the verdict's `tracks` and `levels`, measure the base model's loss per track and
+   per decisions level. Choose the ladder so the base scores 60–90 % on the entry levels.
+   Drop from the plan any track the base cannot move at all.
+3. Set `OPENTYPE_PLAN` so a whole duel finishes in a few hours and every harness track has
+   well over 30 pairs (the per-track guard). Keep the weights where they reflect product
+   priority. The composite SE is dominated by the smallest tracks
+   ([mechanism.md](mechanism.md#9-power)).
+4. With the teacher on, measure the keep rate and gateway spend of one full bank (the
+   container log line `bank <kind>: kept N of target M, discarded {...}`), then set
+   `OPENTYPE_BANK_TARGETS`.
+5. Resume crowns.
 
-## 4. Windows and audits
+## 4. Windows, banks and audits
 
-A window's secret seeds every duel leased in it. Only `sha256(secret)` is public while the
-window is open.
+A window's secret seeds every duel leased in it. While the window is open, only
+`sha256(secret)` and its `bank_digest` are public.
+
+Bank lifecycle:
+
+1. The first window opens with the empty bank.
+2. With a teacher, a background task builds the **next** bank. It is stored in the database
+   but not yet sealed. `/v1/status` reports `teacher.state` as `configured`, `building` or
+   `ready`. A failed build is logged and retried after 10 minutes.
+3. Once the next bank is ready and the open window is at least `OPENTYPE_WINDOW_HOURS` old,
+   the container rotates on its own: it closes the window, reveals its secret, jobs and
+   bank, and opens a new window sealed with the ready bank. The builder then starts on the
+   following bank.
+4. A manual rotation works at any time. It seals the ready bank, or the empty bank when
+   none is ready, which drops sealed and prose content from that window.
+
+A bank is never swapped while its window is open. Rotating does not interrupt a leased job:
+it keeps its seed and bank. Queued jobs are re-targeted to the new window at lease time.
 
 ```bash
 curl -fsS -X POST -H "Authorization: Bearer $(cat admin.token)" \
   https://<cortex-master>/challenge/opentype/v1/admin/window/rotate
 ```
 
-- Rotate on a fixed cadence (for example weekly), preferably when no job is leased. Queued
-  jobs are re-targeted to the new window when they are leased.
-- Rotation publishes the old secret with every job's digest, mix, case count and
-  `cases_sha256`. Audit it, or let anyone audit it:
+- Without a teacher, rotate on a fixed cadence (for example weekly), preferably when no job
+  is leased.
+- Rotation publishes the old secret with every job's digest, mix, plan, beacon, judge flag,
+  case count and `cases_sha256`, plus the bank (`GET /v1/windows/<id>/bank`). Audit it, or
+  let anyone audit it:
 
 ```bash
 opentype-challenge audit --api https://<cortex-master>/challenge/opentype \
   --window <closed id> --window-secret <revealed hex>
 ```
 
-  Each line reports a job and `ok`. The exit status is 1 on any mismatch.
-- Spot-check generator exactness before a release: `uv run pytest tests/test_generator.py`
-  recomputes the gold of thousands of cases from their text alone.
+  The audit checks the secret and the bank against their commitments, then prints one
+  line per job with `ok`. The exit status is 1 on any mismatch.
+- Spot-check exactness before a release: `uv run pytest tests/test_generator.py
+  tests/test_longctx.py tests/test_ops.py tests/test_sqltask.py tests/test_paint.py`. These
+  tests recompute read gold from the text and replay the reference oracles to loss 0.
 
 ## 5. Admin controls
 

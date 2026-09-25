@@ -7,15 +7,19 @@ the exact Bayes posterior over completions. Every item passes three independent 
 tree-walk interpreter == compiled evaluator (N-version), parse(text) == rule, and
 extract(render(facts)) == facts (round trip; a failing render is discarded).
 
-ponytail: a deterministic multi-template renderer and a dictionary extractor stand in for
-the LLM renderer and the two extractor models of different families; swap them in behind
-the same round-trip check once a renderer budget exists.
-ponytail: every family is public; sealed (private, hash-committed) families are not built yet.
+Families are public (FAMILIES) or sealed: invented per window by the teacher, carried as
+the family_to_json payload (docs/tracks.md §2) and rebuilt by the solver from the request's
+facts block. A state is template-rendered, or teacher prose whose known facts were
+round-tripped by the bank builder (make_case(..., prose=...)).
+
+ponytail: the template renderer and dictionary extractor remain the round-trip check of
+template states; prose relies on the bank builder's two extractor models instead.
 """
 
 from __future__ import annotations
 
 import itertools
+import json
 import random
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -573,6 +577,168 @@ FAMILY_BY_TITLE = {family.title: family for family in FAMILIES}
 
 
 # ---------------------------------------------------------------------------
+# Family payloads (docs/tracks.md §2): sealed families travel as JSON in the window bank.
+
+SNAKE = re.compile(r"[a-z][a-z0-9_]*")
+WORDS = re.compile(r"[a-z][a-z0-9]*(?: [a-z0-9]+)*")  # lower case words
+UNIT = re.compile(r"[A-Za-z]+(?: [A-Za-z]+)*")
+SEALED_NAME = re.compile(r"sealed_[0-9a-f]{8}")
+PROBE_SUFFIXES = ("_mirror", "_reordered")  # probe twins' question ids
+MAX_WORDS = 80
+MAX_PROMPT = 200
+FAMILY_KEYS = ("derived", "facts", "name", "questions", "subject", "title")
+FACT_KEYS = ("domain", "label", "name", "unit")
+DERIVED_KEYS = ("domain", "name")
+QUESTION_KEYS = ("id", "kind", "options", "prompt")
+POOL = {"choice": (4, 26), "score": (3, 6), "noul": (2, 2)}
+
+
+def family_to_json(family: Family) -> dict[str, Any]:
+    return {
+        "name": family.name,
+        "title": family.title,
+        "subject": family.subject,
+        "facts": [
+            {"name": f.name, "label": f.label, "domain": list(f.domain), "unit": f.unit}
+            for f in family.facts
+        ],
+        "derived": [{"name": f.name, "domain": list(f.domain)} for f in family.derived],
+        "questions": [
+            {"id": q.id, "kind": q.kind, "prompt": q.prompt, "options": list(q.options)}
+            for q in family.questions
+        ],
+    }
+
+
+def _object(value: Any, keys: tuple[str, ...], where: str) -> Mapping[str, Any]:
+    if not isinstance(value, dict) or tuple(sorted(value)) != keys:
+        got = sorted(value) if isinstance(value, dict) else type(value).__name__
+        raise GeneratorError(f"{where}: expected keys {list(keys)}, got {got}")
+    return value
+
+
+def _array(value: Any, where: str, low: int, high: int) -> list[Any]:
+    if not isinstance(value, list) or not low <= len(value) <= high:
+        size = len(value) if isinstance(value, list) else type(value).__name__
+        raise GeneratorError(f"{where}: expected a list of {low}..{high} items, got {size}")
+    if len({_json_key(v) for v in value}) != len(value):
+        raise GeneratorError(f"{where}: values are not distinct")
+    return value
+
+
+def _json_key(value: Any) -> str:
+    return f"{type(value).__name__}:{value!r}"
+
+
+def _text(value: Any, pattern: re.Pattern[str], where: str, limit: int = MAX_WORDS) -> str:
+    if not isinstance(value, str) or len(value) > limit or not pattern.fullmatch(value):
+        raise GeneratorError(f"{where}: {value!r} does not match {pattern.pattern}")
+    return value
+
+
+def _snakes(value: Any, where: str, low: int, high: int) -> tuple[str, ...]:
+    items = _array(value, where, low, high)
+    return tuple(_text(v, SNAKE, f"{where}[{i}]") for i, v in enumerate(items))
+
+
+def _fact_from_json(value: Any, index: int) -> Fact:
+    where = f"facts[{index}]"
+    raw = _object(value, FACT_KEYS, where)
+    name = _text(raw["name"], SNAKE, f"{where}.name")
+    label = _text(raw["label"], WORDS, f"{where}.label")
+    unit = "" if raw["unit"] == "" else _text(raw["unit"], UNIT, f"{where}.unit")
+    items = _array(raw["domain"], f"{where}.domain", 2, 8)
+    if all(type(v) is int for v in items):
+        if items != sorted(items):
+            raise GeneratorError(f"{where}.domain: integers must ascend")
+        return Fact(name, label, tuple(items), unit)
+    return Fact(name, label, _snakes(items, f"{where}.domain", 2, 8), unit)
+
+
+def _question_from_json(value: Any, index: int) -> Question:
+    where = f"questions[{index}]"
+    raw = _object(value, QUESTION_KEYS, where)
+    qid = _text(raw["id"], SNAKE, f"{where}.id")
+    kind = raw["kind"]
+    if kind not in KINDS:
+        raise GeneratorError(f"{where}.kind: {kind!r} is not one of {list(KINDS)}")
+    prompt = raw["prompt"]
+    if not isinstance(prompt, str) or not 2 <= len(prompt) <= MAX_PROMPT:
+        raise GeneratorError(f"{where}.prompt: expected 2..{MAX_PROMPT} characters")
+    if "\n" in prompt or prompt != prompt.strip() or not prompt.endswith("?"):
+        raise GeneratorError(f"{where}.prompt: expected one line ending with '?'")
+    options = _snakes(raw["options"], f"{where}.options", *POOL[kind])
+    if kind == "noul" and options != NOUL:
+        raise GeneratorError(f"{where}.options: a noul question has exactly ['yes', 'no']")
+    return Question(qid, kind, prompt, options)
+
+
+def family_from_json(payload: Mapping[str, Any]) -> Family:
+    """Parse and validate a family payload; GeneratorError names the first violation.
+    A public name is accepted only with exactly that public family's payload."""
+    raw = _object(payload, FAMILY_KEYS, "family")
+    name = raw["name"]
+    public = FAMILY_BY_NAME.get(name) if isinstance(name, str) else None
+    if public is not None:
+        if _canonical(raw) != _canonical(family_to_json(public)):
+            raise GeneratorError(f"family {name!r} differs from the public family of that name")
+        return public
+    if not isinstance(name, str) or not SEALED_NAME.fullmatch(name):
+        raise GeneratorError(f"family.name: {name!r} is neither public nor sealed_<8 hex>")
+    title = _text(raw["title"], WORDS, "family.title")
+    if title in FAMILY_BY_TITLE:
+        raise GeneratorError(f"family.title: {title!r} is the title of a public family")
+    subject = _text(raw["subject"], WORDS, "family.subject")
+    facts = tuple(_fact_from_json(v, i) for i, v in enumerate(_array(raw["facts"], "facts", 6, 12)))
+    derived = []
+    for i, value in enumerate(_array(raw["derived"], "derived", 1, 3)):
+        item = _object(value, DERIVED_KEYS, f"derived[{i}]")
+        domain = _snakes(item["domain"], f"derived[{i}].domain", 2, 4)
+        derived.append(Fact(_text(item["name"], SNAKE, f"derived[{i}].name"), "", domain))
+    questions = tuple(
+        _question_from_json(v, i)
+        for i, v in enumerate(_array(raw["questions"], "questions", 6, 12))
+    )
+    if {q.kind for q in questions} != set(KINDS):
+        raise GeneratorError(f"questions: every kind of {list(KINDS)} must be present")
+    for question in questions:
+        if question.id.endswith(PROBE_SUFFIXES):
+            raise GeneratorError(f"question id {question.id!r} ends with a probe suffix")
+    names = [f.name for f in facts] + [f.name for f in derived] + [q.id for q in questions]
+    if len(set(names)) != len(names):
+        raise GeneratorError("names of facts, derived facts and questions must be unique")
+    if len({f.label for f in facts}) != len(facts):
+        raise GeneratorError("fact labels must be unique")
+    family = Family(name, title, subject, facts, tuple(derived), questions)  # ambiguity check
+    for fact in facts + tuple(derived):
+        _probe_grammar(family, fact)
+    return family
+
+
+def _probe_grammar(family: Family, fact: Fact) -> None:
+    """Every value of fact, in every operator and beside another atom, must parse back: a
+    name or value such as 'and' would break the rule grammar at duel time, not here."""
+    other: Atom = (fact.name, "is not", fact.domain[0])
+    atoms: list[Atom] = [(fact.name, "is one of", tuple(map(str, fact.domain)))]
+    for value in fact.domain:
+        ops = ("is at least", "is below") if fact.numeric else ("is", "is not")
+        atoms.extend((fact.name, op, value) for op in ops)
+    if fact.numeric:
+        atoms.pop(0)  # ponytail: rules never use 'is one of' on integer facts
+    rule: Rule = (tuple(((atom, other), "x") for atom in atoms), "x")
+    try:
+        ok = parse_rule(rule_lines(rule), family) == rule
+    except GeneratorError:
+        ok = False
+    if not ok:
+        raise GeneratorError(f"fact {fact.name!r}: its name or values break the rule grammar")
+
+
+def _canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+# ---------------------------------------------------------------------------
 # Rules: two independent evaluators and a text form that parses back exactly.
 
 
@@ -649,9 +815,10 @@ def rule_lines(rule: Rule, target: str | None = None) -> list[str]:
     return lines
 
 
-_RULE_LINE = re.compile(r"^(\d+)\. If (.+), (?:choose (\S+)|([a-z_]+) is (\S+))\.$")
-_OTHERWISE = re.compile(r"^(\d+)\. Otherwise (?:choose (\S+)|([a-z_]+) is (\S+))\.$")
-_ATOM = re.compile(r"^([a-z_]+) (is not|is at least|is below|is one of|is) (.+)$")
+_NAME = r"[a-z][a-z0-9_]*"
+_RULE_LINE = re.compile(rf"^(\d+)\. If (.+), (?:choose (\S+)|({_NAME}) is (\S+))\.$")
+_OTHERWISE = re.compile(rf"^(\d+)\. Otherwise (?:choose (\S+)|({_NAME}) is (\S+))\.$")
+_ATOM = re.compile(rf"^({_NAME}) (is not|is at least|is below|is one of|is) (.+)$")
 
 
 def parse_rule(lines: Sequence[str], family: Family, target: str | None = None) -> Rule:
@@ -815,11 +982,13 @@ class Gold:
 
 @dataclass(frozen=True)
 class Case:
-    family: str
+    family: str  # family name, or the env name for harness tracks
     level: int
-    body: dict[str, Any]
-    gold: dict[str, Gold]
+    body: dict[str, Any]  # exactly what the worker receives
+    gold: dict[str, Gold]  # read tracks; {} for harness tracks
     realized: dict[str, int]  # index of the true world's outcome; tests only, never served
+    track: str = "decisions"
+    private: dict[str, Any] = field(default_factory=dict)  # never served: oracle aids, rubrics
 
 
 def _sample_atom(rng: random.Random, fact: Fact) -> Atom:
@@ -866,21 +1035,30 @@ def _mirror(rule: Rule) -> Rule:
     return tuple((atoms, flip[outcome]) for atoms, outcome in clauses), flip[default]
 
 
-def make_case(rng: random.Random, family: Family, level: int) -> Case:
-    spec = LEVELS[level]
-    for _ in range(MAX_ATTEMPTS):
-        case = _attempt(rng, family, level, spec)
-        if case is not None:
-            return case
-    raise GeneratorError(f"{family.name} L{level}: every render failed the round trip")
-
-
-def _attempt(rng: random.Random, family: Family, level: int, spec: Level) -> Case | None:
+def _sample_world(
+    rng: random.Random, family: Family, hidden_max: int
+) -> tuple[dict[str, Value], set[str]]:
     world: dict[str, Value] = {f.name: rng.choice(f.domain) for f in family.facts}
     names = [f.name for f in family.facts]
-    hidden = set(rng.sample(names, rng.randint(0, spec.hidden)))
-    known = {name: world[name] for name in names if name not in hidden}
+    return world, set(rng.sample(names, rng.randint(0, hidden_max)))
 
+
+def sample_known(
+    rng: random.Random, family: Family, hidden_max: int
+) -> tuple[dict[str, Value], list[str]]:
+    """A world's stated facts and its unstated fact names (family order), v1 distribution."""
+    world, hidden = _sample_world(rng, family, hidden_max)
+    known = {f.name: world[f.name] for f in family.facts if f.name not in hidden}
+    return known, [f.name for f in family.facts if f.name in hidden]
+
+
+Item = tuple[str, Question, tuple[str, ...], Rule, str]  # qid, question, options, rule, prompt
+
+
+def sample_program(
+    rng: random.Random, family: Family, spec: Level
+) -> tuple[list[tuple[str, Rule]], list[Item]]:
+    """The derived-fact rules and the question items of one case (v1 rng order)."""
     derived: list[tuple[str, Rule]] = []
     for i, fact in enumerate(family.derived[: spec.derived]):
         earlier = list(family.derived[:i])
@@ -889,7 +1067,7 @@ def _attempt(rng: random.Random, family: Family, level: int, spec: Level) -> Cas
         derived.append((fact.name, rule))
     usable = list(family.derived[: spec.derived])
 
-    items: list[tuple[str, Question, tuple[str, ...], Rule, str]] = []
+    items: list[Item] = []
     for question in _pick_questions(rng, family):
         options = question.options
         if question.kind == "choice":
@@ -916,11 +1094,17 @@ def _attempt(rng: random.Random, family: Family, level: int, spec: Level) -> Cas
                 )
             )
     rng.shuffle(items)
+    return derived, items
 
-    state = render_state(rng, family, known, spec)
-    if extract(family, state) != known:
-        return None  # round trip failed: discard (depends on shown facts only, never hidden)
 
+def grade(
+    family: Family,
+    known: Mapping[str, Value],
+    world: Mapping[str, Value],
+    derived: Sequence[tuple[str, Rule]],
+    items: Sequence[Item],
+) -> tuple[dict[str, Any], dict[str, Gold], dict[str, int]]:
+    """Served questions, exact gold given known, and the true world's outcomes (no rng)."""
     for name, rule in derived:
         if parse_rule(rule_lines(rule, name), family, name) != rule:
             raise GeneratorError(f"derived {name}: text does not parse back to the rule")
@@ -961,6 +1145,70 @@ def _attempt(rng: random.Random, family: Family, level: int, spec: Level) -> Cas
             base = gold[qid.removesuffix("_mirror")].probs[0]
             if abs(gold[qid].probs[0] - (1.0 - base)) > 1e-12:
                 raise GeneratorError(f"{qid}: mirror gold is not 1 - g")
+    return questions, gold, realized
+
+
+MAX_HIDDEN = max(spec.hidden for spec in LEVELS.values())  # bounds the posterior enumeration
+
+
+def _prose_known(family: Family, prose: Mapping[str, Any]) -> tuple[dict[str, Value], str]:
+    """Validate a prose payload against its family; its known facts in family order."""
+    if prose.get("family") != family.name:
+        raise GeneratorError(f"prose of {prose.get('family')!r} used with family {family.name}")
+    known, text = prose.get("known"), prose.get("text")
+    if not isinstance(known, dict) or not isinstance(text, str) or not text.strip():
+        raise GeneratorError("prose needs an object known and a non-empty string text")
+    names = [f.name for f in family.facts]
+    for name in sorted(known):
+        if name not in names:
+            raise GeneratorError(f"prose states {name!r}, not a fact of {family.name}")
+        value, domain = known[name], family.fact(name).domain
+        if type(value) is not type(domain[0]) or value not in domain:
+            raise GeneratorError(f"prose value {value!r} of {name} is outside its domain")
+    hidden = [name for name in names if name not in known]
+    listed = prose.get("hidden")
+    if not isinstance(listed, list) or sorted(map(str, listed)) != sorted(hidden):
+        raise GeneratorError(f"prose hidden {listed!r} is not the unstated facts {hidden}")
+    if len(hidden) > MAX_HIDDEN:
+        raise GeneratorError(f"prose leaves {len(hidden)} facts unstated, at most {MAX_HIDDEN}")
+    return {name: known[name] for name in names if name in known}, text
+
+
+def make_case(
+    rng: random.Random, family: Family, level: int, prose: Mapping[str, Any] | None = None
+) -> Case:
+    """A decisions case. With prose (a bank prose payload of this family) the state is its
+    text verbatim and the gold is the exact posterior given its known facts."""
+    spec = LEVELS[level]
+    given = None if prose is None else _prose_known(family, prose)
+    for _ in range(MAX_ATTEMPTS):
+        case = _attempt(rng, family, level, spec, given)
+        if case is not None:
+            return case
+    raise GeneratorError(f"{family.name} L{level}: every render failed the round trip")
+
+
+def _attempt(
+    rng: random.Random,
+    family: Family,
+    level: int,
+    spec: Level,
+    prose: tuple[dict[str, Value], str] | None,
+) -> Case | None:
+    if prose is None:
+        world, hidden = _sample_world(rng, family, spec.hidden)
+        known = {f.name: world[f.name] for f in family.facts if f.name not in hidden}
+    else:
+        known, state = prose  # hidden facts of the true world are uniform, as in v1
+        world = {
+            f.name: known[f.name] if f.name in known else rng.choice(f.domain) for f in family.facts
+        }
+    derived, items = sample_program(rng, family, spec)
+    if prose is None:
+        state = render_state(rng, family, known, spec)
+        if extract(family, state) != known:
+            return None  # round trip failed: discard (depends on shown facts only, never hidden)
+    questions, gold, realized = grade(family, known, world, derived, items)
     body = {
         "model": MODEL_NAME,
         "instructions": context_text(family, derived),
@@ -976,37 +1224,76 @@ def _attempt(rng: random.Random, family: Family, level: int, spec: Level) -> Cas
 # Reference solver: the text-level version (parses the request, never sees the world).
 
 
-def solve(body: Mapping[str, Any]) -> dict[str, list[float]]:
-    """Exact posterior computed from the Jev request alone."""
-    lines = str(body["instructions"]).split("\n")
-    title = lines[0].removeprefix("Record type: ").removesuffix(".")
-    family = FAMILY_BY_TITLE[title]
-    derived: list[tuple[str, Rule]] = []
-    block: list[str] = []
-    target: str | None = None
+_FACT_LINE = re.compile(rf"- ({_NAME}) \(([^,()]+?)(?:, ([^,()]+))?\): (.+)")
+_INT = re.compile(r"-?\d+")
+FACTS_HEADER = "Facts and allowed values:"
+DECISIONS_MARKER = "Record type: "
+
+
+def read_context(instructions: str) -> tuple[Family, list[tuple[str, Rule]]]:
+    """The family and derived rules of a request, from its instructions alone. The first line
+    is "<marker>: <title>."; a title that is not public names a sealed family, rebuilt from
+    the facts block."""
+    lines = instructions.split("\n")
+    title = lines[0].partition(": ")[2].removesuffix(".")
+    blocks: list[tuple[str, list[str]]] = []
     for line in lines[1:]:
-        if re.fullmatch(r"[a-z_]+:", line):
-            if target:
-                derived.append((target, parse_rule(block, family, target)))
-            target, block = line[:-1], []
-        elif target and re.match(r"\d+\. ", line):
-            block.append(line)
-    if target:
-        derived.append((target, parse_rule(block, family, target)))
-    known = extract(family, str(body["state"]))
-    if known is None:
-        raise GeneratorError("a fact is stated twice")
+        if re.fullmatch(rf"{_NAME}:", line):
+            blocks.append((line[:-1], []))
+        elif blocks and re.match(r"\d+\. ", line):
+            blocks[-1][1].append(line)
+    family = FAMILY_BY_TITLE.get(title)
+    if family is None:
+        facts = []
+        for line in lines[lines.index(FACTS_HEADER) + 1 :]:
+            match = _FACT_LINE.fullmatch(line)
+            if match is None:
+                break
+            name, label, unit, raw = match.groups()
+            values = raw.split(", ")
+            numeric = all(_INT.fullmatch(v) for v in values)
+            domain = tuple(int(v) for v in values) if numeric else tuple(values)
+            facts.append(Fact(name, label, domain, unit or ""))
+        # Derived values are computed, never enumerated: a non-numeric placeholder domain.
+        derived_facts = tuple(Fact(name, "", ("",)) for name, _ in blocks)
+        family = Family(title, title, "", tuple(facts), derived_facts, ())
+    return family, [(name, parse_rule(block, family, name)) for name, block in blocks]
+
+
+def solve_known(body: Mapping[str, Any], known: Mapping[str, Value]) -> dict[str, list[float]]:
+    """Exact posterior of every question given the known facts (prose or dossier states)."""
+    family, derived = read_context(str(body["instructions"]))
+    return _answers(body, family, derived, known)
+
+
+def _answers(
+    body: Mapping[str, Any],
+    family: Family,
+    derived: Sequence[tuple[str, Rule]],
+    known: Mapping[str, Value],
+) -> dict[str, list[float]]:
+    names = {f.name for f in family.facts}
+    for name in sorted(known):
+        if name not in names or known[name] not in family.fact(name).domain:
+            raise GeneratorError(f"known fact {name}={known[name]!r} is not in the family")
     answers = {}
     for qid, question in body["questions"].items():
         text = str(question["instructions"]).split("\n")
         rule = parse_rule(text[text.index(RULES_HEADER) + 1 :], family)
-        criteria = question["criteria"]
-        if question["type"] == "noul":
-            outcomes: Sequence[str] = NOUL
-        else:
-            outcomes = list(criteria)
+        outcomes: Sequence[str] = NOUL if question["type"] == "noul" else list(question["criteria"])
         answers[qid] = posterior(family, known, derived, rule, outcomes)
     return answers
+
+
+def solve(body: Mapping[str, Any]) -> dict[str, list[float]]:
+    """Exact posterior computed from a template-rendered request alone (public or sealed)."""
+    if not str(body["instructions"]).startswith(DECISIONS_MARKER):
+        raise GeneratorError("not a decisions request")
+    family, derived = read_context(str(body["instructions"]))
+    known = extract(family, str(body["state"]))
+    if known is None:
+        raise GeneratorError("a fact is stated twice")
+    return _answers(body, family, derived, known)
 
 
 def case_rng(seed: str | int | bytes) -> random.Random:
