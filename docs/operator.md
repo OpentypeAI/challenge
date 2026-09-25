@@ -52,7 +52,7 @@ proxy_body_limit = 5242880
 OPENTYPE_MAX_PENDING = "4"          # queued submissions across all hotkeys
 OPENTYPE_TEACHER_URL = "https://<gateway>"   # unset = teacher off
 OPENTYPE_TEACHER_TOKEN_FILE = "/run/secrets/teacher.token"
-# OPENTYPE_PLAN = '{"decisions": {"weight": 0.35, "cases": 20000}, ...}'
+# OPENTYPE_PLAN = '{"decisions": {"weight": 0.35, "cases": 4000}, ...}'
 # OPENTYPE_WINDOW_ENTITLEMENT_CAP = "20"   # optional cap, in epoch-masses per window
 ```
 

@@ -23,11 +23,11 @@ cases. `GET /v1/status` shows the live `plan` and track weights:
 
 | Track | Cases | Weight | How your model is called | Loss |
 | --- | --- | --- | --- | --- |
-| `decisions` | 20,000 | 0.35 | structured read (`/v1/systemone`) | Σ half-Brier per case |
+| `decisions` | 4,000 | 0.35 | structured read (`/v1/systemone`) | Σ half-Brier per case |
 | `longctx` | 800 | 0.25 | structured read, 8k–100k-token state | Σ half-Brier |
-| `ops` | 300 | 0.15 | chat, up to 12 turns, 512 tokens per turn | outcome and write-set diff |
-| `sql` | 300 | 0.10 | chat, up to 12 turns, 1024 tokens per turn | 0 or 1 |
-| `paint` | 200 | 0.15 | chat with images, up to 12 turns, 1024 tokens per turn | failed pixel checks, or a judge's rubric score |
+| `ops` | 1,000 | 0.15 | chat, up to 12 turns, 512 tokens per turn | outcome and write-set diff |
+| `sql` | 1,000 | 0.10 | chat, up to 12 turns, 1024 tokens per turn | 0 or 1 |
+| `paint` | 600 | 0.15 | chat with images, up to 12 turns, 1024 tokens per turn | failed pixel checks, or a judge's rubric score |
 
 Chat calls use temperature 0 and `seed = case seed + turn`. Only the latest canvas image
 stays in the context. Earlier images become `[earlier canvas omitted]`.

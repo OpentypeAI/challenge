@@ -82,10 +82,10 @@ constants. New in 2.0: `window.bank_digest`, `plan`, `tracks`, `teacher`, and
   "next_duel_mix": {"1": 0.5, "2": 0.5},
   "window": {"id": 1, "commitment": "<sha256(secret) hex>", "bank_digest": "<sha256 hex>",
              "opened_at": "..."},
-  "plan": {"decisions": {"weight": 0.35, "cases": 20000}, "longctx": {"weight": 0.25, "cases": 800},
-           "ops": {"weight": 0.15, "cases": 300}, "paint": {"weight": 0.15, "cases": 200},
-           "sql": {"weight": 0.1, "cases": 300}},
-  "tracks": {"decisions": {"weight": 0.35, "cases": 20000, "results": 812000}, "...": {}},
+  "plan": {"decisions": {"weight": 0.35, "cases": 4000}, "longctx": {"weight": 0.25, "cases": 800},
+           "ops": {"weight": 0.15, "cases": 1000}, "paint": {"weight": 0.15, "cases": 600},
+           "sql": {"weight": 0.1, "cases": 1000}},
+  "tracks": {"decisions": {"weight": 0.35, "cases": 4000, "results": 162400}, "...": {}},
   "teacher": {"state": "ready", "judge": true, "judgments_pending": 0},
   "crowns_paused": false,
   "constants": {"g_min": 0.0513, "z": 2.326, "guard_max": 0.002, "duel_cases": 7400,
@@ -192,7 +192,7 @@ Returns `204` when the queue is empty. Otherwise:
 ```json
 {
   "job": "j_...", "lease": "<32 hex>", "lease_expires": "...", "cases": 7400,
-  "plan": {"decisions": {"weight": 0.35, "cases": 20000}, "...": {}},
+  "plan": {"decisions": {"weight": 0.35, "cases": 4000}, "...": {}},
   "champion": {"repo": "...", "revision": "...", "files": {...}, "digest": "..."},
   "challenger": {"repo": "...", "revision": "...", "files": {...}, "digest": "..."},
   "base": {"repo": "google/diffusiongemma-26B-A4B-it", "revision": "f7f5b7f5..."}
