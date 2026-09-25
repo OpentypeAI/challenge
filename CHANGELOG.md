@@ -8,7 +8,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
-- `worker --until-empty`: runs jobs until the queue is empty, then exits. Transient API failures retry up to five times, then end the scheduled run;
+- `worker --until-empty`: runs jobs until the queue is empty, then exits. Transient API requests get up to five attempts, then end the scheduled run;
   permanent API errors fail immediately. `--once` and `--until-empty` are
   mutually exclusive.
 - `deploy/modal_worker.py`: a scale-to-zero worker on Modal (1x H200).
