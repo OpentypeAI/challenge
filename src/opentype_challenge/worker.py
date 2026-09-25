@@ -520,14 +520,19 @@ class Worker:
                 await client.aclose()
         return {"cases_fetched": fetched, "cases_sha256": cases_hash.hexdigest(), "errors": errors}
 
-    async def run_forever(self, idle: float = 30.0) -> None:
+    async def run_forever(self, idle: float = 30.0, until_empty: bool = False) -> None:
+        """Run jobs; on an empty queue sleep `idle`, or return when `until_empty`. A master
+        outage (RuntimeError after the client's retries) always backs off and retries."""
         while True:
             try:
                 ran = await self.run_once()
             except RuntimeError as error:
                 print(f"worker: {error}", file=sys.stderr, flush=True)
-                ran = False
+                await asyncio.sleep(idle)
+                continue
             if not ran:
+                if until_empty:
+                    return
                 await asyncio.sleep(idle)
 
 

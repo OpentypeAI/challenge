@@ -236,17 +236,27 @@ def test_vllm_command_and_urls():
 def test_until_empty_runs_jobs_until_the_queue_is_empty(monkeypatch, tmp_path):
     from opentype_challenge import cli, pins, worker
 
-    runs = iter([True, True, False])
+    runs = iter([True, RuntimeError("master down"), True, False])
     calls: list[int] = []
 
     async def run_once(self):
         calls.append(1)
-        return next(runs)
+        result = next(runs)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    async def no_sleep(seconds):
+        pass
 
     token = tmp_path / "token"
     token.write_text("t")
     monkeypatch.setattr(worker.Worker, "run_once", run_once)
+    monkeypatch.setattr(worker.asyncio, "sleep", no_sleep)
     monkeypatch.setattr(worker, "sha256_file", lambda path: pins.STRUCTURED_SERVER_SHA256)
     cli.main(["worker", "--api", "http://x", "--token-file", str(token), "--workdir",
               str(tmp_path), "--until-empty"])  # fmt: skip
-    assert len(calls) == 3
+    assert len(calls) == 4  # an outage backs off and retries; the empty queue ends the run
+    with pytest.raises(SystemExit):
+        cli.main(["worker", "--api", "http://x", "--token-file", str(token), "--workdir",
+                  str(tmp_path), "--once", "--until-empty"])  # fmt: skip

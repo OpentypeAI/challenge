@@ -48,11 +48,8 @@ def _worker(args: argparse.Namespace) -> None:
             )
             if args.once:
                 await worker.run_once()
-            elif args.until_empty:
-                while await worker.run_once():
-                    pass
             else:
-                await worker.run_forever()
+                await worker.run_forever(until_empty=args.until_empty)
 
     asyncio.run(main())
 
@@ -229,8 +226,9 @@ def parser() -> argparse.ArgumentParser:
     worker.add_argument("--canvas", type=int, default=256)
     worker.add_argument("--max-model-len", type=int, default=131072)
     worker.add_argument("--concurrency", type=int, default=64)
-    worker.add_argument("--once", action="store_true", help="run at most one job")
-    worker.add_argument(
+    mode = worker.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true", help="run at most one job")
+    mode.add_argument(
         "--until-empty", action="store_true", help="run jobs until the queue is empty, then exit"
     )
     worker.set_defaults(run=_worker)
