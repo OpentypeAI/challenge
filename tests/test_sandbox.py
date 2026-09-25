@@ -142,22 +142,73 @@ def test_a_failing_server_is_the_sides_fault(tmp_path):
     assert "nope.py" in tails["vllm"] and len(tails["vllm"]) <= sandbox.LOG_TAIL
 
 
-def test_the_relay_refuses_oversized_and_malformed_frames():
+def _wire(*frames: bytes, seq: int = 0) -> bytes:
+    out = b""
+    for frame in frames:
+        lines, seq = sandbox.encode(frame, seq)
+        out += lines
+    return out
+
+
+def _frames(data: bytes, step: int = 1 << 20) -> list[dict]:
     class Channel:
-        def __init__(self, text: str):
-            self.text = text
-
         async def chunks(self):
-            yield self.text
+            for i in range(0, len(data), step):
+                yield data[i : i + step]
 
-    async def frames(text: str) -> list[dict]:
-        return [f async for f in sandbox._lines(Channel(text))]  # type: ignore[arg-type]
+    async def go() -> list[dict]:
+        return [f async for f in sandbox._lines(Channel())]  # type: ignore[arg-type]
 
-    assert asyncio.run(frames('{"ready":true}\n')) == [{"ready": True}]
+    return asyncio.run(go())
+
+
+def test_the_relay_refuses_oversized_and_malformed_frames():
+    assert _frames(_wire(b'{"ready":true}')) == [{"ready": True}]
     with pytest.raises(JobFailed, match="malformed"):
-        asyncio.run(frames("[1]\n"))
+        _frames(_wire(b"[1]"))
+    with pytest.raises(JobFailed, match="malformed"):
+        _frames(b'{"ready":true}\n')  # a bare JSON line is not the wire
     with pytest.raises(JobFailed, match="cap"):
-        asyncio.run(frames("x" * (sandbox.MAX_FRAME + 1)))
+        _frames(b"x" * (sandbox.LINE_MAX + 1))
+    with pytest.raises(JobFailed, match="cap"):
+        _frames(_wire(b"x" * (sandbox.MAX_FRAME + 1)))
+
+
+def test_a_large_unicode_frame_crosses_the_wire_in_short_lines():
+    """Modal drops or splits long stdout lines: a 5 MiB emoji frame travels as <= 16 KiB
+    lines, delivered in odd-sized chunks, and comes back byte for byte."""
+    body = "\U0001f600" * (5 * (1 << 20) // 4)
+    frame = json.dumps({"id": 1, "body": body}, ensure_ascii=False).encode()
+    data = _wire(b'{"ready":true}', frame, b"{}")
+    assert max(len(line) for line in data.split(b"\n")) <= sandbox.LINE_MAX
+    assert _frames(data, step=4093) == [{"ready": True}, {"id": 1, "body": body}, {}]
+
+
+@pytest.mark.parametrize("damage", ["drop", "repeat", "swap", "truncate"])
+def test_a_damaged_wire_is_detected_never_misread(damage):
+    frame = json.dumps({"body": "\u00e9" * 40000}).encode()
+    lines = _wire(frame, b"{}").split(b"\n")[:-1]
+    assert len(lines) > 3
+    if damage == "drop":
+        del lines[1]
+    elif damage == "repeat":
+        lines.insert(1, lines[1])
+    elif damage == "swap":
+        lines[1], lines[2] = lines[2], lines[1]
+    else:
+        lines[1] = lines[1][:-7]
+    with pytest.raises(JobFailed, match="relay"):
+        _frames(b"\n".join(lines) + b"\n")
+
+
+def test_the_bootstrap_inbox_reassembles_and_rejects():
+    import io
+
+    frame = json.dumps({"x": "\U0001f600" * 20000}, ensure_ascii=False).encode()
+    inbox = sandbox._Inbox(io.BytesIO(_wire(frame, b"{}")))
+    assert inbox.read() == frame and inbox.read() == b"{}" and inbox.read() is None
+    with pytest.raises(ValueError):
+        sandbox._Inbox(io.BytesIO(_wire(b"{}", seq=5))).read()
 
 
 def test_the_kernel_file_must_match_its_signed_sha(tmp_path):
@@ -529,10 +580,10 @@ def test_a_build_child_is_capped_and_its_failure_is_the_kernels(tmp_path, monkey
         return real([sys.executable, "-c", spam], *args, **kwargs)
 
     monkeypatch.setattr(sandbox, "_spawn", spawn)
-    stdin = io.BytesIO(json.dumps({"kernel": kernel, "arch": 103}).encode() + b"\n")
+    stdin = io.BytesIO(_wire(json.dumps({"kernel": kernel, "arch": 103}).encode()))
     stdout = io.BytesIO()
     assert sandbox.build(stdin, stdout, demote=False, kernel_dir=tmp_path / "k") == 1
-    frame = json.loads(stdout.getvalue())
+    (frame,) = _frames(stdout.getvalue())
     assert "build_failed" in frame and len(frame["build_failed"]) <= 2000
     assert (tmp_path / "k" / "logs" / "build.log").stat().st_size <= 1 << 20
 

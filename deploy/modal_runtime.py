@@ -140,66 +140,87 @@ def smoke(moe_backend: str = "cutlass", cases: int = 8, max_model_len: int = 327
 # probe lines it was asked for, made of 4-byte characters, with their own sha256.
 PROBE = r"""
 import hashlib, json, sys
-for raw in sys.stdin.buffer:
+from opentype_challenge.sandbox import _Inbox, _Out
+inbox, out = _Inbox(sys.stdin.buffer), _Out(sys.stdout.buffer)
+while (raw := inbox.read()) is not None:
     ask = json.loads(raw)
-    got = hashlib.sha256(ask["pad"].encode()).hexdigest()
-    sys.stdout.buffer.write(json.dumps({"n": ask["n"], "echo": got}).encode() + b"\n")
-    for size in ask["sizes"]:
-        pad = "\U0001f600" * (size // 4)
-        line = {"n": ask["n"], "size": size, "sha": hashlib.sha256(pad.encode()).hexdigest(),
-                "pad": pad}
-        sys.stdout.buffer.write(json.dumps(line, ensure_ascii=False).encode() + b"\n")
-    sys.stdout.buffer.flush()
+    if "pad" in ask:
+        out({"n": ask["n"], "bytes": len(ask["pad"].encode()),
+             "sha": hashlib.sha256(ask["pad"].encode()).hexdigest()})
+    else:
+        pad = "\U0001f600" * (ask["size"] // 4)
+        out({"n": ask["n"], "sha": hashlib.sha256(pad.encode()).hexdigest(), "pad": pad})
 """
 
 
 @app.function(image=image, cpu=1, memory=2048, timeout=900)
-def relay_probe(max_mib: int = 7) -> dict:
-    """Frames of 1 KiB .. max_mib MiB of 4-byte characters, both directions, through a CPU
-    sandbox's stdio exactly as the relay reads it (no GPU, no volume, no network, no miner
-    code): does Modal split, merge, truncate or reorder long lines?"""
+def relay_probe(max_mib: int = 7, stdio: str = "exec") -> dict:
+    """Frames of 1 KiB .. max_mib MiB, each direction as its own phase, through a CPU
+    sandbox's stdio with the relay's wire codec (no GPU, no volume, no network, no miner
+    code). stdio="exec" is the production path (an exec'd process, the command router);
+    "entrypoint" reads the sandbox's own stdout (Modal's rate-limited log pipeline). Only
+    lengths, digests and timings are reported, never payloads."""
     import asyncio
     import contextlib
     import hashlib
     import time
 
+    from modal.stream_type import StreamType
+
     from opentype_challenge import sandbox
 
-    if not 1 <= max_mib <= 8:
-        raise SystemExit("--max-mib 1..8")
+    if not 1 <= max_mib <= 8 or stdio not in ("exec", "entrypoint"):
+        raise SystemExit("--max-mib 1..8, --stdio exec|entrypoint")
     sizes = [1 << 10, 64 << 10, 1 << 20, 4 << 20, max_mib << 20]
+    command = ("python3", "-c", PROBE)
 
     async def go() -> dict:
         box = await modal.Sandbox.create.aio(
-            "python3", "-c", PROBE, app=app, image=image, cpu=1, memory=2048,
+            *(command if stdio == "entrypoint" else ("sleep", "infinity")),
+            app=app, image=image, cpu=1, memory=2048,
             block_network=True, secrets=[], include_oidc_identity_token=False, timeout=600,
         )  # fmt: skip
-        channel = sandbox._ModalChannel(box)
-        rows = []
-        frames = sandbox._lines(channel)
+        process = box
+        if stdio == "exec":
+            process = await box.exec.aio(*command, text=False, stderr=StreamType.DEVNULL)
+        channel = sandbox._ModalChannel(box, process)
+        send, frames = sandbox._Sender(channel), sandbox._lines(channel)
+        rows: list[dict] = []
         try:
             for n, size in enumerate(sizes):
-                pad = "é" * (size // 2)
+                # a frame is <= MAX_FRAME: leave room for the JSON around the payload
+                size = min(size, sandbox.MAX_FRAME - 256)
+                row: dict = {"size": size}
+                rows.append(row)
+                pad = "\u00e9" * (size // 2)
                 start = time.monotonic()
-                await channel.send(json.dumps({"n": n, "pad": pad, "sizes": [size]}) + "\n")
-                echo = await asyncio.wait_for(frames.__anext__(), 300)
-                line = await asyncio.wait_for(frames.__anext__(), 300)
-                rows.append(
-                    {
-                        "size": size,
-                        "up_ok": echo == {"n": n, "echo": hashlib.sha256(pad.encode()).hexdigest()},
-                        "down_ok": line.get("n") == n
-                        and hashlib.sha256(line.get("pad", "").encode()).hexdigest() == line["sha"],
-                        "seconds": round(time.monotonic() - start, 2),
-                    }
+                row["phase"] = "up"
+                await send({"n": n, "pad": pad})
+                echo = await asyncio.wait_for(frames.__anext__(), 120)
+                row["up_ok"] = echo == {
+                    "n": n, "bytes": len(pad.encode()),
+                    "sha": hashlib.sha256(pad.encode()).hexdigest(),
+                }  # fmt: skip
+                row["up_s"] = round(time.monotonic() - start, 2)
+                start = time.monotonic()
+                row["phase"] = "down"
+                await send({"n": n, "size": size})
+                line = await asyncio.wait_for(frames.__anext__(), 120)
+                got = line.get("pad", "").encode()
+                row["down_bytes"] = len(got)
+                row["down_ok"] = line.get("n") == n and (
+                    hashlib.sha256(got).hexdigest() == line.get("sha")
                 )
-        except Exception as error:  # noqa: BLE001 - the first size that breaks is the answer
-            rows.append({"error": repr(error)[:500]})
+                row["down_s"] = round(time.monotonic() - start, 2)
+                row["phase"] = "done"
+        except BaseException as error:  # noqa: BLE001 - the first size that breaks is the answer
+            rows.append({"error": repr(error)[:300]})
         finally:
             with contextlib.suppress(BaseException):
                 await frames.aclose()
             await channel.close()
-        return {"rows": rows, "ok": all(r.get("up_ok") and r.get("down_ok") for r in rows)}
+        ok = all(r.get("up_ok") and r.get("down_ok") for r in rows)
+        return {"stdio": stdio, "rows": rows, "ok": ok}
 
     result = asyncio.run(go())
     print(json.dumps(result, indent=2))

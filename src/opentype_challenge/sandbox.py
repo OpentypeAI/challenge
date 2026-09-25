@@ -79,6 +79,80 @@ BUILD_MEMORY = 6 << 30  # RLIMIT_AS of the compile; the build sandbox gets 12 Gi
 BUILD_FILE_BYTES = 256 << 20  # the compile writes a log and a Triton cache, nothing large
 CHILD_FILE_BYTES = 8 << 30  # logs, Triton and torch caches of one run
 PLUGIN = "opentype_kernel"  # the vllm.general_plugins entry point (kernel_slot.register)
+PIECE = 12 * 1024  # bytes of a frame per physical line; base64 keeps a line under 16.1 KiB
+LINE_MAX = 16 * 1024 + 64
+
+
+# ---------------------------------------------------------------------------
+# The wire: each logical frame (one JSON line, <= MAX_FRAME bytes) travels as physical lines
+# "<seq> <more> <base64 piece>\n" of <= LINE_MAX bytes, numbered per direction. A dropped,
+# duplicated, reordered or oversized line is detected (Modal's log path drops stdout over a
+# rate limit), never silently misread.
+
+
+def encode(frame: bytes, seq: int) -> tuple[bytes, int]:
+    """Physical lines of one logical frame from sequence number `seq`; (lines, next seq)."""
+    import base64
+
+    pieces = [frame[i : i + PIECE] for i in range(0, len(frame), PIECE)] or [b""]
+    out = []
+    for index, piece in enumerate(pieces):
+        more = int(index < len(pieces) - 1)
+        out.append(b"%d %d %s\n" % (seq, more, base64.b64encode(piece)))
+        seq += 1
+    return b"".join(out), seq
+
+
+class Reassembler:
+    """Logical frames from physical lines, in order, each capped at MAX_FRAME."""
+
+    def __init__(self) -> None:
+        self.seq, self.parts, self.size = 0, list[bytes](), 0
+
+    def feed(self, line: bytes) -> bytes | None:
+        """The logical frame `line` completes, or None; ValueError on any protocol break."""
+        import base64
+        import binascii
+
+        if len(line) > LINE_MAX:
+            raise ValueError("a relay line exceeds its cap")
+        try:
+            fields = line.strip().split(b" ")
+            if len(fields) == 2:
+                fields.append(b"")  # an empty piece (strip removed its separator)
+            seq, more, data = fields
+            piece = base64.b64decode(data, validate=True)
+            number, flag = int(seq), int(more)
+        except (ValueError, binascii.Error):
+            raise ValueError("a malformed relay line") from None
+        if number != self.seq or flag not in (0, 1):
+            raise ValueError(f"relay line {number} where {self.seq} was due")
+        self.seq += 1
+        self.size += len(piece)
+        if self.size > MAX_FRAME:
+            raise ValueError("a relay frame exceeds its cap")
+        self.parts.append(piece)
+        if flag:
+            return None
+        frame, self.parts, self.size = b"".join(self.parts), [], 0
+        return frame
+
+
+class _Inbox:
+    """Logical frames from the bootstrap's stdin."""
+
+    def __init__(self, stream: Any):
+        self.stream, self.wire = stream, Reassembler()
+
+    def read(self) -> bytes | None:
+        """The next logical frame, or None at EOF; ValueError on a protocol break."""
+        while True:
+            line = self.stream.readline(LINE_MAX + 1)
+            if not line:
+                return None
+            frame = self.wire.feed(line)
+            if frame is not None:
+                return frame
 
 
 # ---------------------------------------------------------------------------
@@ -244,12 +318,13 @@ class _Out:
     """The one writer of the relay stdout."""
 
     def __init__(self, stream: Any):
-        self.stream, self.lock = stream, threading.Lock()
+        self.stream, self.lock, self.seq = stream, threading.Lock(), 0
 
     def __call__(self, frame: Mapping[str, Any]) -> None:
         line = _frame(frame)
         with self.lock:
-            self.stream.write(line)
+            wire, self.seq = encode(line, self.seq)
+            self.stream.write(wire)
             self.stream.flush()
 
 
@@ -318,13 +393,12 @@ def serve(
     port_base: int = 8100,
 ) -> int:
     """The serve bootstrap. demote=False, a fake vllm and port_base are for local tests only."""
-    out = _Out(stdout)
-    first = stdin.readline(MAX_FRAME)
+    out, inbox = _Out(stdout), _Inbox(stdin)
     try:
-        init = json.loads(first)
+        init = json.loads(inbox.read() or b"")
         side, argv = str(init["side"]), [str(a) for a in init["argv"]]
         share = float(init["share"])
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError, RecursionError):
         out({"failed": "malformed init"})
         return 2
     out({"identity": identity(reader)})  # before any miner code exists here
@@ -379,8 +453,12 @@ def serve(
         names = ("reader", "vllm")
         with ThreadPoolExecutor(RELAY_WORKERS) as pool:
             while True:
-                line = stdin.readline(MAX_FRAME + 1)
-                if not line:
+                try:
+                    line = inbox.read()
+                except ValueError as error:
+                    out({"failed": f"relay: {error}"})
+                    break
+                if line is None:
                     break  # the controller closed the channel
                 gone = [n for n, p in zip(names, processes, strict=True) if p.poll() is not None]
                 if gone:  # nothing is relayed once a served process is gone
@@ -452,10 +530,10 @@ def build(stdin: Any, stdout: Any, *, demote: bool = True, kernel_dir: Path = KE
     """The build bootstrap: compile the kernel for one arch as an unprivileged, capped child."""
     out = _Out(stdout)
     try:
-        init = json.loads(stdin.readline(MAX_FRAME))
+        init = json.loads(_Inbox(stdin).read() or b"")
         path = write_kernel(init["kernel"], kernel_dir)
         arch = int(init["arch"])
-    except (ValueError, KeyError, TypeError, OSError) as error:
+    except (ValueError, KeyError, TypeError, OSError, RecursionError) as error:
         out({"failed": f"malformed build: {error}"})
         return 2
     if demote and os.geteuid() != 0:
@@ -508,7 +586,7 @@ def main(argv: Sequence[str]) -> int:
 class Channel(Protocol):
     async def send(self, line: str) -> None: ...
 
-    def chunks(self) -> AsyncIterator[str]: ...
+    def chunks(self) -> AsyncIterator[bytes]: ...
 
     async def close(self) -> bool:
         """Stop the sandbox and wait for it; True once it is gone."""
@@ -526,24 +604,36 @@ class Backend(Protocol):
 
 
 async def _lines(channel: Channel) -> AsyncIterator[dict[str, Any]]:
-    """JSON frames from a sandbox's stdout, each capped at MAX_FRAME."""
-    buffer = ""
+    """JSON frames from a sandbox's stdout (the wire's lines reassembled, each frame capped at
+    MAX_FRAME); a lost or malformed line fails the channel."""
+    buffer, wire = b"", Reassembler()
     async for chunk in channel.chunks():
-        buffer += chunk
-        if len(buffer) > MAX_FRAME and "\n" not in buffer:
-            raise JobFailed("a sandbox frame exceeded the relay cap", retry=True)
-        while "\n" in buffer:
-            line, buffer = buffer.split("\n", 1)
-            if len(line) > MAX_FRAME:
-                raise JobFailed("a sandbox frame exceeded the relay cap", retry=True)
-            if line.strip():
-                try:
-                    frame = json.loads(line)
-                except ValueError:
-                    raise JobFailed("a sandbox wrote a malformed frame", retry=True) from None
-                if not isinstance(frame, dict):
-                    raise JobFailed("a sandbox wrote a malformed frame", retry=True)
-                yield frame
+        buffer += chunk.encode() if isinstance(chunk, str) else chunk
+        if len(buffer) > LINE_MAX and b"\n" not in buffer:
+            raise JobFailed("a sandbox relay line exceeded its cap", retry=True)
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            try:
+                raw = wire.feed(line)
+                frame = json.loads(raw) if raw is not None else None
+            except (ValueError, RecursionError) as error:
+                raise JobFailed(f"a sandbox broke the relay: {error}", retry=True) from None
+            if raw is None:
+                continue
+            if not isinstance(frame, dict):
+                raise JobFailed("a sandbox wrote a malformed frame", retry=True)
+            yield frame
+
+
+class _Sender:
+    """Logical frames onto a channel, numbered for the sandbox's reassembler."""
+
+    def __init__(self, channel: Channel):
+        self.channel, self.seq = channel, 0
+
+    async def __call__(self, frame: Mapping[str, Any]) -> None:
+        wire, self.seq = encode(_frame(frame), self.seq)
+        await self.channel.send(wire.decode())
 
 
 @dataclass
@@ -555,6 +645,7 @@ class _Live:
     pump: asyncio.Task[None] | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     dead: str = ""
+    send: _Sender | None = None
 
 
 class RelayTransport(httpx.AsyncBaseTransport):
@@ -578,7 +669,8 @@ class RelayTransport(httpx.AsyncBaseTransport):
         frame = {"id": number, "to": to, "path": request.url.path, "body": body, "timeout": timeout}
         try:
             async with live.lock:
-                await live.channel.send(json.dumps(frame, separators=(",", ":")) + "\n")
+                assert live.send is not None
+                await live.send(frame)
             reply = await asyncio.wait_for(future, timeout + 5)
         except TimeoutError:
             raise httpx.ReadTimeout("the sandbox did not answer", request=request) from None
@@ -645,7 +737,7 @@ class SandboxLauncher:
     async def build(self, kernel: Mapping[str, Any], arch: int) -> str:
         channel = await self.backend.start("build", None)
         try:
-            await channel.send(json.dumps({"kernel": dict(kernel), "arch": arch}) + "\n")
+            await _Sender(channel)({"kernel": dict(kernel), "arch": arch})
             async with asyncio.timeout(BUILD_SECONDS + 300):
                 async for frame in _lines(channel):
                     if "built" in frame:
@@ -696,6 +788,7 @@ class SandboxLauncher:
         channel = await self.backend.start("serve", model)
         self._open += 1
         live = _Live(side, channel, _lines(channel))
+        live.send = _Sender(channel)
         self.live[side] = live
         init = {
             "side": side,
@@ -707,7 +800,7 @@ class SandboxLauncher:
             "kernel": dict(kernel) if kernel else None,
         }
         try:
-            await channel.send(json.dumps(init) + "\n")
+            await live.send(init)
             measured: dict[str, Any] | None = None
             async with asyncio.timeout(self.ready_timeout):
                 async for frame in live.frames:
@@ -884,12 +977,17 @@ class ModalBackend:
     timeout: int = 6 * 3600
     cpu: tuple[float, float] = (8.0, 16.0)
     memory: tuple[int, int] = (65536, 131072)
+    # "exec": the bootstrap runs as an exec'd process whose stdio goes through the task
+    # command router; "entrypoint": it is the sandbox's own command, whose stdout Modal serves
+    # from its log pipeline (rate limited: it drops output; kept for the relay probe only)
+    stdio: str = "exec"
 
     def model_path(self, local: Path) -> str:
         return MODEL_MOUNT
 
     async def start(self, mode: str, model: Path | None) -> Channel:
         import modal
+        from modal.stream_type import StreamType
 
         volumes = {}
         if model is not None:
@@ -899,11 +997,10 @@ class ModalBackend:
             volumes = {
                 MODEL_MOUNT: self.volume.with_mount_options(read_only=True, sub_path=str(sub))
             }
+        command = ("python3", "-m", "opentype_challenge.sandbox", mode)
+        entry = command if self.stdio == "entrypoint" else ("sleep", "infinity")
         sandbox = await modal.Sandbox.create.aio(
-            "python3",
-            "-m",
-            "opentype_challenge.sandbox",
-            mode,
+            *entry,
             app=self.app,
             image=self.image,
             gpu=self.gpu if mode == "serve" else None,
@@ -915,7 +1012,16 @@ class ModalBackend:
             volumes=volumes,
             timeout=self.timeout if mode == "serve" else BUILD_SECONDS + 600,
         )
-        return _ModalChannel(sandbox)
+        if self.stdio == "entrypoint":
+            return _ModalChannel(sandbox, sandbox)
+        try:
+            # stderr is discarded: an unread pipe would fill; the bootstrap reports on stdout
+            process = await sandbox.exec.aio(*command, text=False, stderr=StreamType.DEVNULL)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await sandbox.terminate.aio()
+            raise
+        return _ModalChannel(sandbox, process)
 
 
 STDIN_CHUNK = 1 << 20  # Modal buffers at most 2 MiB of sandbox stdin between drains
@@ -931,19 +1037,21 @@ async def _send_chunked(stdin: Any, line: str) -> None:
 
 
 class _ModalChannel:
-    def __init__(self, sandbox: Any):
-        self.sandbox = sandbox
+    """stdio of `process` (the sandbox itself, or a process exec'd in it)."""
+
+    def __init__(self, sandbox: Any, process: Any):
+        self.sandbox, self.process = sandbox, process
 
     async def send(self, line: str) -> None:
-        await _send_chunked(self.sandbox.stdin, line)
+        await _send_chunked(self.process.stdin, line)
 
-    async def chunks(self) -> AsyncIterator[str]:
-        async for chunk in self.sandbox.stdout:
-            yield chunk if isinstance(chunk, str) else chunk.decode(errors="replace")
+    async def chunks(self) -> AsyncIterator[bytes]:
+        async for chunk in self.process.stdout:
+            yield chunk.encode() if isinstance(chunk, str) else chunk
 
     async def close(self) -> bool:
         with contextlib.suppress(Exception):
-            self.sandbox.stdin.write_eof()
+            self.process.stdin.write_eof()
         try:
             await self.sandbox.terminate.aio(wait=True)
         except Exception:  # noqa: BLE001 - reported as not quiescent
@@ -984,10 +1092,10 @@ class _ProcessChannel:
         self.process.stdin.write(line.encode())
         await self.process.stdin.drain()
 
-    async def chunks(self) -> AsyncIterator[str]:
+    async def chunks(self) -> AsyncIterator[bytes]:
         assert self.process.stdout is not None
         while chunk := await self.process.stdout.read(1 << 16):
-            yield chunk.decode(errors="replace")
+            yield chunk
 
     async def close(self) -> bool:
         if self.process.stdin is not None:

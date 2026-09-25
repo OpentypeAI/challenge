@@ -75,5 +75,5 @@ module = ["tests.*"]
 disallow_untyped_defs = false
 
 [[tool.mypy.overrides]]
-module = ["sr25519", "bittensor_wallet", "torch.*", "vllm.*", "triton.*", "modal"]
+module = ["sr25519", "bittensor_wallet", "torch.*", "vllm.*", "triton.*", "modal", "modal.*"]
 ignore_missing_imports = true
