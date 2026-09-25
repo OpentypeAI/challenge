@@ -327,7 +327,7 @@ class Api:
             except httpx.TransportError:
                 await asyncio.sleep(2**attempt)
                 continue
-            if response.status_code in (502, 503, 504):
+            if response.status_code == 429 or response.status_code >= 500:
                 await asyncio.sleep(2**attempt)
                 continue
             if response.status_code >= 400:
