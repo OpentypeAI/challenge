@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS submissions (
   intake INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, hotkey TEXT NOT NULL,
   repo TEXT NOT NULL, revision TEXT NOT NULL, files TEXT NOT NULL, digest TEXT NOT NULL,
   state TEXT NOT NULL, reason TEXT, created_at INTEGER NOT NULL, job_id TEXT,
-  lane TEXT NOT NULL DEFAULT 'quality', options TEXT, target INTEGER, profile TEXT);
+  lane TEXT NOT NULL DEFAULT 'quality', options TEXT, target INTEGER, profile TEXT,
+  kernel TEXT);
 CREATE INDEX IF NOT EXISTS submissions_hotkey ON submissions (hotkey, state);
 CREATE INDEX IF NOT EXISTS submissions_lane ON submissions (lane, state);
 CREATE TABLE IF NOT EXISTS champions (
@@ -83,10 +84,11 @@ CREATE TABLE IF NOT EXISTS runtime_incumbents (
   model_champion_id INTEGER NOT NULL, options TEXT NOT NULL, options_digest TEXT NOT NULL,
   profile_digest TEXT NOT NULL, calibration TEXT NOT NULL, job_id TEXT NOT NULL,
   g_lcb REAL NOT NULL, total_gain REAL NOT NULL, credited INTEGER NOT NULL,
-  crowned_at INTEGER NOT NULL);
+  crowned_at INTEGER NOT NULL, kernel TEXT);
 CREATE TABLE IF NOT EXISTS runtime_tasks (
   job_id TEXT NOT NULL, block INTEGER NOT NULL, side TEXT NOT NULL, cell TEXT NOT NULL,
   case_index INTEGER NOT NULL, ms REAL NOT NULL, ok INTEGER NOT NULL, error INTEGER NOT NULL,
+  vectors TEXT,
   PRIMARY KEY (job_id, block, side, cell, case_index)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS epochs (epoch INTEGER PRIMARY KEY, body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS payments (
@@ -114,7 +116,12 @@ MIGRATIONS = (
     ("jobs", "incumbent_id", "INTEGER NOT NULL DEFAULT 0"),
     ("jobs", "calibration", "TEXT"),
     ("entitlements", "lane", "TEXT NOT NULL DEFAULT 'quality'"),
+    # the kernel slot and the timed answer vectors (still v3: nullable additions only)
+    ("submissions", "kernel", "TEXT"),
+    ("runtime_incumbents", "kernel", "TEXT"),
+    ("runtime_tasks", "vectors", "TEXT"),
 )
+CREATED_WHOLE = ("runtime_incumbents", "runtime_tasks")  # v3 tables a v2 file lacks
 RESULT_COLUMNS = (
     "job_id, case_index, side, level, loss, decisions, determined, correct, under_loss, under, "
     "track"
@@ -278,6 +285,8 @@ class Store:
         try:
             for table, column, ddl in MIGRATIONS:
                 have = {r[1] for r in self._db.execute(f"PRAGMA table_info({table})")}
+                if not have and table in CREATED_WHOLE:
+                    continue  # a v2 file lacks it: SCHEMA creates it whole below
                 if column not in have:
                     self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
             self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -329,10 +338,21 @@ class Store:
         return None if value is None else runtime.Calibration.from_json(value)
 
     def _runtime_open(self, db: sqlite3.Connection) -> bool:
-        """Runtime intake needs the operator's calibration and the lane split scheduled."""
+        """Runtime intake needs the operator's calibration, the lane split scheduled and an
+        NVFP4 quality champion: the lane measures NVFP4 weights only, so while the champion is
+        a BF16 checkpoint (every champion before the NVFP4 migration) it stays closed."""
         return (
-            self._calibration(db) is not None and self._meta_opt(db, "lanes_from_epoch") is not None
+            self._calibration(db) is not None
+            and self._meta_opt(db, "lanes_from_epoch") is not None
+            and self._champion_nvfp4(db)
         )
+
+    def _champion_nvfp4(self, db: sqlite3.Connection) -> bool:
+        """The champion's manifest carries the pinned NVFP4 config. Its tensor layout is
+        checked by the worker on the verified files (sandbox.weights_identity) and bound by
+        the calibrated profile; a mismatch there is never measured."""
+        files = json.loads(self._champion(db)["files"])
+        return bool(files.get("config.json") == pins.NVFP4_CONFIG_SHA256)
 
     def _incumbent(self, db: sqlite3.Connection) -> sqlite3.Row | None:
         """The runtime incumbent certified on the current champion's weights and the current
@@ -381,13 +401,23 @@ class Store:
         digest: str,
         nonce: str,
         exp: int,
+        kernel: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """A signed vLLM option set for the current champion's weights on the pinned profile."""
+        """A signed vLLM option set and/or kernel for the current champion's weights on the
+        pinned profile."""
         with self._tx() as db:
             if not self._runtime_open(db):
-                raise StoreError(503, "the runtime lane is closed until the operator calibrates it")
+                raise StoreError(
+                    503,
+                    "the runtime lane is closed until the operator calibrates it on an NVFP4 "
+                    "champion",
+                )
             calibration = self._calibration(db)
             assert calibration is not None
+            if kernel is not None and kernel["slot"] not in calibration.kernel_slots:
+                raise StoreError(
+                    503, f"the {kernel['slot']} kernel slot is not open under this calibration"
+                )
             db.execute("DELETE FROM nonces WHERE exp < ?", (self._now(),))
             if db.execute("SELECT 1 FROM nonces WHERE nonce=?", (nonce,)).fetchone():
                 raise StoreError(409, "nonce already used")
@@ -407,14 +437,17 @@ class Store:
             if pending >= self.settings.max_pending:
                 raise StoreError(429, "the runtime queue is full, retry later")
             incumbent = self._incumbent(db)
-            if incumbent is not None and json.loads(incumbent["options"]) == dict(options):
-                raise StoreError(409, "the options are those of the runtime incumbent")
+            if incumbent is not None and (
+                json.loads(incumbent["options"]) == dict(options)
+                and _kernel_sha(incumbent["kernel"]) == (kernel or {}).get("sha256")
+            ):
+                raise StoreError(409, "the candidate is the runtime incumbent")
             db.execute("INSERT INTO nonces VALUES (?, ?, ?)", (nonce, hotkey, exp))
             submission_id = "r_" + secrets.token_hex(8)
             db.execute(
                 "INSERT INTO submissions (id, hotkey, repo, revision, files, digest, state, "
-                "created_at, lane, options, target, profile) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, 'runtime', ?, ?, ?)",
+                "created_at, lane, options, target, profile, kernel) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, 'runtime', ?, ?, ?, ?)",
                 (
                     submission_id,
                     hotkey,
@@ -426,6 +459,7 @@ class Store:
                     _dumps(dict(options)),
                     champion["id"],
                     profile_digest,
+                    _dumps(dict(kernel)) if kernel else None,
                 ),
             )
             self._new_job(db, submission_id)
@@ -447,14 +481,18 @@ class Store:
         calibration = runtime.Calibration.from_json(json.loads(job["calibration"]))
         evidence = json.loads(job["evidence"]) if job["evidence"] else {}
         measured = evidence.get("runtime")
-        tasks = db.execute(
-            "SELECT block, side, cell, ms, ok, error FROM runtime_tasks WHERE job_id=?",
-            (job["id"],),
-        ).fetchall()
+        tasks = [
+            dict(t)
+            for t in db.execute(
+                "SELECT block, side, cell, case_index, ms, ok, error, vectors "
+                "FROM runtime_tasks WHERE job_id=?",
+                (job["id"],),
+            ).fetchall()
+        ]
+        for task in tasks:
+            task["vectors"] = json.loads(task["vectors"]) if task["vectors"] else None
         if isinstance(measured, Mapping):
-            blocks = runtime.runs_from_tasks(
-                calibration, measured.get("blocks"), [dict(t) for t in tasks]
-            )
+            blocks = runtime.runs_from_tasks(calibration, measured.get("blocks"), tasks)
             measured = {"profile": measured.get("profile"), "blocks": blocks}
         result = runtime.verdict(
             calibration,
@@ -462,6 +500,7 @@ class Store:
             self._runtime_fidelity(db, job["id"], "challenger"),
             self._runtime_fidelity(db, job["id"], "champion"),
             {track: plan.cases for track, plan in _job_plan(job).items()},
+            runtime.divergence(calibration.blocks, tasks),
         )
         db.execute(
             "UPDATE jobs SET state='scored', lease=NULL, verdict=?, finished_at=? WHERE id=?",
@@ -525,13 +564,20 @@ class Store:
         cursor = db.execute(
             "INSERT INTO runtime_incumbents (submission_id, hotkey, model_champion_id, options, "
             "options_digest, profile_digest, calibration, job_id, g_lcb, total_gain, credited, "
-            "crowned_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "crowned_at, kernel) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 submission["id"],
                 submission["hotkey"],
                 job["champion_id"],
                 submission["options"],
-                runtime.digest(json.loads(submission["options"])),
+                runtime.digest(
+                    {
+                        "options": json.loads(submission["options"]),
+                        "kernel": runtime.kernel_ref(_kernel(submission["kernel"])),
+                    }
+                    if submission["kernel"]
+                    else json.loads(submission["options"])
+                ),
                 calibration.profile_digest,
                 calibration.version,
                 job["id"],
@@ -539,6 +585,7 @@ class Store:
                 total,
                 amount,
                 self._now(),
+                submission["kernel"],
             ),
         )
         incumbent_id = cursor.lastrowid
@@ -1029,6 +1076,9 @@ class Store:
                     "calibration": json.loads(job["calibration"]),
                     "incumbent": json.loads(incumbent["options"]) if incumbent else {},
                     "candidate": json.loads(submission["options"]),
+                    # full sources: only the controller forwards them, into sandboxes
+                    "incumbent_kernel": _kernel(incumbent["kernel"]) if incumbent else None,
+                    "candidate_kernel": _kernel(submission["kernel"]),
                     "seed": job["seed"],  # the private workload, sealed like a duel's cases
                     "sides": {"champion": "stock", "challenger": "candidate"},
                 }
@@ -1274,6 +1324,7 @@ class Store:
                 raise StoreError(400, f"block {item['block']} is outside the calibration")
             case = runtime.cell_case(job["seed"], item["cell"], cell, item["case_index"])
             ok = runtime.task_ok(case, item)
+            vectors = runtime.answer_vectors(case, item)
             rows.append(
                 (
                     job_id,
@@ -1284,12 +1335,15 @@ class Store:
                     float(item["ms"]),
                     int(ok),
                     int("error" in item),
+                    None if vectors is None else _dumps(vectors),
                 )
             )
         with self._tx() as db:
             self._leased(db, job_id, lease)
             db.executemany(
-                "INSERT OR IGNORE INTO runtime_tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows
+                "INSERT OR IGNORE INTO runtime_tasks (job_id, block, side, cell, case_index, ms, "
+                "ok, error, vectors) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
             )
             db.execute(
                 "UPDATE jobs SET lease_expires=? WHERE id=?",
@@ -1806,7 +1860,21 @@ class Store:
                 "options": {
                     k: {"flag": v[0], "min": v[2], "max": v[3]} for k, v in runtime.OPTIONS.items()
                 },
-                "kernels": runtime.KERNELS,
+                "kernels": {
+                    "slots": list(runtime.KERNEL_SLOTS),
+                    "open": list(calibration.kernel_slots) if calibration else [],
+                    "max_bytes": runtime.KERNEL_MAX_BYTES,
+                },
+                "weights": {
+                    "format": "modelopt-nvfp4",
+                    "champion_nvfp4": self._champion_nvfp4(db),
+                    "reference": {
+                        "repo": pins.NVFP4_REPO,
+                        "revision": pins.NVFP4_REVISION,
+                        "files": pins.NVFP4_FILES,
+                    },
+                },
+                "gpu": runtime.GPU_TYPE,
                 "calibration": calibration.public() if calibration else None,
                 "target": {"champion": champion["id"], "digest": champion["digest"]},
                 "incumbent": None
@@ -1815,6 +1883,7 @@ class Store:
                     "id": incumbent["id"],
                     "hotkey": incumbent["hotkey"],
                     "options": json.loads(incumbent["options"]),
+                    "kernel": runtime.kernel_ref(_kernel(incumbent["kernel"])),
                 },
                 "queue": [dict(row) for row in queue],
                 "crowns": [
@@ -1857,6 +1926,15 @@ def _weights(job: sqlite3.Row) -> dict[str, float]:
 
 def _evidence(row: sqlite3.Row, key: str) -> Any:
     return json.loads(row["evidence"]).get(key) if row["evidence"] else None
+
+
+def _kernel(value: str | None) -> dict[str, Any] | None:
+    return json.loads(value) if value else None
+
+
+def _kernel_sha(value: str | None) -> str | None:
+    kernel = _kernel(value)
+    return kernel["sha256"] if kernel else None
 
 
 def _manifest(row: sqlite3.Row) -> dict[str, Any]:

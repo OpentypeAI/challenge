@@ -68,3 +68,34 @@ STRUCTURED_SERVER_URL = (
     "examples/features/structured_diffusion/structured_server.py"
 )
 STRUCTURED_SERVER_SHA256 = "7cd9aa0081090c064eaac28db0f54f812749eeb3ae787d7f7653d2e35d8a938f"
+
+# The runtime lane measures NVFP4 weights only, on B300 only (docs/operator.md, runtime lane).
+# The reference export is NVIDIA's ModelOpt NVFP4 of the same base: W4A4 FP4 (e2m1 in U8 pairs,
+# group 16, F8_E4M3 block scales, F32 global and input scales) on the 128 routed experts of the
+# 30 layers; attention, the dense MLP, the router, embeddings, lm_head and self-conditioning stay
+# BF16 (its hf_quant_config.json). Digests read from the Hub at this revision (lfs sha256 or a
+# download of the file).
+NVFP4_REPO = "nvidia/diffusiongemma-26B-A4B-it-NVFP4"
+NVFP4_REVISION = "ec4ff3df205028f4e81c954c2227f9312b3ec2ea"
+NVFP4_FILES = {
+    "config.json": "b4f650bd55f6c6ccd55656e27a7967c72ac28f1f3e315edaa29d6f5eebd05fde",
+    "model.safetensors.index.json": (
+        "3a1f1d8b64daad31b33c63ac48edd1cb43f0c3b3edf7cddf625f74fff37ae4c0"
+    ),
+    "model-00001-of-00002.safetensors": (
+        "24f1257810848d296cc42fd2f6186c8dd6c2a562482c4c1bc8463a087a2c6554"
+    ),
+    "model-00002-of-00002.safetensors": (
+        "5015731988fbfc21042032ed9ea4c9af335bfe70bcd7529d09b8f2438d5fdd0e"
+    ),
+}
+# The base config.json plus its quantization_config (modelopt, NVFP4, group 16, an FP8 KV
+# scheme without k/v scales). The runtime lane pins --kv-cache-dtype bfloat16: `auto` would
+# resolve to FP8 with unit scales. Its chat_template.jinja differs from the base's, so the base
+# support files are served with it, as with every quality champion.
+NVFP4_CONFIG_SHA256 = NVFP4_FILES["config.json"]
+# sha256 of the canonical {tensor name: [dtype, shape]} of both shard headers (47,067 tensors):
+# a runtime model must have exactly this layout, so FP4 packing, block scales and global scales
+# are where the loader expects them. Values are not checked (a scale can still be wrong; the
+# fidelity reads catch what matters).
+NVFP4_SCHEMA_SHA256 = "ac30a8c9d59750901192c3856988fdbf8b3c081e50561c9b953c4de2b5933d7c"

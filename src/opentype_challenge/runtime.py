@@ -1,11 +1,14 @@
-"""The runtime lane: vLLM options, the operator calibration and the pure verdict.
+"""The runtime lane: vLLM options, a registered kernel slot, the calibration and the verdict.
 
-The lane pays for serving the quality champion's weights faster. A miner submits only
-options from OPTIONS (no argv, env, image, plugin, reader or kernel); a trusted worker runs
-blocks of incumbent B / candidate C / incumbent B' one process at a time on one exclusive
-GPU and reports each timed task's latency and raw output plus each run's monotonic seconds.
-The container scores every output against its own gold (task_ok) and recomputes the verdict
-here; no success flag or count from the worker or the miner is ever evidence.
+The lane pays for serving the quality champion's weights faster, on B300 and NVFP4 weights
+only. A miner submits options from OPTIONS and, where the calibration opens it, one Triton
+kernel for a registered slot (KERNEL_SLOTS); never argv, env, image, reader or a plugin of
+their own. A trusted controller runs blocks of incumbent B / candidate C / incumbent B', each
+run in a fresh network-blocked, secret-free GPU sandbox (sandbox.py), and reports each timed
+task's latency (its own clock) and raw output plus each run's monotonic seconds. The container
+scores every output against its own gold (task_ok), measures how far the candidate's answers
+drift from a pristine stock reference's (divergence), and recomputes the verdict here; no
+success flag or count from the worker or the miner is ever evidence.
 
 Nothing is decided before the operator publishes a calibration (reference-vs-reference
 pilot on the pinned profile): without it the lane stays closed and no timing is accepted.
@@ -13,6 +16,7 @@ pilot on the pinned profile): without it the lane stays closed and no timing is 
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import math
@@ -27,8 +31,15 @@ from .generator import Case
 LANES = ("quality", "runtime")
 # Budgets in ledger units (1e9 = one epoch-mass), fixed by the challenge: an unused lane burns.
 BUDGETS = {"quality": 750_000_000, "runtime": 250_000_000}
-KERNELS = "disabled: no GPU backend with verified isolation (docs/operator.md, runtime lane)"
 SIDES = ("B", "C", "B2")
+# Registered kernel slots: the vLLM IR op each replaces, as provider "opentype"
+# (kernel_slot.py). Only slots a calibration lists accept kernels.
+KERNEL_SLOTS = ("rms_norm",)
+KERNEL_MAX_BYTES = 48 * 1024
+# What a kernel file may import: Triton only. The file runs only inside a sandbox; this check
+# keeps obvious non-kernels out of the queue, it is not the security boundary.
+KERNEL_IMPORTS = ("triton", "triton.language", "math")
+READ_TRACKS = ("decisions", "longctx")
 # Operational caps on a calibration (an oversized one would hold the exclusive GPU for days):
 # MAX_BLOCKS matches the timings API's block bound.
 MAX_BLOCKS = 999
@@ -49,23 +60,135 @@ OPTIONS: dict[str, tuple[str, type, int, int]] = {
     "enable_prefix_caching": ("--enable-prefix-caching", bool, 0, 1),
 }
 
-# The serving profile every measurement runs under. The worker measures MEASURED on its own
-# host and reads vllm_image from the build manifest baked into its image; a calibration pins
-# all of them, and a worker that cannot read one refuses the job.
-MEASURED = ("gpu", "driver", "vllm_version")
+# The serving profile every measurement runs under. The sandbox bootstrap measures MEASURED
+# inside each run's sandbox before any miner code runs, and reads vllm_image from the build
+# manifest baked into the image; a calibration pins all of them, and a run whose identity
+# differs is infrastructure doubt (no decision).
+MEASURED = ("gpu", "driver", "vllm_version", "compute_cap")
+GPU_TYPE = "B300"  # Modal's gpu= string; the measured name must contain it too
 PROFILE_FIXED: dict[str, Any] = {
     "vllm_image": pins.VLLM_IMAGE,
     "structured_server_sha256": pins.STRUCTURED_SERVER_SHA256,
-    "base": f"{pins.BASE_REPO}@{pins.BASE_REVISION}",
+    "base": f"{pins.BASE_REPO}@{pins.BASE_REVISION}",  # tokenizer, template, processor
+    # The champion must be a ModelOpt NVFP4 checkpoint of exactly this config and tensor
+    # layout; activations, attention and the KV cache stay bfloat16, pinned by flag.
+    "weights": "modelopt-nvfp4",
+    "weights_config_sha256": pins.NVFP4_CONFIG_SHA256,
+    "weights_schema_sha256": pins.NVFP4_SCHEMA_SHA256,
     "dtype": "bfloat16",
+    "kv_cache_dtype": "bfloat16",
+    "attention_backend": "TRITON_ATTN",
     "canvas": 256,
     "max_model_len": 131072,
     "gpu_memory_utilization": 0.9,
+    "executor": "modal-sandbox",
+    "gpu_type": GPU_TYPE,
 }
+# Pinned by the operator per calibration (chosen on the hardware), from this allowlist.
+MOE_BACKENDS = ("flashinfer_trtllm", "flashinfer_cutlass", "cutlass")
+PROFILE_KEYS = (*PROFILE_FIXED, "moe_backend", *MEASURED)
 
 
 class RuntimeError_(ValueError):
-    """A refused option set or calibration."""
+    """A refused option set, kernel or calibration."""
+
+
+def serving_argv(profile: Mapping[str, Any]) -> list[str]:
+    """The profile's own vllm flags, the same for every side: never auto-resolved."""
+    return [
+        "--kv-cache-dtype",
+        str(profile["kv_cache_dtype"]),
+        "--attention-backend",
+        str(profile["attention_backend"]),
+        "--moe-backend",
+        str(profile["moe_backend"]),
+    ]
+
+
+def kernel_argv(kernel: Mapping[str, Any] | None) -> list[str]:
+    """Select the registered provider for the kernel's slot (vllm --ir-op-priority)."""
+    if not kernel:
+        return []
+    return ["--ir-op-priority", json.dumps({kernel["slot"]: ["opentype"]})]
+
+
+def normalize_kernel(raw: Any) -> dict[str, Any] | None:
+    """{slot, source, sha256} of a submitted kernel, or None. The source is parsed, never
+    imported or executed here: only a sandbox ever runs it (kernel_slot.py)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping) or set(raw) != {"slot", "source"}:
+        raise RuntimeError_("kernel must be an object with slot and source")
+    slot, source = raw["slot"], raw["source"]
+    if slot not in KERNEL_SLOTS:
+        raise RuntimeError_(f"kernel slot must be one of {KERNEL_SLOTS}")
+    if not isinstance(source, str) or not source.strip():
+        raise RuntimeError_("kernel source must be a non-empty string")
+    data = source.encode()
+    if len(data) > KERNEL_MAX_BYTES:
+        raise RuntimeError_(f"kernel source exceeds {KERNEL_MAX_BYTES} bytes")
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError) as error:
+        raise RuntimeError_(f"kernel source does not parse: {error}") from None
+    kernels = []
+    for node in tree.body:
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            names = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module]
+            if isinstance(node, ast.ImportFrom) and node.level:
+                raise RuntimeError_("kernel source may not use relative imports")
+            if any(n not in KERNEL_IMPORTS for n in names):
+                raise RuntimeError_(f"kernel source may import only {KERNEL_IMPORTS}")
+        elif isinstance(node, ast.FunctionDef):
+            if node.name == "rms_norm_kernel":
+                kernels.append(node)
+        elif isinstance(node, ast.Assign):
+            if not all(isinstance(t, ast.Name) for t in node.targets) or not isinstance(
+                node.value, ast.Constant
+            ):
+                raise RuntimeError_("top-level assignments must bind names to constants")
+        elif not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)):
+            raise RuntimeError_("kernel source may hold only imports, constants and functions")
+        if isinstance(node, ast.FunctionDef):
+            _plain_def(node)
+    if len(kernels) != 1 or [ast.unparse(d) for d in kernels[0].decorator_list] != ["triton.jit"]:
+        raise RuntimeError_("kernel source must define one @triton.jit rms_norm_kernel")
+    return {"slot": slot, "source": source, "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def _dotted(node: ast.AST | None) -> bool:
+    """A name or attribute chain (tl.constexpr), or nothing: evaluates without calls."""
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return node is None or isinstance(node, ast.Name)
+
+
+def _plain_def(node: ast.FunctionDef) -> None:
+    """What `def` evaluates at import (decorators, defaults, annotations) runs no code."""
+    args = node.args
+    every = [*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg]
+    if (
+        not all(_dotted(d) and not isinstance(d, ast.Call) for d in node.decorator_list)
+        or not all(isinstance(d, ast.Constant) for d in [*args.defaults, *args.kw_defaults] if d)
+        or not all(_dotted(a.annotation) for a in every if a is not None)
+        or not _dotted(node.returns)
+    ):
+        raise RuntimeError_(
+            f"{node.name}: decorators, defaults and annotations must be names or constants"
+        )
+
+
+def kernel_ref(kernel: Mapping[str, Any] | None) -> dict[str, str] | None:
+    """What is signed, stored in digests and shown: the slot and the source digest."""
+    return None if not kernel else {"slot": kernel["slot"], "sha256": kernel["sha256"]}
+
+
+def normalize_candidate(options: Any, kernel: Any) -> tuple[dict[str, Any], dict | None]:
+    """A runtime submission: options (possibly none) and at most one kernel, not both empty."""
+    normalized_kernel = normalize_kernel(kernel)
+    if normalized_kernel is not None and (options is None or options == {}):
+        return {}, normalized_kernel
+    return normalize_options(options), normalized_kernel
 
 
 def canonical(value: Any) -> str:
@@ -142,9 +265,14 @@ class Calibration:
     latency_tolerance: float  # every block: candidate p95 <= (1 + this) * min(p95 B, p95 B')
     fidelity_loss_tolerance: float  # candidate loss per decision - stock's
     fidelity_accuracy_tolerance: float  # stock accuracy - candidate's
+    # mean total-variation distance of the candidate's timed read answers from the stock
+    # reference's, above the B-vs-B' distance of the same block: a kernel exact in the
+    # fidelity pass but approximate while timed is rejected
+    divergence_tolerance: float
     bootstrap_resamples: int
     credit_per_log_gain: float  # epoch-masses per unit of certified log gain
     credit_cap: float  # epoch-masses per crown
+    kernel_slots: tuple[str, ...]  # slots accepting kernels under this calibration
 
     @property
     def profile_digest(self) -> str:
@@ -158,13 +286,24 @@ class Calibration:
         if set(raw) != fields:
             raise RuntimeError_(f"calibration keys must be exactly {sorted(fields)}")
         profile = raw["profile"]
-        if not isinstance(profile, Mapping) or set(profile) != {*PROFILE_FIXED, *MEASURED}:
-            raise RuntimeError_(f"the profile must hold the fixed profile keys and {MEASURED}")
+        if not isinstance(profile, Mapping) or set(profile) != set(PROFILE_KEYS):
+            raise RuntimeError_(f"the profile keys must be exactly {sorted(PROFILE_KEYS)}")
         wrong = [k for k, v in PROFILE_FIXED.items() if profile[k] != v]
         if wrong:
             raise RuntimeError_(f"profile differs from the pinned serving profile: {wrong}")
+        if profile["moe_backend"] not in MOE_BACKENDS:
+            raise RuntimeError_(f"moe_backend must be one of {MOE_BACKENDS}")
         if not all(isinstance(profile[k], str) and profile[k] for k in MEASURED):
             raise RuntimeError_(f"profile {MEASURED} must be non-empty strings")
+        if GPU_TYPE not in profile["gpu"]:
+            raise RuntimeError_(f"the runtime lane is calibrated on {GPU_TYPE} only")
+        slots = raw["kernel_slots"]
+        if (
+            not isinstance(slots, list)
+            or len(set(slots)) != len(slots)
+            or not all(s in KERNEL_SLOTS for s in slots)
+        ):
+            raise RuntimeError_(f"kernel_slots must be distinct slots from {KERNEL_SLOTS}")
         cells_raw = raw["cells"]
         if not isinstance(cells_raw, Mapping) or not cells_raw:
             raise RuntimeError_("cells must be a non-empty object")
@@ -208,6 +347,7 @@ class Calibration:
             "latency_tolerance",
             "fidelity_loss_tolerance",
             "fidelity_accuracy_tolerance",
+            "divergence_tolerance",
             "credit_per_log_gain",
             "credit_cap",
         ):
@@ -215,7 +355,9 @@ class Calibration:
                 raise RuntimeError_(f"{key} must be a finite non-negative number")
         if not isinstance(raw["version"], str) or not raw["version"]:
             raise RuntimeError_("version must be a non-empty string")
-        return cls(**{**raw, "profile": dict(profile), "cells": cells})
+        return cls(
+            **{**raw, "profile": dict(profile), "cells": cells, "kernel_slots": tuple(slots)}
+        )
 
     def public(self) -> dict[str, Any]:
         """Published: distributions, weights, thresholds and profile; never the cases."""
@@ -233,11 +375,13 @@ class Calibration:
                     "latency_tolerance",
                     "fidelity_loss_tolerance",
                     "fidelity_accuracy_tolerance",
+                    "divergence_tolerance",
                     "bootstrap_resamples",
                     "credit_per_log_gain",
                     "credit_cap",
                 )
             },
+            "kernel_slots": list(self.kernel_slots),
         }
 
 
@@ -313,11 +457,12 @@ def verdict(
     candidate: Mapping[str, Fidelity],
     stock: Mapping[str, Fidelity],
     fidelity_cases: Mapping[str, int],
+    divergences: Sequence[Mapping[str, float]] | None = None,
 ) -> dict[str, Any]:
     """Pure: the runtime verdict from the trusted worker's timings, the container's scores of
-    the timed outputs (runs_from_tasks) and its per-track fidelity scores. Infrastructure
-    doubt gives NO_DECISION (no credit, no penalty); a candidate failing on healthy
-    infrastructure is rejected."""
+    the timed outputs (runs_from_tasks), its per-track fidelity scores and each block's timed
+    answer divergence from B (divergence). Infrastructure doubt gives NO_DECISION (no credit,
+    no penalty); a candidate failing on healthy infrastructure is rejected."""
     if not isinstance(evidence, Mapping):
         return _no_decision("no evidence")
     if evidence.get("profile") != cal.profile:
@@ -387,6 +532,15 @@ def verdict(
             return _reject(f"{track}: loss regressed against the stock reference", **detail)
         if acc_s - acc_c > cal.fidelity_accuracy_tolerance:
             return _reject(f"{track}: accuracy regressed against the stock reference", **detail)
+    # the timed answers: a candidate may not drift from B further than B' drifts from B
+    drift = divergences or []
+    if len(drift) != len(blocks) or not all(
+        isinstance(d, Mapping) and _finite(d.get("C")) and _finite(d.get("B2")) for d in drift
+    ):
+        return _no_decision("the timed answers are incomplete", **detail)
+    detail["divergence"] = [{"C": d["C"], "B2": d["B2"]} for d in drift]
+    if any(d["C"] - d["B2"] > cal.divergence_tolerance for d in drift):
+        return _reject("the timed answers drifted from the stock reference", **detail)
     # every block must hold the guard: a median would let a minority of slow blocks through
     slow = [n for n, v in latency.items() if max(v) > 1 + cal.latency_tolerance]
     if slow:
@@ -433,6 +587,48 @@ def task_ok(case: Case, item: Mapping[str, Any]) -> bool:
             if not right or sorted(vector)[-1] == sorted(vector)[-2]:  # a tie decides nothing
                 return False
     return True
+
+
+def answer_vectors(case: Case, item: Mapping[str, Any]) -> dict[str, list[float]] | None:
+    """A read task's answers as gold-aligned probability vectors (None for a harness task);
+    an invalid answer is an empty vector, as far from anything as it gets."""
+    from . import scoring
+
+    if case.track not in READ_TRACKS:
+        return None
+    answers = item.get("answers") if "error" not in item else None
+    answers = answers if isinstance(answers, Mapping) else {}
+    return {qid: scoring._vector(gold, answers.get(qid)) or [] for qid, gold in case.gold.items()}
+
+
+def _distance(a: Mapping[str, list[float]], b: Mapping[str, list[float]]) -> float:
+    """Mean total-variation distance over the case's questions (1 when either is invalid)."""
+    per = [
+        0.5 * sum(abs(p - q) for p, q in zip(a[k], b[k], strict=True))
+        if a.get(k) and b.get(k) and len(a[k]) == len(b[k])
+        else 1.0
+        for k in sorted(set(a) | set(b))
+    ]
+    return sum(per) / len(per) if per else 0.0
+
+
+def divergence(blocks: int, tasks: Sequence[Mapping[str, Any]]) -> list[dict[str, float]]:
+    """Per block, the mean distance of C's and of B2's timed read answers from B's on the same
+    cases ({block, side, cell, case_index, vectors}); a case B answered but another side did
+    not counts as distance 1. Blocks without read cells give 0 for both."""
+    by: dict[tuple[int, str, str, int], Mapping[str, list[float]]] = {}
+    for t in tasks:
+        if t.get("vectors") is not None:
+            by[(t["block"], t["side"], t["cell"], t["case_index"])] = t["vectors"]
+    out = []
+    for block in range(blocks):
+        keys = [k for k in by if k[0] == block and k[1] == "B"]
+        row = {}
+        for side in ("C", "B2"):
+            d = [_distance(by[k], by.get((block, side, k[2], k[3]), {"": []})) for k in keys]
+            row[side] = sum(d) / len(d) if d else 0.0
+        out.append(row)
+    return out
 
 
 def runs_from_tasks(

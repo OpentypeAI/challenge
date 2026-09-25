@@ -208,12 +208,20 @@ def _miner_runtime_submit(args: argparse.Namespace) -> None:
     state = miner.runtime_state(args.api)
     if not state["open"] or state["calibration"] is None:
         raise SystemExit("the runtime lane is closed: the operator has not calibrated it yet")
+    kernel = None
+    if args.kernel_file:
+        kernel = {"slot": args.kernel_slot, "source": Path(args.kernel_file).read_text()}
     try:
-        options = runtime.normalize_options(json.loads(args.options))
+        options, _ = runtime.normalize_candidate(json.loads(args.options or "{}"), kernel)
     except (ValueError, runtime.RuntimeError_) as error:
-        raise SystemExit(f"--options: {error}") from None
+        raise SystemExit(f"--options/--kernel-file: {error}") from None
     body = miner.signed_runtime_submission(
-        args.slug, state["target"], state["calibration"]["profile_digest"], options, signer
+        args.slug,
+        state["target"],
+        state["calibration"]["profile_digest"],
+        options,
+        signer,
+        kernel=kernel,
     )
     print(miner.post_runtime(args.api, body)["id"])
 
@@ -299,11 +307,14 @@ def parser() -> argparse.ArgumentParser:
     submit.add_argument("--wallet-path")
     submit.set_defaults(run=_miner_submit)
     rsubmit = msub.add_parser(
-        "runtime-submit", help="submit vLLM options for the champion's weights (runtime lane)"
+        "runtime-submit",
+        help="submit vLLM options and/or a kernel for the champion's weights (runtime lane)",
     )
     rsubmit.add_argument("--api", required=True)
     rsubmit.add_argument("--slug", default="opentype")
-    rsubmit.add_argument("--options", required=True, help="e.g. '{\"max_num_seqs\": 128}'")
+    rsubmit.add_argument("--options", help="e.g. '{\"max_num_seqs\": 128}'")
+    rsubmit.add_argument("--kernel-file", help="a Triton file defining rms_norm_kernel")
+    rsubmit.add_argument("--kernel-slot", default="rms_norm")
     for flag in ("--seed-file", "--wallet-name", "--wallet-hotkey", "--wallet-path"):
         rsubmit.add_argument(flag)
     rsubmit.set_defaults(run=_miner_runtime_submit)

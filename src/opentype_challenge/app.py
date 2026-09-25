@@ -89,14 +89,21 @@ class RuntimeTarget(Strict):
     digest: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class Kernel(Strict):
+    slot: str = Field(max_length=32)
+    source: str = Field(min_length=1, max_length=runtime.KERNEL_MAX_BYTES)
+
+
 class RuntimeSubmission(Strict):
-    """Only allowlisted vLLM options: no argv, env, image, plugin, reader or kernel."""
+    """Allowlisted vLLM options and/or one Triton kernel for a registered slot; never argv,
+    env, image, plugin or reader."""
 
     target: RuntimeTarget
     profile: str = Field(pattern=r"^[0-9a-f]{64}$")
     options: dict[str, StrictBool | StrictInt] = Field(
-        min_length=1, max_length=len(runtime.OPTIONS)
+        default_factory=dict, max_length=len(runtime.OPTIONS)
     )
+    kernel: Kernel | None = None
     hotkey: str = Field(max_length=66)
     nonce: str = Field(pattern=r"^[0-9a-f]{32}$")
     exp: int
@@ -548,7 +555,9 @@ def create_app(
     async def submit_runtime(request: Request) -> dict[str, Any]:
         item: RuntimeSubmission = await body(request, SUBMIT_BODY_MAX, RuntimeSubmission)
         try:
-            options = runtime.normalize_options(item.options)
+            options, kernel = runtime.normalize_candidate(
+                item.options, item.kernel.model_dump() if item.kernel else None
+            )
         except runtime.RuntimeError_ as error:
             raise StoreError(422, str(error)) from None
         now = int(clock())
@@ -559,7 +568,7 @@ def create_app(
         except CryptoError:
             raise StoreError(400, "invalid hotkey") from None
         target = item.target.model_dump()
-        digest = runtime_digest(config.slug, target, item.profile, options)
+        digest = runtime_digest(config.slug, target, item.profile, options, kernel)
         signature = bytes.fromhex(item.signature.removeprefix("0x"))
         if not verify(public, runtime_message(public, digest, item.nonce, item.exp), signature):
             raise StoreError(401, "signature verification failed")
@@ -567,7 +576,15 @@ def create_app(
         if ss58 not in await metagraph.hotkeys():
             raise StoreError(403, "the hotkey is not registered on the subnet")
         result: dict[str, Any] = await run(
-            store.submit_runtime, ss58, target, item.profile, options, digest, item.nonce, item.exp
+            store.submit_runtime,
+            ss58,
+            target,
+            item.profile,
+            options,
+            digest,
+            item.nonce,
+            item.exp,
+            kernel,
         )
         return result
 

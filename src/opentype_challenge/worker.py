@@ -106,19 +106,25 @@ def hf_fetch(repo: str, revision: str, filename: str, directory: Path) -> Path:
 
 
 def assemble(
-    manifest: Mapping[str, Any], base_dir: Path, directory: Path, fetch: Fetch
+    manifest: Mapping[str, Any],
+    base_dir: Path,
+    directory: Path,
+    fetch: Fetch,
+    config_sha256: str | None = None,
 ) -> dict[str, str]:
     """Download a manifest into directory, verify every sha256, add the base support files.
 
     Only weights, the weight index and config.json come from the miner; config.json must be
-    byte-equal to the base revision's, and tokenizer/chat template/processor files are
-    copied from the verified base snapshot. Returns the resolved sha256 of every file.
+    byte-equal to config_sha256 (the base revision's for a challenger; the champion's own,
+    which the container accepted, for the champion), and tokenizer/chat template/processor
+    files are copied from the verified base snapshot. Returns the resolved sha256 of every
+    file.
     """
     files: dict[str, str] = dict(manifest["files"])
     problem = manifest_problem(files)
     if problem:
         raise JobFailed(f"{manifest['repo']}: {problem}", retry=False)
-    if files["config.json"] != pins.BASE_FILES["config.json"]:
+    if files["config.json"] != (config_sha256 or pins.BASE_FILES["config.json"]):
         raise JobFailed("config.json differs from the base revision", retry=False)
     directory.mkdir(parents=True, exist_ok=True)
     resolved = {}
@@ -226,6 +232,8 @@ class VllmLauncher:
             "gpu_memory_utilization": runtime.PROFILE_FIXED["gpu_memory_utilization"],
             "gpu": gpu,
             "driver": driver,
+            # never the calibrated "modal-sandbox": miner code does not run on this host
+            "executor": "local-process",
         }
         missing = sorted(k for k, v in profile.items() if not v)
         if missing:
@@ -295,7 +303,10 @@ class VllmLauncher:
         models: Mapping[str, Path],
         extra: Mapping[str, Sequence[str]] | None = None,
         share: float | None = None,
+        kernel: Mapping[str, Any] | None = None,
     ) -> AsyncIterator[dict[str, dict[str, str]]]:
+        if kernel:  # this host holds the token and a writable workdir: miner code never runs
+            raise JobFailed("a local launcher never runs a miner kernel", retry=True)
         processes: list[subprocess.Popen[bytes]] = []
         env = {**scrubbed_env(), "HF_HUB_OFFLINE": "1"}
         self._live = processes
@@ -539,13 +550,22 @@ class Worker:
         if only the candidate then fails to start, its options are (reject)."""
         spec = job["runtime"]
         cal = runtime.Calibration.from_json(spec["calibration"])
-        flags = {
-            "B": runtime.options_argv(spec["incumbent"]),
-            "C": runtime.options_argv(spec["candidate"]),
+        base_flags = runtime.serving_argv(cal.profile)
+        kernels = {
+            "B": spec.get("incumbent_kernel"),
+            "C": spec.get("candidate_kernel"),
         }
-        profile = self.launcher.profile()
-        if profile != cal.profile:
-            raise JobFailed("this worker does not match the calibrated profile", retry=True)
+        flags = {
+            s: [
+                *base_flags,
+                *runtime.options_argv(spec["incumbent" if s == "B" else "candidate"]),
+                *runtime.kernel_argv(kernels[s]),
+            ]
+            for s in ("B", "C")
+        }
+        build = getattr(self.launcher, "build", None)
+        if any(kernels.values()) and build is None:
+            raise JobFailed("this worker cannot run kernels: no sandbox launcher", retry=True)
         base = await asyncio.to_thread(base_snapshot, self.workdir / "base", self.fetch)
         try:
             model, evidence["champion_files"] = await asyncio.to_thread(
@@ -553,17 +573,27 @@ class Worker:
             )
         except JobFailed as error:
             raise JobFailed(f"champion: {error.reason}", retry=True) from None
+        if kernels["C"] is not None:
+            assert build is not None
+            arch = int(str(cal.profile["compute_cap"]).replace(".", ""))
+            evidence["kernel_build"] = await build(kernels["C"], arch)  # fault: the candidate's
         share = float(cal.profile["gpu_memory_utilization"])
+        placements: list[Any] = []
+
+        def launch(side: str, served: str) -> Any:
+            return self._launch(
+                cal, model, served, flags[side] if side in flags else base_flags,
+                kernels.get(side), share, placements,
+            )  # fmt: skip
+
         # fidelity: stock ("champion", pristine flags, independent of B) then candidate
         # ("challenger"), each alone on the GPU at the calibrated share, like the timing
         self._require_quiescent("before stock fidelity")
-        async with self.launcher({"champion": model}, {"champion": []}, share=share) as urls:
+        async with launch("stock", "champion") as urls:
             counts = await self._read(job, urls, ("champion",))
         self._require_quiescent("before candidate fidelity")
         try:
-            async with self.launcher(
-                {"challenger": model}, {"challenger": flags["C"]}, share=share
-            ) as urls:
+            async with launch("C", "challenger") as urls:
                 candidate = await self._read(job, urls, ("challenger",))
         except ServeFailed as error:
             # stock served healthily alone on this GPU just before
@@ -575,11 +605,7 @@ class Worker:
             for side in runtime.SIDES:
                 self._require_quiescent(f"before {side}")
                 try:
-                    async with self.launcher(
-                        {"champion": model},
-                        {"champion": flags["C" if side == "C" else "B"]},
-                        share=share,
-                    ) as urls:
+                    async with launch("C" if side == "C" else "B", "champion") as urls:
                         seconds[side], tasks = await self._measure(job, cal, urls["champion"])
                 except ServeFailed as error:
                     # C's server runs as "champion"; B served healthily just before it
@@ -593,7 +619,31 @@ class Worker:
             )
             if not all(quiescent):
                 break  # reported as is: the verdict is NO_DECISION
-        return {**counts, "runtime": {"profile": profile, "blocks": blocks}}
+        evidence["placements"] = placements
+        return {**counts, "runtime": {"profile": cal.profile, "blocks": blocks}}
+
+    @asynccontextmanager
+    async def _launch(
+        self,
+        cal: runtime.Calibration,
+        model: Path,
+        served: str,
+        argv: Sequence[str],
+        kernel: Mapping[str, Any] | None,
+        share: float,
+        placements: list[Any],
+    ) -> AsyncIterator[dict[str, dict[str, str]]]:
+        """One run: serve, then check the profile this very run measured (the bootstrap reads
+        the GPU before any miner code) before a single case is sent; a mismatch is the host's."""
+        kwargs = {"kernel": {served: kernel}} if kernel else {}
+        async with self.launcher({served: model}, {served: list(argv)}, share, **kwargs) as urls:
+            measured = self.launcher.profile()
+            if measured != cal.profile:
+                wrong = sorted(k for k in {*measured, *cal.profile}
+                               if measured.get(k) != cal.profile.get(k))  # fmt: skip
+                raise JobFailed(f"this run does not match the calibrated profile: {wrong}", True)
+            placements.extend(getattr(self.launcher, "placements", [])[-1:])
+            yield urls
 
     async def _post_timings(
         self, job: dict[str, Any], block: int, side: str, tasks: list[dict[str, Any]]
@@ -718,7 +768,13 @@ class Worker:
             resolved: dict[str, str] = json.loads(record.read_text())
             return directory, resolved
         shutil.rmtree(root, ignore_errors=True)  # only the current champion is kept
-        resolved = assemble(manifest, base, directory, self.fetch)
+        # the champion's config is the one the container crowned: the base's, or the pinned
+        # NVFP4 export's once the champion migrated (nothing else ever becomes champion)
+        allowed = {pins.BASE_FILES["config.json"], pins.NVFP4_CONFIG_SHA256}
+        config = manifest["files"].get("config.json")
+        if config not in allowed:
+            raise JobFailed("the champion's config.json is neither the base's nor NVFP4's", True)
+        resolved = assemble(manifest, base, directory, self.fetch, config)
         record.write_text(json.dumps(resolved, sort_keys=True))
         return directory, resolved
 

@@ -32,6 +32,11 @@ Source = "https://github.com/OpentypeAI/challenge"
 [project.scripts]
 opentype-challenge = "opentype_challenge.cli:main"
 
+# Loaded by vllm only inside a runtime-lane sandbox (VLLM_PLUGINS=opentype_kernel); a no-op
+# unless the bootstrap set OPENTYPE_KERNEL_FILE and OPENTYPE_KERNEL_SHA256.
+[project.entry-points."vllm.general_plugins"]
+opentype_kernel = "opentype_challenge.kernel_slot:register"
+
 [dependency-groups]
 dev = ["pytest>=9,<10", "pytest-asyncio>=1.3,<2", "ruff>=0.16,<0.17", "mypy>=2,<3"]
 
@@ -70,5 +75,5 @@ module = ["tests.*"]
 disallow_untyped_defs = false
 
 [[tool.mypy.overrides]]
-module = ["sr25519", "bittensor_wallet"]
+module = ["sr25519", "bittensor_wallet", "torch.*", "vllm.*", "triton.*", "modal"]
 ignore_missing_imports = true

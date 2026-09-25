@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from opentype_challenge import crypto, harness, ledger, runtime, tracks, worker
+from opentype_challenge import crypto, harness, ledger, pins, runtime, tracks, worker
 from opentype_challenge.crypto import manifest_digest
 from opentype_challenge.miner import signed_runtime_submission, signed_submission
 from opentype_challenge.runtime import Calibration, Fidelity
@@ -25,9 +25,11 @@ from .fake_inference import answer, blur, chat_reply
 
 PROFILE = {
     **runtime.PROFILE_FIXED,
-    "gpu": "NVIDIA H200",
-    "driver": "570.00",
+    "moe_backend": "cutlass",
+    "gpu": "NVIDIA B300 SXM6 AC",
+    "driver": "580.95.05",
     "vllm_version": "0.11.1rc2.dev77+g7f1a5398",
+    "compute_cap": "10.3",
 }
 
 
@@ -63,15 +65,27 @@ def calibration_json(**over: Any) -> dict[str, Any]:
         "bootstrap_resamples": 2000,
         "credit_per_log_gain": 10.0,
         "credit_cap": 2.0,
+        "divergence_tolerance": 0.05,
+        "kernel_slots": ["rms_norm"],
     }
     raw.update(over)
     return raw
 
 
 CAL = Calibration.from_json(calibration_json())
+
+
+@pytest.fixture(autouse=True)
+def nvfp4_champion(monkeypatch):
+    """The test champion (the base manifest) stands in for the pinned NVFP4 export; the gate
+    itself is checked by test_the_lane_stays_closed_on_a_non_nvfp4_champion."""
+    monkeypatch.setattr(pins, "NVFP4_CONFIG_SHA256", pins.BASE_FILES["config.json"])
+
+
 GOOD = Fidelity(loss=10.0, decisions=100, determined=80, correct=78, cases=4)
 GOODS = {track: GOOD for track in runtime.fidelity_tracks(CAL)}  # decisions and ops
 CASES = {track: 4 for track in GOODS}
+SAME = [{"C": 0.0, "B2": 0.0}] * CAL.blocks  # the timed answers agree with B's
 
 
 def run_of(cal: Calibration, seconds: float, p95: float = 500.0, ok: Any = None) -> dict:
@@ -152,7 +166,7 @@ def test_calibration_is_strict():
 
 
 def test_a_known_gain_crowns_with_its_lcb():
-    result = runtime.verdict(CAL, evidence_of(gain=0.2, jitter=0.01), GOODS, GOODS, CASES)
+    result = runtime.verdict(CAL, evidence_of(gain=0.2, jitter=0.01), GOODS, GOODS, CASES, SAME)
     assert result["decision"] == "crown" and result["crown"]
     assert math.isclose(result["gain_mean"], 0.2 - 0.01 / 5)  # 3 blocks at -j, 2 at +j
     assert 0.185 < result["g_lcb"] < result["gain_mean"]
@@ -160,7 +174,7 @@ def test_a_known_gain_crowns_with_its_lcb():
 
 
 def test_noise_below_the_margin_is_no_crown():
-    result = runtime.verdict(CAL, evidence_of(gain=0.005, jitter=0.02), GOODS, GOODS, CASES)
+    result = runtime.verdict(CAL, evidence_of(gain=0.005, jitter=0.02), GOODS, GOODS, CASES, SAME)
     assert result["decision"] == "reject" and result["reason"] == "no certified gain"
 
 
@@ -183,7 +197,7 @@ def test_noise_below_the_margin_is_no_crown():
 def test_infrastructure_doubt_is_no_decision(mutate, reason):
     evidence = evidence_of()
     mutate(evidence)
-    result = runtime.verdict(CAL, evidence, GOODS, GOODS, CASES)
+    result = runtime.verdict(CAL, evidence, GOODS, GOODS, CASES, SAME)
     assert result["decision"] == "no_decision" and not result["crown"]
     assert reason in result["reason"]
 
@@ -191,40 +205,43 @@ def test_infrastructure_doubt_is_no_decision(mutate, reason):
 def test_candidate_failures_on_healthy_infrastructure_reject():
     dead = evidence_of()
     dead["blocks"][0]["runs"]["C"]["short"]["ok"] = 0
-    assert runtime.verdict(CAL, dead, GOODS, GOODS, CASES)["decision"] == "reject"
+    assert runtime.verdict(CAL, dead, GOODS, GOODS, CASES, SAME)["decision"] == "reject"
     slow = evidence_of()
     for block in slow["blocks"]:
         block["runs"]["C"]["short"]["p95_ms"] = 900.0
-    assert "latency" in runtime.verdict(CAL, slow, GOODS, GOODS, CASES)["reason"]
+    assert "latency" in runtime.verdict(CAL, slow, GOODS, GOODS, CASES, SAME)["reason"]
     minority = evidence_of()  # two slow blocks of five: a median would pass them
     for block in minority["blocks"][:2]:
         block["runs"]["C"]["short"]["p95_ms"] = 900.0
-    assert "latency" in runtime.verdict(CAL, minority, GOODS, GOODS, CASES)["reason"]
+    assert "latency" in runtime.verdict(CAL, minority, GOODS, GOODS, CASES, SAME)["reason"]
     worse = Fidelity(loss=12.0, decisions=100, determined=80, correct=78, cases=4)
     wrong = Fidelity(loss=10.0, decisions=100, determined=80, correct=70, cases=4)
     for track in GOODS:  # every measured track is guarded, not only decisions
         for bad, reason in ((worse, "loss"), (wrong, "accuracy")):
-            result = runtime.verdict(CAL, evidence_of(), {**GOODS, track: bad}, GOODS, CASES)
+            result = runtime.verdict(CAL, evidence_of(), {**GOODS, track: bad}, GOODS, CASES, SAME)
             assert result["decision"] == "reject" and result["reason"].startswith(track)
             assert reason in result["reason"]
     missing = Fidelity(loss=10.0, decisions=100, determined=80, correct=78, cases=3)
     for track in GOODS:
         partial = {**GOODS, track: missing}
-        assert runtime.verdict(CAL, evidence_of(), partial, GOODS, CASES)["decision"] == (
+        assert runtime.verdict(CAL, evidence_of(), partial, GOODS, CASES, SAME)["decision"] == (
             "no_decision"
         )
     no_ops = {"decisions": GOOD}
-    assert runtime.verdict(CAL, evidence_of(), no_ops, no_ops, {"decisions": 4})["decision"] == (
-        "no_decision"
-    )
+    assert runtime.verdict(CAL, evidence_of(), no_ops, no_ops, {"decisions": 4}, SAME)[
+        "decision"
+    ] == ("no_decision")
 
 
 def test_declared_candidate_metrics_never_count():
     evidence = evidence_of(gain=0.0)
     evidence["candidate_claims"] = {"speedup": 10.0}
     evidence["blocks"][0]["runs"]["C"]["short"]["speedup"] = 10.0  # unknown key: refused
-    assert runtime.verdict(CAL, evidence, GOODS, GOODS, CASES)["decision"] == "no_decision"
-    assert runtime.verdict(CAL, evidence_of(gain=0.0), GOODS, GOODS, CASES)["decision"] == "reject"
+    assert runtime.verdict(CAL, evidence, GOODS, GOODS, CASES, SAME)["decision"] == "no_decision"
+    assert (
+        runtime.verdict(CAL, evidence_of(gain=0.0), GOODS, GOODS, CASES, SAME)["decision"]
+        == "reject"
+    )
 
 
 def test_credit_is_capped_and_never_negative():
@@ -433,13 +450,24 @@ def runtime_body(state: dict[str, Any], who: Miner, clock: Clock, **over: Any) -
 def test_runtime_lane_is_closed_until_calibrated(client, miner, clock):
     state = client.get("/v1/runtime").json()
     assert not state["open"] and state["calibration"] is None
-    assert state["kernels"].startswith("disabled")
+    assert state["kernels"] == {
+        "slots": ["rms_norm"],
+        "open": [],
+        "max_bytes": runtime.KERNEL_MAX_BYTES,
+    }
     fake = {**state, "calibration": {"profile_digest": "0" * 64}}
     assert (
         client.post("/v1/runtime/submissions", json=runtime_body(fake, miner, clock)).status_code
         == 503
     )
     assert client.post("/v1/worker/lease?lane=runtime", headers=bearer(WORKER)).status_code == 204
+
+
+def test_the_lane_stays_closed_on_a_non_nvfp4_champion(tmp_path, monkeypatch):
+    monkeypatch.setattr(pins, "NVFP4_CONFIG_SHA256", "f" * 64)
+    store = lane_store(tmp_path)
+    state = store.runtime_status()
+    assert not state["open"] and not state["weights"]["champion_nvfp4"]
 
 
 def test_runtime_signatures_bind_every_field(client, miner, clock):
@@ -681,8 +709,8 @@ def test_champion_change_expires_runtime_work_and_recertification_pays_nothing(t
     with store._tx() as db:  # a quality crown (champion 2) without running a whole duel
         db.execute(
             "INSERT INTO champions (repo, revision, files, digest, crowned_at) "
-            "VALUES ('m/new', 'r2', '{}', ?, 0)",
-            ("e" * 64,),
+            "VALUES ('m/new', 'r2', ?, ?, 0)",
+            (json.dumps({"config.json": pins.NVFP4_CONFIG_SHA256}), "e" * 64),
         )
         store._expire_runtime(db)  # what _crown runs after it inserts a champion
     assert store.submission(queued)["state"] == "expired"
@@ -815,7 +843,7 @@ def verdict_of(out: dict[str, Any]) -> dict[str, Any]:
     ]
     blocks = runtime.runs_from_tasks(CAL, out["runtime"]["blocks"], tasks)
     measured = {"profile": out["runtime"]["profile"], "blocks": blocks}
-    return runtime.verdict(CAL, measured, GOODS, GOODS, CASES)
+    return runtime.verdict(CAL, measured, GOODS, GOODS, CASES, SAME)
 
 
 def test_worker_runs_b_c_b2_one_server_at_a_time(monkeypatch):
@@ -827,16 +855,21 @@ def test_worker_runs_b_c_b2_one_server_at_a_time(monkeypatch):
     assert "ok" not in json.dumps(out["runtime"])  # the worker reports no success flag
     stock, candidate, *measured = launcher.starts
     # fidelity: one server at a time at the calibrated share, stock pristine and first
-    assert stock == {"sides": ["champion"], "extra": {"champion": []}, "share": 0.9}
+    fixed = runtime.serving_argv(PROFILE)
+    assert fixed == [
+        "--kv-cache-dtype", "bfloat16", "--attention-backend", "TRITON_ATTN",
+        "--moe-backend", "cutlass",
+    ]  # fmt: skip
+    assert stock == {"sides": ["champion"], "extra": {"champion": fixed}, "share": 0.9}
     assert candidate == {
         "sides": ["challenger"],
-        "extra": {"challenger": ["--max-num-seqs", "128"]},
+        "extra": {"challenger": [*fixed, "--max-num-seqs", "128"]},
         "share": 0.9,
     }
     assert len(measured) == 3 * CAL.blocks
     assert all(start["sides"] == ["champion"] and start["share"] == 0.9 for start in measured)
     flags = [start["extra"]["champion"] for start in measured]
-    assert flags == [[], ["--max-num-seqs", "128"], []] * CAL.blocks
+    assert flags == [fixed, [*fixed, "--max-num-seqs", "128"], fixed] * CAL.blocks
     assert out["runtime"]["profile"] == PROFILE
     assert verdict_of(out)["decision"] == "reject"  # no gain
 
@@ -846,6 +879,31 @@ def test_worker_stops_on_a_dirty_gpu_and_the_verdict_is_no_decision(monkeypatch)
     blocks = out["runtime"]["blocks"]
     assert len(blocks) == 1 and blocks[0]["quiescent"] == [True, False]
     assert verdict_of(out)["decision"] == "no_decision"
+
+
+def test_a_kernel_never_runs_on_a_local_launcher(monkeypatch):
+    kernel = {"slot": "rms_norm", "source": "x", "sha256": "0" * 64}
+
+    async def go() -> None:
+        async with worker.VllmLauncher()({"champion": worker.Path("/m")}, kernel={"c": kernel}):
+            pass
+
+    with pytest.raises(worker.JobFailed, match="never runs a miner kernel"):
+        asyncio.run(go())
+    launcher = FakeLauncher()
+    with pytest.raises(worker.JobFailed, match="no sandbox launcher"):
+        bench_kernel(monkeypatch, launcher, kernel)
+    assert launcher.starts == []  # refused before anything served
+
+
+def bench_kernel(monkeypatch, launcher: FakeLauncher, kernel: dict[str, Any]) -> dict[str, Any]:
+    monkeypatch.setattr(worker, "base_snapshot", lambda directory, fetch: directory)
+    monkeypatch.setattr(worker.Worker, "_champion", lambda self, m, b: (b, {}))
+    instance = worker.Worker(None, None, launcher, lane="runtime")  # type: ignore[arg-type]
+    instance.workdir = worker.Path("/nonexistent")
+    spec = {"calibration": calibration_json(), "incumbent": {}, "candidate": {}, "seed": "s"}
+    job = {"champion": {}, "runtime": {**spec, "candidate_kernel": kernel}}
+    return asyncio.run(instance._bench(job, None, {}))  # type: ignore[arg-type]
 
 
 def test_worker_refuses_an_uncalibrated_profile(monkeypatch):
@@ -1108,7 +1166,8 @@ def test_profile_reads_the_build_and_fails_closed(monkeypatch, tmp_path):
     manifest.write_text(json.dumps({"vllm_image": "vllm/other@sha256:1"}))
     profile = launcher.profile()
     assert profile["vllm_image"] == "vllm/other@sha256:1" and profile["vllm_version"] == "0.11.1"
-    assert set(profile) == {*runtime.PROFILE_FIXED, *runtime.MEASURED}
+    assert profile["executor"] == "local-process"  # never the runtime lane's executor
+    assert profile["executor"] != runtime.PROFILE_FIXED["executor"]
     assert profile != {**profile, "vllm_image": runtime.PROFILE_FIXED["vllm_image"]}
     assert worker.VllmLauncher(reader=reader, dtype="float16").profile()["dtype"] == "float16"
     monkeypatch.setattr(worker, "_package_version", lambda name: None)
