@@ -332,7 +332,7 @@ def serve(
                 f"http://127.0.0.1:{vllm_port}/health", processes, health_timeout
             )
         if problem:
-            out({"failed": problem})
+            out({"failed": problem, "logs": _tails(log_dir)})
             return 1
         out({"ready": True})
         bases = {
@@ -355,6 +355,20 @@ def serve(
     finally:
         _stop(processes)
     return 0
+
+
+LOG_TAIL = 4000  # bytes of each child's log in a failure frame (operator diagnosis only)
+
+
+def _tails(log_dir: Path) -> dict[str, str]:
+    tails = {}
+    for name in ("reader", "vllm"):
+        with contextlib.suppress(OSError):
+            with (log_dir / f"{name}.log").open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - LOG_TAIL))
+                tails[name] = handle.read().decode(errors="replace")
+    return tails
 
 
 def _relay(out: _Out, base: str, request: Mapping[str, Any], timeout: float) -> None:
@@ -512,6 +526,7 @@ class SandboxLauncher:
     ready_timeout: float = HEALTH_TIMEOUT + 600
     live: dict[str, _Live] = field(default_factory=dict)
     placements: list[dict[str, Any]] = field(default_factory=list)
+    failures: list[dict[str, Any]] = field(default_factory=list)  # never sent to the API
     _profile: dict[str, Any] | None = None
     _open: int = 0
 
@@ -612,6 +627,7 @@ class SandboxLauncher:
                     elif "ready" in frame and measured is not None:
                         break
                     elif "failed" in frame:
+                        self.failures.append({"side": side, **frame})  # bounded by MAX_FRAME
                         raise ServeFailed(f"sandbox: {str(frame['failed'])[:300]}", side)
                     else:
                         raise JobFailed("a sandbox broke the start protocol", retry=True)

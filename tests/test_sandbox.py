@@ -119,6 +119,8 @@ def test_a_failing_server_is_the_sides_fault(tmp_path):
         asyncio.run(go())
     assert error.value.side == "challenger"
     assert launcher.quiescent()
+    tails = launcher.failures[-1]["logs"]
+    assert "nope.py" in tails["vllm"] and len(tails["vllm"]) <= sandbox.LOG_TAIL
 
 
 def test_the_relay_refuses_oversized_and_malformed_frames():

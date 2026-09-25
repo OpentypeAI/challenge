@@ -127,6 +127,10 @@ def smoke(moe_backend: str = "cutlass", cases: int = 8, max_model_len: int = 327
             "quiescent": launcher.quiescent(),
         }
 
-    result = asyncio.run(go())
+    try:
+        result = asyncio.run(go())
+    except Exception:
+        print(json.dumps({"failures": launcher.failures}, indent=2)[-20000:])
+        raise
     print(json.dumps(result, indent=2))
     return result
