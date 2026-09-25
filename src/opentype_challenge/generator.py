@@ -709,7 +709,29 @@ def family_from_json(payload: Mapping[str, Any]) -> Family:
         raise GeneratorError("names of facts, derived facts and questions must be unique")
     if len({f.label for f in facts}) != len(facts):
         raise GeneratorError("fact labels must be unique")
-    return Family(name, title, subject, facts, tuple(derived), questions)  # ambiguity check
+    family = Family(name, title, subject, facts, tuple(derived), questions)  # ambiguity check
+    for fact in facts + tuple(derived):
+        _probe_grammar(family, fact)
+    return family
+
+
+def _probe_grammar(family: Family, fact: Fact) -> None:
+    """Every value of fact, in every operator and beside another atom, must parse back: a
+    name or value such as 'and' would break the rule grammar at duel time, not here."""
+    other: Atom = (fact.name, "is not", fact.domain[0])
+    atoms: list[Atom] = [(fact.name, "is one of", tuple(map(str, fact.domain)))]
+    for value in fact.domain:
+        ops = ("is at least", "is below") if fact.numeric else ("is", "is not")
+        atoms.extend((fact.name, op, value) for op in ops)
+    if fact.numeric:
+        atoms.pop(0)  # ponytail: rules never use 'is one of' on integer facts
+    rule: Rule = (tuple(((atom, other), "x") for atom in atoms), "x")
+    try:
+        ok = parse_rule(rule_lines(rule), family) == rule
+    except GeneratorError:
+        ok = False
+    if not ok:
+        raise GeneratorError(f"fact {fact.name!r}: its name or values break the rule grammar")
 
 
 def _canonical(value: Any) -> str:

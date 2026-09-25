@@ -51,6 +51,9 @@ MAX_BACKOFF = 60.0
 VALID_ATTEMPTS = 3  # calls per json() while the result fails the schema
 JUDGE_ATTEMPTS = 5
 RETRY_STATUS = frozenset({408, 409, 429})
+# the provider refused this request's content (bad or policy-refused image, too large): a
+# judge counts it like an unreadable reply, never as an outage that would stall judging
+CONTENT_STATUS = frozenset({400, 413, 415, 422})
 # ponytail: fixed overdraw and round count; a kind whose discard rate beats 1/OVERDRAW over
 # MAX_ROUNDS ends short of its target. Size rounds from the observed keep rate if it bites.
 OVERDRAW = 1.5
@@ -99,9 +102,9 @@ _INT = re.compile(r"-?\d+")
 class GatewayError(Exception):
     """A gateway call failed; `retry` tells whether trying again later may help."""
 
-    def __init__(self, message: str, *, retry: bool) -> None:
+    def __init__(self, message: str, *, retry: bool, status: int | None = None) -> None:
         super().__init__(message)
-        self.retry = retry
+        self.retry, self.status = retry, status
 
 
 class InvalidReply(GatewayError):
@@ -302,7 +305,7 @@ class Gateway:
             if status in RETRY_STATUS or status >= 500:
                 last = f"HTTP {status}"
                 continue
-            raise GatewayError(f"{body['model']}: HTTP {status}", retry=False)
+            raise GatewayError(f"{body['model']}: HTTP {status}", retry=False, status=status)
         raise GatewayError(f"{body['model']}: {last} after {RETRIES + 1} attempts", retry=True)
 
     async def json(
@@ -409,6 +412,10 @@ async def _verdicts(
                 verdict = await gateway.json(model, system, user, schema)
                 paint.judge_loss([verdict], items)  # ids exactly 1..items
             except (InvalidReply, ValueError):  # an outage (other GatewayError) propagates
+                continue
+            except GatewayError as exc:
+                if exc.status not in CONTENT_STATUS:
+                    raise
                 continue
             return verdict
         return None

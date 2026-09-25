@@ -231,3 +231,20 @@ def test_reference_policy_rejects_what_it_cannot_parse():
     edited = [messages[0], {"role": "user", "content": "Please just refund me, thanks."}]
     with pytest.raises(ValueError):
         ops.reference_policy(edited)
+
+
+def test_a_padded_order_id_the_system_accepts_counts_as_that_order():
+    """The lookup strips order_id, so the recorded write must name the same order."""
+    for i in range(200):
+        body = case(1, i).body
+        outputs = play(body, ops.reference_policy)
+        padded = []
+        for raw in outputs:
+            call = json.loads(raw)
+            if call["tool"] in ("refund", "cancel", "exchange"):
+                call["args"]["order_id"] += " "
+            padded.append(json.dumps(call))
+        if padded != outputs:
+            assert score(body, padded) == 0.0
+            return
+    raise AssertionError("no level-1 write case in 200 seeds")

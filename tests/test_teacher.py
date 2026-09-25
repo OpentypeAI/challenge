@@ -493,6 +493,21 @@ def test_judge_png_averages_and_gives_up(tmp_path):
     with pytest.raises(GatewayError):  # an outage is not an unreadable render
         run(go(down))
 
+    refusals: list[int] = []
+
+    def refused(request: httpx.Request) -> httpx.Response:
+        refusals.append(1)
+        return httpx.Response(400)  # the provider refuses this render: a content failure
+
+    assert run(go(refused)) is None  # forfeits; never stalls the judging queue
+    assert len(refusals) == 2 * teacher.JUDGE_ATTEMPTS
+
+    def unauthorised(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401)
+
+    with pytest.raises(GatewayError):  # a config failure is an outage: the side stays pending
+        run(go(unauthorised))
+
 
 # ---------------------------------------------------------------------------
 # Live smoke test against the operator gateway.

@@ -23,7 +23,7 @@ from fastapi import FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from . import __version__, bank, generator, pins, teacher
+from . import __version__, bank, generator, pins, teacher, tracks
 from .crypto import (
     CryptoError,
     decode_hotkey,
@@ -245,6 +245,8 @@ def create_app(
     hooks; both None means "from teacher.TeacherConfig.from_env() when its token is readable".
     beacon() -> {round, randomness} | None defaults to drand through `transport` when it can
     serve sync requests."""
+    # a plan that builds nothing must fail the canary, not 500 every submission later
+    tracks.effective_plan(config.settings.track_plan(), bank.EMPTY_BANK, judge=False)
     gateway: teacher.Gateway | None = None
     if judge is None and bank_builder is None:
         found = _teacher()
@@ -276,13 +278,15 @@ def create_app(
         with nothing left to judge. Returns the number of sides judged here. A judge that
         raises (gateway outage, closed at shutdown) leaves its side pending for a later pass;
         only None (the judge's replies about this render were unreadable) excludes the pair.
+        Without a judge (teacher off at startup) nothing is judged: the sides stay pending
+        until a restart with the teacher, never scored as unjudged.
 
         ponytail: a long outage holds its jobs in 'judging'; add an operator deadline if that
         ever bites.
         """
         done = 0
         down = False
-        while not down:
+        while judge is not None and not down:
             batch = await run(store.pending_judgments)
             with claims_lock:
                 mine = [
@@ -296,14 +300,12 @@ def create_app(
                 break
             try:
                 for item in mine:
-                    loss = None
-                    if judge is not None:
-                        try:
-                            loss = await judge(item["brief"], item["rubric"], item["png"])
-                        except Exception:
-                            log.exception("judge call failed; the side stays pending")
-                            down = True
-                            break
+                    try:
+                        loss = await judge(item["brief"], item["rubric"], item["png"])
+                    except Exception:
+                        log.exception("judge call failed; the side stays pending")
+                        down = True
+                        break
                     await run(
                         store.record_judgment, item["job"], item["case_index"], item["side"], loss
                     )
@@ -314,10 +316,13 @@ def create_app(
         await run(store.settle_judged)
         return done
 
-    async def tick() -> None:
-        """One pass of background work: judging, settling and window auto-rotation."""
-        await judge_pending()
+    async def rotate_due() -> None:
         await run(store.auto_rotate, config.window_hours * 3600)
+
+    async def tick() -> None:
+        """One pass of background work: window auto-rotation, judging and settling."""
+        await rotate_due()
+        await judge_pending()
 
     async def build_next() -> bool:
         """Build the next window's bank when none is ready; True when one was built."""
@@ -332,10 +337,11 @@ def create_app(
         log.info("next window bank ready: %d items, digest %s", len(items), digest)
         return True
 
-    async def background() -> None:
+    async def background(work: Callable[[], Awaitable[Any]]) -> None:
+        # rotation has its own loop: a judging backlog (hours of calls) never delays it
         while True:
             try:
-                await tick()
+                await work()
             except Exception:
                 log.exception("background pass failed")
             await asyncio.sleep(BACKGROUND_SECONDS)
@@ -351,7 +357,11 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        tasks = [asyncio.create_task(background()), asyncio.create_task(builder())]
+        tasks = [
+            asyncio.create_task(background(rotate_due)),
+            asyncio.create_task(background(judge_pending)),
+            asyncio.create_task(builder()),
+        ]
         yield
         # judge calls started by complete too: they must not outlive the gateway
         futures: list[asyncio.Future[Any]] = [*tasks, *running]

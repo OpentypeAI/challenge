@@ -4,6 +4,7 @@ lifecycle, the v1 -> v2 migration, the drand beacon and early stop on the compos
 
 from __future__ import annotations
 
+import asyncio
 import json
 import random
 import secrets
@@ -262,6 +263,16 @@ def test_release_drops_pending_judgments(tmp_path):
     assert store.pending_judgments() == []
 
 
+def test_a_retargeted_job_drops_the_previous_attempts_evidence(tmp_path):
+    store = store_of(tmp_path)
+    sid = enqueue(store, "a")["id"]
+    lease = lease_of(store)
+    store.fail(lease["job"], lease["lease"], "retry me", True, {"cases_sha256": "stale"})
+    assert store.submission(sid)["job"]["evidence"] == {"cases_sha256": "stale"}
+    lease_of(store)  # retargeted: a fresh window, mix or seed may differ from attempt 1's
+    assert store.submission(sid)["job"]["evidence"] is None
+
+
 # -- drand beacon ------------------------------------------------------------------
 
 
@@ -498,3 +509,49 @@ def test_a_judge_outage_leaves_the_sides_pending(make_client):
         store._db.execute("SELECT count(*) FROM judgments WHERE state != 'pending'").fetchone()[0]
         == 0
     )
+
+
+def test_a_restart_without_the_teacher_keeps_pending_judgments(tmp_path, make_client):
+    store = depict_store(tmp_path)
+    sid = enqueue(store, "a")["id"]
+    lease = lease_of(store)
+    answer_paint(store, lease)
+    assert store.complete(lease["job"], lease["lease"], {})["job"]["state"] == "judging"
+    pending = len(store.pending_judgments())
+    client = make_client(plan={"paint": TrackPlan(1.0, 12)})  # teacher off: judge is None
+    client.portal.call(client.app.state.tick)
+    again = client.app.state.store
+    assert len(again.pending_judgments()) == pending  # not scored unjudged
+    assert again.submission(sid)["job"]["state"] == "judging"
+
+
+def test_rotation_does_not_wait_for_the_judging_backlog(tmp_path, make_client, clock):
+    async def judge(brief: str, rubric: list[str], png: bytes) -> float | None:
+        await asyncio.Event().wait()  # a very slow gateway
+        return None
+
+    client = make_client(judge=judge, plan={"paint": TrackPlan(1.0, 12)})
+    store = client.app.state.store
+    with_bank(store, [BankItem.make("depict", DEPICT)])
+    enqueue(store, "a")
+    lease = lease_of(store)
+    answer_paint(store, lease)
+    store.complete(lease["job"], lease["lease"], {})
+    store.set_next_bank([])
+    clock.now += 24 * 3600
+
+    async def bounded() -> None:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(client.app.state.tick(), 0.5)
+
+    client.portal.call(bounded)
+    assert store.window(3)["bank_digest"] == EMPTY_BANK.digest  # rotated all the same
+
+
+@pytest.mark.parametrize(
+    "plan",
+    [{"Decisions": TrackPlan(1.0, 10)}, {"decisions": TrackPlan(0.0, 10)}],
+)
+def test_a_plan_that_builds_nothing_fails_startup(make_client, plan):
+    with pytest.raises(ValueError):
+        make_client(plan=plan)

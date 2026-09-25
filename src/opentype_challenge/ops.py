@@ -733,13 +733,17 @@ def _solve(
 
 
 def _keys(tool: str, args: Mapping[str, Any]) -> list[tuple[str, ...]]:
-    """Write-set elements: one per refunded line, so one call or several count the same."""
+    """Write-set elements: one per refunded line, so one call or several count the same.
+    order_id is stripped exactly as _order looks it up, so an accepted write records its order."""
+    if tool == "escalate":
+        return [("escalate",)]
+    oid = args["order_id"].strip()
     if tool == "refund":
-        return [("refund", args["order_id"], item, args["reason"]) for item in args["item_ids"]]
+        return [("refund", oid, item, args["reason"]) for item in args["item_ids"]]
     if tool == "cancel":
-        return [("cancel", args["order_id"])]
+        return [("cancel", oid)]
     if tool == "exchange":
-        return [("exchange", args["order_id"], args["item_id"], args["new_sku"])]
+        return [("exchange", oid, args["item_id"], args["new_sku"])]
     return [("escalate",)]
 
 

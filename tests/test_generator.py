@@ -249,6 +249,8 @@ REJECTIONS = {  # reason: (mutation, expected message fragment)
     ),
     "prompt without ?": (lambda p: p["questions"][0].update(prompt="Decide"), "prompt"),
     "probe suffix": (lambda p: p["questions"][0].update(id="qx_decision_mirror"), "probe"),
+    "value 'and'": (lambda p: p["facts"][0].update(domain=["and", "b"]), "rule grammar"),
+    "derived value 'and'": (lambda p: p["derived"][0].update(domain=["and", "b"]), "grammar"),
     "not an object": (lambda p: p["facts"].__setitem__(0, "fact"), r"facts\[0\]"),
 }
 

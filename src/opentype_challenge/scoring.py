@@ -28,12 +28,22 @@ NORM_TOLERANCE = 1e-3
 ZERO_LOSS_FLOOR = -math.log(0.01)
 TRACK_GUARD_PAIRS = 30  # a track with at least this many pairs must not regress
 TRACK_REGRESSION = -math.log(1.02)  # UCB99 of a track's g may not fall below this
+# a track's g counts at most this much in a multi-track composite: one track alone (sql is
+# all public templates a miner can overfit) cannot clear the bar or mint several epochs
+TRACK_GAIN_CAP = math.log(2.0)
+# a crown needs this many guarded tracks (>= TRACK_GUARD_PAIRS pairs) whose g has a positive
+# LCB99, when the duel has that many guarded tracks
+GAIN_TRACKS = 2
 
 TrackMoments = tuple[int, float, float, float, float, float]  # (n, sa, sb, saa, sbb, sab)
 
 
 def _finite(value: Any) -> TypeGuard[float]:
-    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return abs(value) < 2**1023  # math.isfinite would raise OverflowError on wider ints
+    return isinstance(value, float) and math.isfinite(value)
 
 
 def _vector(gold: Gold, answer: Any) -> list[float] | None:
@@ -214,8 +224,9 @@ def moments(pairs: Iterable[Paired]) -> dict[str, TrackMoments]:
 def composite(
     moments: Mapping[str, TrackMoments], weights: Mapping[str, float]
 ) -> tuple[float, float]:
-    """(g, se): the weighted mean of per-track log ratios over tracks with >= 2 pairs and a
-    positive weight; exactly log_ratio_moments when one track is present."""
+    """(g, se): the weighted mean of per-track log ratios, each capped at TRACK_GAIN_CAP,
+    over tracks with >= 2 pairs and a positive weight; exactly log_ratio_moments when one
+    track is present."""
     stats = [
         (weights[t], *log_ratio_moments(*m))
         for t, m in sorted(moments.items())
@@ -226,7 +237,7 @@ def composite(
     if len(stats) == 1:
         return stats[0][1], stats[0][2]
     total = sum(w for w, _, _ in stats)
-    g = sum(w * g_t for w, g_t, _ in stats) / total
+    g = sum(w * min(g_t, TRACK_GAIN_CAP) for w, g_t, _ in stats) / total
     se = math.sqrt(sum((w * se_t) ** 2 for w, _, se_t in stats)) / total
     return g, se
 
@@ -289,6 +300,7 @@ def _track_metrics(pairs: Sequence[Paired]) -> dict[str, dict[str, Any]]:
             "challenger_loss": m[2],
             "accuracy": accuracy,
             "regressed": m[0] >= TRACK_GUARD_PAIRS and g + Z99 * se < TRACK_REGRESSION,
+            "gained": m[0] >= TRACK_GUARD_PAIRS and g - Z99 * se > 0,
         }
     return out
 
@@ -346,6 +358,10 @@ def verdict(
     tracks = _track_metrics(active) if weights is not None else None
     if tracks is not None:
         crown = crown and not any(t["regressed"] for t in tracks.values())
+        # breadth: one overfit track (capped above) must not carry a multi-track duel
+        guarded = sum(t["pairs"] >= TRACK_GUARD_PAIRS for t in tracks.values())
+        gained = sum(t["gained"] for t in tracks.values())
+        crown = crown and gained >= min(GAIN_TRACKS, guarded)
     result = {
         "crown": crown,
         "early_stop": stopped,
@@ -364,7 +380,12 @@ def verdict(
         # levels collide across tracks: the ladder metrics are the decisions track's
         result["levels"] = _level_metrics([p for p in pairs if p.track == "decisions"])
         result["tracks"] = tracks
-        result["track_guard"] = {"pairs": TRACK_GUARD_PAIRS, "min": TRACK_REGRESSION}
+        result["track_guard"] = {
+            "pairs": TRACK_GUARD_PAIRS,
+            "min": TRACK_REGRESSION,
+            "gain_cap": TRACK_GAIN_CAP,
+            "gain_tracks": GAIN_TRACKS,
+        }
     return result
 
 

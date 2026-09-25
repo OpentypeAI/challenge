@@ -52,6 +52,9 @@ def test_unparseable_reads_forfeit():
     assert s.decision_loss(CHOICE, good, {"label_mass": 0.4, "argmax_is_label": True})[0] == 1
     assert s.decision_loss(CHOICE, good, {"label_mass": 0.9, "argmax_is_label": False})[0] == 1
     assert s.decision_loss(NOUL, {"noul": float("inf")}, READ)[0] == 1
+    assert s.decision_loss(NOUL, {"noul": 10**400}, READ)[0] == 1
+    assert s.decision_loss(CHOICE, choice([0, 10**400, 0]), READ)[0] == 1
+    assert s.decision_loss(CHOICE, good, {"label_mass": 10**400, "argmax_is_label": True})[0] == 1
     wrong_legend = {"legend": {"0": "mid", "1": "low", "2": "high"}, "probabilities": {}}
     assert s.decision_loss(SCORE, wrong_legend, READ)[0] == 1
 
@@ -340,3 +343,20 @@ def test_default_plan_balances_the_track_errors():
     shares = [weights[t] * m["se"] for t, m in result["tracks"].items()]
     assert max(shares) < 4 * min(shares), result["tracks"]
     assert result["se"] < 0.02
+
+
+def test_one_perfect_track_alone_is_not_crowned():
+    """Ties everywhere but sql, where the challenger is perfect: capped, no crown."""
+    rng = random.Random(3)
+    plan = {"decisions": 4000, "longctx": 800, "ops": 1000, "sql": 1000, "paint": 600}
+    pairs, offset = [], 0
+    for track, n in plan.items():
+        for i in range(n):
+            a = s.harness_score(float(rng.random() < 0.5))
+            b = s.harness_score(0.0) if track == "sql" else a
+            pairs.append(s.Paired(offset + i, 1, a, b, track))
+        offset += n
+    result = s.verdict(pairs, set(), False, WEIGHTS)
+    assert result["tracks"]["sql"]["g"] > 4.0  # uncapped, this alone gave g_LCB ~ 0.38
+    assert result["g"] <= WEIGHTS["sql"] * s.TRACK_GAIN_CAP + 1e-12
+    assert not result["crown"], result

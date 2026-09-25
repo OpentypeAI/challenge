@@ -107,11 +107,11 @@ def launcher(tmp_path):
 
 
 PLAN = {
-    "decisions": TrackPlan(0.35, 40),
-    "longctx": TrackPlan(0.25, 4),
-    "ops": TrackPlan(0.15, 6),
-    "sql": TrackPlan(0.10, 6),
-    "paint": TrackPlan(0.15, 10),
+    "decisions": TrackPlan(0.35, 160),
+    "longctx": TrackPlan(0.25, 16),
+    "ops": TrackPlan(0.15, 32),
+    "sql": TrackPlan(0.10, 32),
+    "paint": TrackPlan(0.15, 40),
 }
 BEACON = {"round": 4242, "randomness": "ab" * 32}
 

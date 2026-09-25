@@ -410,8 +410,10 @@ def gold(task: Mapping[str, Any]) -> Any:
 def _number(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
-    if isinstance(value, int | float):
-        return float(value) if math.isfinite(value) else None
+    if isinstance(value, int):
+        return float(value) if abs(value) < 2**1023 else None  # wider ints overflow float()
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
     if isinstance(value, str):
         try:
             number = float(value.strip().replace(",", ""))

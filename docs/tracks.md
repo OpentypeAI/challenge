@@ -394,8 +394,11 @@ It never contains the gold, the expected actions or the rubric.
 - A side whose render the judge cannot read (no valid verdict after 5 attempts) forfeits
   with loss 1. Only when **both** renders are unreadable is the pair excluded on both sides
   and counted in the verdict as `unjudged`; a duel that drops more than `UNJUDGED_MAX`
-  (5 %) of its judged cases is not crowned. A gateway outage (or a gateway closed at
-  shutdown) is not a verdict: the side stays pending and a later pass judges it.
+  (5 %) of its judged cases is not crowned. A provider refusal of the request's content
+  (HTTP 400, 413, 415 or 422) counts as an unreadable reply. A gateway outage (transport,
+  408/409/429/5xx, 401/403, or a gateway closed at shutdown) is not a verdict: the side
+  stays pending and a later pass judges it. Without a judge (teacher off at startup) no
+  side is judged: pending sides wait for a restart with the teacher.
 
 ## 7. Worker
 
@@ -433,7 +436,8 @@ It never contains the gold, the expected actions or the rubric.
   built (for example `depict` without a judge) keeps its weight but only builds the levels
   it can. A track with no buildable level, no case or no weight is dropped, and the
   remaining weights are renormalized. The job stores its effective plan, and the job's case
-  count is the plan's total.
+  count is the plan's total. The app refuses to start when the configured plan builds no
+  case on the empty bank without a judge (unknown track, all weights zero).
 - **Case order.** `track_of(index, plan)` is a deterministic interleave, so any prefix
   holds the tracks in proportion. The k-th case of track `t` has key `(k + 0.5) / n_t`.
   Cases are merged by `(key, track order)`.
@@ -453,7 +457,8 @@ It never contains the gold, the expected actions or the rubric.
   0), under_loss=0, under=0)`.
 - **Per-track statistics.** For each track with at least 2 pairs, `g_t, se_t` is v1's
   `log_ratio` on that track's case sums.
-- **Composite.** `g = Σ π_t g_t / Σ π_t` and `se = sqrt(Σ π_t² se_t²) / Σ π_t`, over the
+- **Composite.** `g = Σ π_t min(g_t, ln 2) / Σ π_t` (each track's gain is capped at
+  `TRACK_GAIN_CAP = ln 2` when two or more tracks are present) and `se = sqrt(Σ π_t² se_t²) / Σ π_t`, over the
   tracks present. `g_LCB` is the min over the two halves of the composite LCB99; a
   pair's half is the parity of its rank within its track (by case index), so every track
   splits evenly between the halves.
@@ -463,10 +468,13 @@ It never contains the gold, the expected actions or the rubric.
   - the v1 retired-level guard passes (decisions track only);
   - no track with at least 30 pairs regresses, meaning `g_t + Z99·se_t ≥ −ln 1.02` for
     every such track;
+  - at least `min(2, G)` tracks gain, where `G` counts the tracks with at least 30 pairs
+    and a track gains when it has at least 30 pairs and `g_t − Z99·se_t > 0` (one overfit
+    track cannot carry the crown);
   - the duel was not early-stopped.
 - **Early stop.** v1's rule applied to the composite.
 - The verdict reports `tracks: {t: {g, se, pairs, champion_loss, challenger_loss,
-  accuracy, regressed}}`, `track_guard: {pairs, min}`, `unjudged` (pairs excluded because
+  accuracy, regressed}}`, `track_guard: {pairs, min, gain_cap, gain_tracks}`, a per-track `gained` flag, `unjudged` (pairs excluded because
   neither side could be judged) and `unjudged_max`. Only decisions pairs feed the ladder
   statistics.
 
@@ -477,7 +485,8 @@ It never contains the gold, the expected actions or the rubric.
 - `rotate_window` promotes the next window, whose bank is complete. It never swaps a
   window's bank while that window is open.
 - The window auto-rotates when the next bank is ready and the current window is at least
-  `OPENTYPE_WINDOW_HOURS` old (default 24); the check runs every 30 s. Without a teacher no
+  `OPENTYPE_WINDOW_HOURS` old (default 24); the check runs every 30 s in its own loop,
+  independent of judging. Without a teacher no
   next bank is ever ready, so windows rotate only on `POST /v1/admin/window/rotate`, which
   always works and opens the new window with the next bank or, when none is ready, the
   empty bank.
@@ -495,6 +504,8 @@ It never contains the gold, the expected actions or the rubric.
   timeout. It stores `{round, randomness}` on the job, reuses it on every retry and
   publishes it with the window. When drand is unreachable, it stores `null` and the job
   uses v1's seed.
+- **Evidence.** Retargeting a job (each lease) clears the previous attempt's evidence, so
+  published evidence always comes from the attempt that ran the published seed and plan.
 - **Judging.** Pending judgments (the container's PNG, brief and rubric) are stored in a
   `judgments` table. `complete` moves the job to `judging` while any judgment is pending
   and judges inline for up to 20 s. A background task (every 30 s) judges the rest, scores

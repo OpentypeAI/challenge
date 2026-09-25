@@ -60,6 +60,12 @@ def test_wrong_answers_lose():
             assert score(body, []) == 1.0
 
 
+def test_a_huge_integer_answer_is_wrong_not_a_crash():
+    body = case(1, 0).body
+    assert score(body, ['{"tool":"answer","args":{"value":1' + "0" * 400 + "}}"]) == 1.0
+    assert sqltask._number(10**400) is None and sqltask._number(-(10**400)) is None
+
+
 def test_answer_normalisation():
     spec = {"kind": "count_city", "params": {"city": "Oslo"}}
     assert sqltask.correct(spec, "12", 12) and sqltask.correct(spec, 12.004, 12)

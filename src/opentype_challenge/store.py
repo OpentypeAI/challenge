@@ -524,7 +524,7 @@ class Store:
         beacon = json.loads(job["beacon"]) if job["beacon"] else None
         db.execute(
             "UPDATE jobs SET champion_id=?, window_id=?, seed=?, mix=?, retired=?, plan=?, "
-            "cases=?, judge=? WHERE id=?",
+            "cases=?, judge=?, evidence=NULL WHERE id=?",
             (
                 champion["id"],
                 window["id"],
