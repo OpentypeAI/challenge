@@ -134,3 +134,70 @@ def smoke(moe_backend: str = "cutlass", cases: int = 8, max_model_len: int = 327
         raise
     print(json.dumps(result, indent=2))
     return result
+
+
+# A trusted echo: each stdin line comes back as {n, sha256, size} of what arrived, then the
+# probe lines it was asked for, made of 4-byte characters, with their own sha256.
+PROBE = r"""
+import hashlib, json, sys
+for raw in sys.stdin.buffer:
+    ask = json.loads(raw)
+    got = hashlib.sha256(ask["pad"].encode()).hexdigest()
+    sys.stdout.buffer.write(json.dumps({"n": ask["n"], "echo": got}).encode() + b"\n")
+    for size in ask["sizes"]:
+        pad = "\U0001f600" * (size // 4)
+        line = {"n": ask["n"], "size": size, "sha": hashlib.sha256(pad.encode()).hexdigest(),
+                "pad": pad}
+        sys.stdout.buffer.write(json.dumps(line, ensure_ascii=False).encode() + b"\n")
+    sys.stdout.buffer.flush()
+"""
+
+
+@app.function(image=image, cpu=1, memory=2048, timeout=900)
+def relay_probe(max_mib: int = 7) -> dict:
+    """Frames of 1 KiB .. max_mib MiB of 4-byte characters, both directions, through a CPU
+    sandbox's stdio exactly as the relay reads it (no GPU, no volume, no network, no miner
+    code): does Modal split, merge, truncate or reorder long lines?"""
+    import asyncio
+    import hashlib
+    import time
+
+    from opentype_challenge import sandbox
+
+    if not 1 <= max_mib <= 8:
+        raise SystemExit("--max-mib 1..8")
+    sizes = [1 << 10, 64 << 10, 1 << 20, 4 << 20, max_mib << 20]
+
+    async def go() -> dict:
+        box = await modal.Sandbox.create.aio(
+            "python3", "-c", PROBE, app=app, image=image, cpu=1, memory=2048,
+            block_network=True, secrets=[], include_oidc_identity_token=False, timeout=600,
+        )  # fmt: skip
+        channel = sandbox._ModalChannel(box)
+        rows = []
+        try:
+            frames = sandbox._lines(channel)
+            for n, size in enumerate(sizes):
+                pad = "é" * (size // 2)
+                start = time.monotonic()
+                await channel.send(json.dumps({"n": n, "pad": pad, "sizes": [size]}) + "\n")
+                echo = await asyncio.wait_for(frames.__anext__(), 300)
+                line = await asyncio.wait_for(frames.__anext__(), 300)
+                rows.append(
+                    {
+                        "size": size,
+                        "up_ok": echo == {"n": n, "echo": hashlib.sha256(pad.encode()).hexdigest()},
+                        "down_ok": line.get("n") == n
+                        and hashlib.sha256(line.get("pad", "").encode()).hexdigest() == line["sha"],
+                        "seconds": round(time.monotonic() - start, 2),
+                    }
+                )
+        except Exception as error:  # noqa: BLE001 - the first size that breaks is the answer
+            rows.append({"error": repr(error)[:500]})
+        finally:
+            await channel.close()
+        return {"rows": rows, "ok": all(r.get("up_ok") and r.get("down_ok") for r in rows)}
+
+    result = asyncio.run(go())
+    print(json.dumps(result, indent=2))
+    return result
