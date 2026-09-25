@@ -596,8 +596,10 @@ class Worker:
             async with launch("C", "challenger") as urls:
                 candidate = await self._read(job, urls, ("challenger",))
         except ServeFailed as error:
-            # stock served healthily alone on this GPU just before
+            # stock served healthily alone just before, on the same pinned build
             raise _candidate_fault(error, "challenger") from None
+        except JobFailed as error:
+            raise self._content_fault(error, "challenger") from None
         counts["errors"] += candidate["errors"]
         blocks = []
         for number in range(cal.blocks):
@@ -610,6 +612,10 @@ class Worker:
                 except ServeFailed as error:
                     # C's server runs as "champion"; B served healthily just before it
                     raise _candidate_fault(error, "champion" if side == "C" else None) from None
+                except JobFailed as error:
+                    if side != "C":
+                        raise
+                    raise self._content_fault(error, "champion") from None
                 await self._post_timings(job, number, side, tasks)
                 quiescent.append(self.launcher.quiescent())
                 if not quiescent[-1]:
@@ -621,6 +627,15 @@ class Worker:
                 break  # reported as is: the verdict is NO_DECISION
         evidence["placements"] = placements
         return {**counts, "runtime": {"profile": cal.profile, "blocks": blocks}}
+
+    def _content_fault(self, error: JobFailed, served: str) -> JobFailed:
+        """A candidate run failing mid-run is the candidate's only on a content fault of its
+        own server (a 5xx or a broken answer); a crash, a hang or a lost channel may be the
+        fresh placement's, and retries (bounded by MAX_ATTEMPTS)."""
+        fault = getattr(self.launcher, "content_fault", lambda _: None)(served)
+        if not error.retry or fault is None:
+            return error
+        return JobFailed(f"the candidate's server gave a broken answer: {fault}"[:500], False)
 
     @asynccontextmanager
     async def _launch(

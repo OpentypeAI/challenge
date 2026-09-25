@@ -66,8 +66,8 @@ from .worker import (
     sha256_file,
 )
 
-VLLM_UID = 65534
-READER_UID = 65533
+VLLM_UID = 10001  # dedicated: 65534 is nobody, the overflow uid of user namespaces
+READER_UID = 10002
 MODEL_MOUNT = "/model"
 KERNEL_DIR = Path("/opt/opentype-kernel")
 LOG_DIR = Path("/var/log/opentype")
@@ -75,7 +75,8 @@ MAX_FRAME = 8 * 1024 * 1024  # one relay line, either direction
 MAX_BODY = 6 * 1024 * 1024  # one relayed response body
 RELAY_WORKERS = runtime.MAX_CONCURRENCY
 BUILD_SECONDS = 300
-BUILD_MEMORY = 8 << 30
+BUILD_MEMORY = 6 << 30  # RLIMIT_AS of the compile; the build sandbox gets 12 GiB
+BUILD_FILE_BYTES = 256 << 20  # the compile writes a log and a Triton cache, nothing large
 CHILD_FILE_BYTES = 8 << 30  # logs, Triton and torch caches of one run
 PLUGIN = "opentype_kernel"  # the vllm.general_plugins entry point (kernel_slot.register)
 
@@ -84,18 +85,28 @@ PLUGIN = "opentype_kernel"  # the vllm.general_plugins entry point (kernel_slot.
 # Inside the sandbox (root).
 
 
-def _limits(cpu_seconds: int | None, memory: int | None) -> Callable[[], None]:
+def _cap(kind: int, want: int) -> None:
+    """Lower a limit to `want`, never above the inherited hard limit (raising it fails once
+    the child dropped root: CPython runs preexec_fn after setuid)."""
+    hard = resource.getrlimit(kind)[1]
+    value = want if hard == resource.RLIM_INFINITY else min(want, hard)
+    resource.setrlimit(kind, (value, value))
+
+
+def _limits(
+    cpu_seconds: int | None, memory: int | None, file_bytes: int = CHILD_FILE_BYTES
+) -> Callable[[], None]:
     """preexec: rlimits and no_new_privs for a demoted child (runs after fork, before exec)."""
 
     def apply() -> None:
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        resource.setrlimit(resource.RLIMIT_FSIZE, (CHILD_FILE_BYTES, CHILD_FILE_BYTES))
-        resource.setrlimit(resource.RLIMIT_NOFILE, (65536, 65536))
-        resource.setrlimit(resource.RLIMIT_NPROC, (8192, 8192))
+        _cap(resource.RLIMIT_CORE, 0)
+        _cap(resource.RLIMIT_FSIZE, file_bytes)
+        _cap(resource.RLIMIT_NOFILE, 65536)
+        _cap(resource.RLIMIT_NPROC, 8192)
         if cpu_seconds is not None:
-            resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
+            _cap(resource.RLIMIT_CPU, cpu_seconds)
         if memory is not None:
-            resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
+            _cap(resource.RLIMIT_AS, memory)
         import ctypes
 
         pr_set_no_new_privs = 38
@@ -120,6 +131,7 @@ def _spawn(
     log_dir: Path,
     cpu_seconds: int | None = None,
     memory: int | None = None,
+    file_bytes: int = CHILD_FILE_BYTES,
 ) -> subprocess.Popen[bytes]:
     """A child as `uid` (None: unchanged, tests only) with a private home, its output in a
     root-owned log file and nothing inherited but that file."""
@@ -153,7 +165,7 @@ def _spawn(
             cwd=home,
             close_fds=True,
             start_new_session=True,
-            preexec_fn=_limits(cpu_seconds, memory),  # noqa: PLW1509 - single-threaded here
+            preexec_fn=_limits(cpu_seconds, memory, file_bytes),  # noqa: PLW1509 - single-threaded here
             **demote,
         )
     finally:
@@ -224,6 +236,10 @@ def write_kernel(kernel: Mapping[str, Any], directory: Path) -> Path:
     return path
 
 
+def _frame(frame: Mapping[str, Any]) -> bytes:
+    return json.dumps(frame, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
+
+
 class _Out:
     """The one writer of the relay stdout."""
 
@@ -231,7 +247,7 @@ class _Out:
         self.stream, self.lock = stream, threading.Lock()
 
     def __call__(self, frame: Mapping[str, Any]) -> None:
-        line = json.dumps(frame, separators=(",", ":")).encode() + b"\n"
+        line = _frame(frame)
         with self.lock:
             self.stream.write(line)
             self.stream.flush()
@@ -264,15 +280,28 @@ def _forward(base: str, request: Mapping[str, Any], timeout: float) -> dict[str,
             status, raw = response.status, response.read(MAX_BODY + 1)
     except urllib.error.HTTPError as error:
         status, raw = error.code, error.read(MAX_BODY + 1)
-    except (OSError, urllib.error.URLError) as error:
+    except (OSError, urllib.error.URLError) as error:  # refused, reset, timed out: a crash or
+        # a hang, which a fresh placement's hardware can cause as well as the served code
         return {"id": request["id"], "status": 599, "body": {"error": repr(error)[:300]}}
     if len(raw) > MAX_BODY:
-        return {"id": request["id"], "status": 599, "body": {"error": "response too large"}}
+        return _upstream(request, "response too large")
     try:
         body = json.loads(raw)
-    except ValueError:
-        return {"id": request["id"], "status": 599, "body": {"error": "not json"}}
-    return {"id": request["id"], "status": status, "body": body}
+    except (ValueError, RecursionError):
+        return _upstream(request, "not json")
+    reply = {"id": request["id"], "status": status, "body": body}
+    try:
+        if len(_frame(reply)) > MAX_FRAME:
+            return _upstream(request, "response too large")
+    except (ValueError, RecursionError):
+        return _upstream(request, "not json")
+    return reply
+
+
+def _upstream(request: Mapping[str, Any], error: str) -> dict[str, Any]:
+    """The served process answered, with something the relay refuses (not JSON, too large):
+    a content fault of what it serves, which no hardware produces."""
+    return {"id": request["id"], "status": 599, "origin": "upstream", "body": {"error": error}}
 
 
 def serve(
@@ -322,15 +351,22 @@ def serve(
     try:
         # The pinned reader binds its port before any miner code runs, so the vllm process
         # (which loads the kernel) can never listen in its place.
-        processes.append(_spawn(reader_cmd, READER_UID if demote else None, "reader", {}, log_dir))
-        problem = _wait_health(f"http://127.0.0.1:{reader_port}/health", processes, health_timeout)
-        if not problem:
+        try:
             processes.append(
-                _spawn(serve_cmd, VLLM_UID if demote else None, "vllm", kernel_env, log_dir)
+                _spawn(reader_cmd, READER_UID if demote else None, "reader", {}, log_dir)
             )
             problem = _wait_health(
-                f"http://127.0.0.1:{vllm_port}/health", processes, health_timeout
+                f"http://127.0.0.1:{reader_port}/health", processes, health_timeout
             )
+            if not problem:
+                processes.append(
+                    _spawn(serve_cmd, VLLM_UID if demote else None, "vllm", kernel_env, log_dir)
+                )
+                problem = _wait_health(
+                    f"http://127.0.0.1:{vllm_port}/health", processes, health_timeout
+                )
+        except (OSError, subprocess.SubprocessError) as error:
+            problem = f"spawn: {error!r}"[:300]
         if problem:
             out({"failed": problem, "logs": _tails(log_dir)})
             return 1
@@ -339,19 +375,24 @@ def serve(
             "chat": f"http://127.0.0.1:{vllm_port}",
             "reader": f"http://127.0.0.1:{reader_port}",
         }
+        names = ("reader", "vllm")
         with ThreadPoolExecutor(RELAY_WORKERS) as pool:
             while True:
                 line = stdin.readline(MAX_FRAME + 1)
                 if not line:
                     break  # the controller closed the channel
+                gone = [n for n, p in zip(names, processes, strict=True) if p.poll() is not None]
+                if gone:  # nothing is relayed once a served process is gone
+                    out({"exited": gone[0], "logs": _tails(log_dir)})
+                    break
                 try:
                     request = json.loads(line)
                     base = bases[request["to"]]
                     timeout = float(request.get("timeout", 300))
-                except (ValueError, KeyError, TypeError):
+                except (ValueError, KeyError, TypeError, RecursionError):
                     out({"failed": "malformed request"})
                     break
-                pool.submit(_relay, out, base, request, timeout)
+                pool.submit(_relay, out, base, request, timeout, processes[0])
     finally:
         _stop(processes)
     return 0
@@ -360,19 +401,39 @@ def serve(
 LOG_TAIL = 4000  # bytes of each child's log in a failure frame (operator diagnosis only)
 
 
+def _tail(path: Path, size: int) -> str:
+    """The last `size` bytes of a child's log, never the whole file (a child may fill it)."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - size))
+            return handle.read(size).decode(errors="replace")
+    except OSError:
+        return ""
+
+
 def _tails(log_dir: Path) -> dict[str, str]:
-    tails = {}
-    for name in ("reader", "vllm"):
-        with contextlib.suppress(OSError):
-            with (log_dir / f"{name}.log").open("rb") as handle:
-                handle.seek(0, os.SEEK_END)
-                handle.seek(max(0, handle.tell() - LOG_TAIL))
-                tails[name] = handle.read().decode(errors="replace")
-    return tails
+    return {name: _tail(log_dir / f"{name}.log", LOG_TAIL) for name in ("reader", "vllm")}
 
 
-def _relay(out: _Out, base: str, request: Mapping[str, Any], timeout: float) -> None:
-    out(_forward(base, request, timeout))
+def _relay(
+    out: _Out,
+    base: str,
+    request: Mapping[str, Any],
+    timeout: float,
+    reader: subprocess.Popen[bytes],
+) -> None:
+    """One request, always answered. A reader reply counts only if the pinned reader is alive
+    once it is received: a live reader still holds its port (bound before any miner code ran,
+    and a process of another uid cannot share it), so the reply came from it. A dead reader
+    ends the relay: its port could be taken by the served process."""
+    try:
+        reply = _forward(base, request, timeout)
+    except Exception as error:  # noqa: BLE001 - every request gets an answer
+        reply = _upstream(request, f"relay: {error!r}"[:300])
+    if request.get("to") == "reader" and reader.poll() is not None:
+        reply = {"id": request["id"], "status": 599, "body": {"error": "the reader exited"}}
+    out(reply)
 
 
 def path_sha(path: Path) -> str:
@@ -394,22 +455,27 @@ def build(stdin: Any, stdout: Any, *, demote: bool = True, kernel_dir: Path = KE
         return 2
     command = [sys.executable, "-m", "opentype_challenge.kernel_slot", str(path), path_sha(path)]
     logs = kernel_dir / "logs"
-    child = _spawn(
-        [*command, str(arch)],
-        VLLM_UID if demote else None,
-        "build",
-        {},
-        logs,
-        cpu_seconds=BUILD_SECONDS,
-        memory=BUILD_MEMORY,
-    )
+    try:
+        child = _spawn(
+            [*command, str(arch)],
+            VLLM_UID if demote else None,
+            "build",
+            {},
+            logs,
+            cpu_seconds=BUILD_SECONDS,
+            memory=BUILD_MEMORY,
+            file_bytes=BUILD_FILE_BYTES,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        out({"failed": f"spawn: {error!r}"[:300]})
+        return 2
     try:
         code = child.wait(timeout=BUILD_SECONDS + 30)
     except subprocess.TimeoutExpired:
         _stop([child])
         out({"build_failed": "the compile timed out"})
         return 1
-    tail = (logs / "build.log").read_bytes()[-2000:].decode(errors="replace")
+    tail = _tail(logs / "build.log", 2000)
     if code != 0:
         out({"build_failed": tail})
         return 1
@@ -510,9 +576,14 @@ class RelayTransport(httpx.AsyncBaseTransport):
             raise httpx.ReadTimeout("the sandbox did not answer", request=request) from None
         finally:
             live.pending.pop(number, None)
-        if reply.get("status") == 599:
+        status = int(reply["status"])
+        if reply.get("origin") == "upstream" or 500 <= status < 599:
+            # the served process answered and the answer is broken: a content fault
+            self.launcher.faults.append({"side": side, "status": status, "body": reply.get("body")})
+            return httpx.Response(502 if status == 599 else status, json=reply.get("body"))
+        if status == 599:  # no answer: a crash, a hang or a lost channel
             raise httpx.ConnectError(str(reply.get("body")), request=request)
-        return httpx.Response(int(reply["status"]), json=reply.get("body"), request=request)
+        return httpx.Response(status, json=reply.get("body"), request=request)
 
 
 @dataclass
@@ -527,6 +598,7 @@ class SandboxLauncher:
     live: dict[str, _Live] = field(default_factory=dict)
     placements: list[dict[str, Any]] = field(default_factory=list)
     failures: list[dict[str, Any]] = field(default_factory=list)  # never sent to the API
+    faults: list[dict[str, Any]] = field(default_factory=list)  # content faults, this launch
     _profile: dict[str, Any] | None = None
     _open: int = 0
 
@@ -549,6 +621,12 @@ class SandboxLauncher:
         if self._profile is None:
             raise JobFailed("no sandbox has reported its identity yet", retry=True)
         return dict(self._profile)
+
+    def content_fault(self, side: str) -> dict[str, Any] | None:
+        """The first broken answer (5xx, not JSON, too large) a server of `side` gave since
+        its launch: evidence against what it serves, unlike a crash, a hang or a lost channel,
+        which a fresh placement's host can cause too."""
+        return next((f for f in self.faults if f["side"] == side), None)
 
     def quiescent(self) -> bool:
         """Every sandbox this launcher started is gone (a fresh one serves each run)."""
@@ -604,6 +682,7 @@ class SandboxLauncher:
         kernel: Mapping[str, Any] | None,
     ) -> _Live:
         weights = weights_identity(model)  # the controller's own copy: verified, never mounted rw
+        self.faults = [f for f in self.faults if f["side"] != side]
         channel = await self.backend.start("serve", model)
         self._open += 1
         live = _Live(side, channel, _lines(channel))
@@ -686,6 +765,10 @@ class SandboxLauncher:
             async for frame in live.frames:
                 number = frame.get("id")
                 future = live.pending.get(number) if isinstance(number, int) else None
+                if "exited" in frame:
+                    self.failures.append({"side": live.side, **frame})
+                    live.dead = f"the {frame['exited']} process exited"
+                    break
                 if future is None or "status" not in frame:
                     live.dead = "an unexpected frame"
                     break
@@ -813,7 +896,7 @@ class ModalBackend:
             image=self.image,
             gpu=self.gpu if mode == "serve" else None,
             cpu=self.cpu if mode == "serve" else (2.0, 4.0),
-            memory=self.memory if mode == "serve" else (8192, BUILD_MEMORY >> 20),
+            memory=self.memory if mode == "serve" else (8192, 12288),
             block_network=True,
             secrets=[],
             include_oidc_identity_token=False,

@@ -1217,6 +1217,36 @@ def test_startup_failures_blame_the_candidate_only_after_a_healthy_reference(
     assert error.value.retry is retry
 
 
+@pytest.mark.parametrize(
+    "fault,retry",
+    [
+        ({"side": "challenger", "status": 500, "body": {}}, False),  # it answered, broken
+        (None, True),  # no answer: a crash, a hang or a lost channel may be the placement's
+    ],
+)
+def test_a_candidate_failing_mid_run_is_its_fault_only_on_a_broken_answer(
+    monkeypatch, fault, retry
+):
+    class MidRun(FakeLauncher):
+        def content_fault(self, side):
+            return fault if fault and fault["side"] == side else None
+
+    async def read(self, job, urls, sides=worker.SIDES):
+        if sides == ("challenger",):
+            raise worker.JobFailed("challenger http://c.test returned 502", retry=True)
+        return {"cases_fetched": 4, "cases_sha256": "x", "errors": 0}
+
+    monkeypatch.setattr(worker.Worker, "_read", read)
+    monkeypatch.setattr(worker, "base_snapshot", lambda directory, fetch: directory)
+    monkeypatch.setattr(worker.Worker, "_champion", lambda self, m, b: (b, {}))
+    instance = worker.Worker(None, None, MidRun(), lane="runtime")  # type: ignore[arg-type]
+    instance.workdir = worker.Path("/nonexistent")
+    spec = {"calibration": calibration_json(), "incumbent": {}, "candidate": {}, "seed": "s"}
+    with pytest.raises(worker.JobFailed) as error:
+        asyncio.run(instance._bench({"champion": {}, "runtime": spec}, None, {}))  # type: ignore[arg-type]
+    assert error.value.retry is retry
+
+
 def test_timings_route_takes_raw_outputs_not_verdicts(client, miner, clock):
     state = open_lane(client)
     client.post("/v1/runtime/submissions", json=runtime_body(state, miner, clock))

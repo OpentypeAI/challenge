@@ -12,6 +12,7 @@ import socket
 import struct
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -50,16 +51,30 @@ def _port_base() -> int:
             return port
 
 
-def _backend(tmp_path: Path) -> sandbox.ProcessBackend:
+HOSTILE = Path(__file__).with_name("hostile_vllm.py")
+
+
+def _backend(tmp_path: Path, hostile: bool = False) -> sandbox.ProcessBackend:
+    """The serve bootstrap as a local process: the fake reader (which records its pid) and
+    the fake vllm, or the hostile one."""
+    base = _port_base()
+    pid_file = tmp_path / "reader.pid"
     reader = tmp_path / "structured_server.py"
-    reader.write_text(FAKE.read_text())
+    future = "from __future__ import annotations\n"
+    record = f"import os\nopen({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+    reader.write_text(FAKE.read_text().replace(future, future + record, 1))
+    vllm = (
+        (sys.executable, str(HOSTILE), str(pid_file), str(base + 10))
+        if hostile
+        else (sys.executable, str(FAKE))
+    )
     code = (
         "import sys; from pathlib import Path; from opentype_challenge import sandbox; "
         "sys.exit(sandbox.serve(sys.stdin.buffer, sys.stdout.buffer, "
-        f"vllm=({sys.executable!r}, {str(FAKE)!r}), reader=Path({str(reader)!r}), "
+        f"vllm={vllm!r}, reader=Path({str(reader)!r}), "
         f"demote=False, kernel_dir=Path({str(tmp_path / 'k')!r}), "
         f"log_dir=Path({str(tmp_path / 'logs')!r}), health_timeout=30, "
-        f"port_base={_port_base()}))"
+        f"port_base={base}))"
     )
     return sandbox.ProcessBackend([sys.executable, "-c", code])
 
@@ -316,3 +331,160 @@ def test_stage_nvfp4_verifies_every_file_and_the_layout(tmp_path, monkeypatch):
     (src / shard).write_bytes(b"\0" * 16)  # a tampered shard never verifies
     with pytest.raises(JobFailed, match="sha256"):
         sandbox.stage_nvfp4(tmp_path / "snap2" / "m", fetch)
+
+
+# -- regressions of the sandbox boundary review (each one a confirmed defect) -----------------
+
+
+def _hostile(tmp_path: Path, paths: list[str], reader_after: bool = False) -> tuple[list, Any]:
+    """POST each path to the hostile chat server through the relay; (status or error, launcher).
+    reader_after: then one reader request."""
+    launcher = sandbox.SandboxLauncher(_backend(tmp_path, hostile=True), canvas=64)
+    launcher.ready_timeout = 60
+    results: list[Any] = []
+
+    async def go() -> None:
+        async with launcher({"champion": _model(tmp_path)}, {"champion": []}, 0.9) as urls:
+            async with launcher.client() as client:
+                for path in paths:
+                    try:
+                        reply = await client.post(
+                            urls["champion"]["chat"] + path, json={}, timeout=20
+                        )
+                        results.append(reply.status_code)
+                    except Exception as error:  # noqa: BLE001 - recorded
+                        results.append(type(error).__name__)
+                if reader_after:
+                    try:
+                        reply = await client.post(
+                            urls["champion"]["reader"] + "/v1/systemone", json={}, timeout=20
+                        )
+                        results.append(reply.json())
+                    except Exception as error:  # noqa: BLE001 - recorded
+                        results.append(type(error).__name__)
+
+    asyncio.run(go())
+    return results, launcher
+
+
+def test_non_ascii_replies_never_overflow_the_frame_cap(tmp_path):
+    """A 6 MB body of 4-byte characters escaped to ASCII was an 18 MB frame: the relay died
+    and every pending request failed as infrastructure. It is one refused reply now."""
+    (emoji, after), launcher = _hostile(tmp_path, ["/emoji", "/error"])
+    assert emoji == 200 or emoji == 502  # encoded raw it fits the frame, or it is refused
+    assert after == 500  # the relay survived
+    raw = sandbox._frame({"id": 1, "status": 200, "body": {"x": "\U0001f600" * 1_400_000}})
+    assert len(raw) < sandbox.MAX_FRAME
+
+
+def test_a_deeply_nested_reply_is_answered_at_once(tmp_path):
+    """json.loads raised RecursionError in a relay thread, which died without replying: the
+    controller waited out the whole read timeout."""
+    import time
+
+    start = time.monotonic()
+    (deep, after), launcher = _hostile(tmp_path, ["/deep", "/error"])
+    assert deep == 502 and after == 500
+    assert time.monotonic() - start < 15
+    assert launcher.content_fault("champion") is not None
+
+
+def test_a_hung_server_is_not_a_content_fault(tmp_path):
+    """No answer may be the placement's (a crash, a hang): it stays a transport error."""
+    launcher = sandbox.SandboxLauncher(_backend(tmp_path, hostile=True), canvas=64)
+
+    async def go() -> str:
+        async with launcher({"champion": _model(tmp_path)}, {"champion": []}, 0.9) as urls:
+            async with launcher.client() as client:
+                try:
+                    await client.post(urls["champion"]["chat"] + "/hang", json={}, timeout=2)
+                except Exception as error:  # noqa: BLE001 - recorded
+                    return type(error).__name__
+        return "answered"
+
+    assert asyncio.run(go()) in ("ReadTimeout", "ConnectError")  # a transport error
+    assert launcher.content_fault("champion") is None
+
+
+def test_a_dead_reader_ends_the_relay_before_a_spoofed_port_answers(tmp_path):
+    """The served process kills the pinned reader and listens on its port: no reader reply
+    is relayed once the reader exited (checked before and after every request)."""
+    (spoof, reader), launcher = _hostile(tmp_path, ["/spoof"], reader_after=True)
+    assert spoof == 200
+    assert reader == "ConnectError"  # never the forged {"answers": {"forged": true}}
+    assert launcher.failures and launcher.failures[-1].get("exited") == "reader"
+
+
+def test_a_reader_dying_during_a_request_voids_its_reply(tmp_path):
+    """The race: the reader is alive when the request is relayed and dies before the reply
+    is read back; the reply is dropped, not trusted."""
+
+    class Dead:
+        def poll(self) -> int:
+            return -9
+
+    replies: list[dict] = []
+    relay: Any = sandbox._relay  # duck-typed writer and process
+    relay(
+        replies.append,
+        "http://127.0.0.1:1",
+        {"id": 3, "to": "reader", "path": "/", "body": {}},
+        1,
+        Dead(),
+    )
+    assert replies == [{"id": 3, "status": 599, "body": {"error": "the reader exited"}}]
+
+
+def test_limits_never_raise_an_inherited_hard_limit():
+    """preexec_fn runs after setuid: raising a hard limit there failed the spawn."""
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    code = (
+        "import resource, subprocess, sys; "
+        "from opentype_challenge import sandbox; "
+        "resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256)); "
+        "p = subprocess.run([sys.executable, '-c', 'import resource; "
+        "print(resource.getrlimit(resource.RLIMIT_NOFILE)[1])'], "
+        "preexec_fn=sandbox._limits(None, None), capture_output=True, text=True); "
+        "print(p.stdout.strip())"
+    )
+    import subprocess
+
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "256"
+    assert resource.getrlimit(resource.RLIMIT_NOFILE) == (soft, hard)
+
+
+def test_a_huge_build_log_is_read_by_its_tail(tmp_path):
+    """build() read the whole log a child may fill (8 GiB) into root's memory."""
+    log = tmp_path / "build.log"
+    with log.open("wb") as handle:
+        handle.seek(50 << 20)
+        handle.write(b"the end")
+    assert sandbox._tail(log, 2000).endswith("the end")
+    assert len(sandbox._tail(log, 2000)) <= 2000
+    assert sandbox._tail(tmp_path / "missing.log", 10) == ""
+
+
+def test_a_build_child_is_capped_and_its_failure_is_the_kernels(tmp_path, monkeypatch):
+    """The compile child writes past its file cap: the bootstrap answers build_failed."""
+    import io
+
+    monkeypatch.setattr(sandbox, "BUILD_FILE_BYTES", 1 << 20)
+    kernel = runtime.normalize_kernel({"slot": "rms_norm", "source": KERNEL})
+    assert kernel is not None
+    real = sandbox._spawn
+
+    def spawn(command, *args, **kwargs):  # the child spams its log instead of compiling
+        spam = "import sys\nwhile True: sys.stdout.write('x' * 65536)"
+        return real([sys.executable, "-c", spam], *args, **kwargs)
+
+    monkeypatch.setattr(sandbox, "_spawn", spawn)
+    stdin = io.BytesIO(json.dumps({"kernel": kernel, "arch": 103}).encode() + b"\n")
+    stdout = io.BytesIO()
+    assert sandbox.build(stdin, stdout, demote=False, kernel_dir=tmp_path / "k") == 1
+    frame = json.loads(stdout.getvalue())
+    assert "build_failed" in frame and len(frame["build_failed"]) <= 2000
+    assert (tmp_path / "k" / "logs" / "build.log").stat().st_size <= 1 << 20
