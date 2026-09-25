@@ -3,7 +3,8 @@
     modal secret create opentype-worker OPENTYPE_WORKER_TOKEN=<worker.token>
     modal deploy deploy/modal_worker.py
 
-Pins the v2.1.0 + worker fix (63fa0db) build by digest: Modal caches registry tags rather than refreshing `stable`.
+Pins the v2.1.0 server contract plus the worker sampling fix (63fa0db) by digest:
+Modal caches registry tags rather than refreshing `stable`.
 
 A cron wakes the worker every 10 minutes. It runs duels until the queue is empty and
 exits. Startup and empty-queue checks also incur GPU billing. The work volume keeps the champion's
