@@ -407,8 +407,10 @@ It never contains the gold, the expected actions or the rubric.
 - The launcher yields `{side: {"reader": <structured server URL>, "chat": <vllm URL>}}`.
 - Read tracks post the body to `reader + /v1/systemone`, as in v1. Harness tracks run
   `harness.run_episode` with `generate` posting to `chat + /v1/chat/completions`. The body
-  is `{"model": side, "messages", "max_tokens": limits.max_tokens, "temperature": 0.0,
-  "seed": seed}`, and the reply is `choices[0].message.content`.
+  is `{"model": side, "messages", "max_tokens": limits.max_tokens}`, and the reply is
+  `choices[0].message.content`. The pinned diffusion engine rejects temperature overrides
+  and per-request seeds. Case generation and transcript replay remain reproducible;
+  model-generated transcripts are not guaranteed deterministic.
 - **Answer items.** A read item is `{case_index, side, answers, reads}`, a harness item is
   `{case_index, side, transcript: [str]}`, and a failed item is `{case_index, side,
   error}`.

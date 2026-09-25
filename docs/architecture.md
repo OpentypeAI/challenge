@@ -50,7 +50,9 @@
    under 6 MiB) and runs each case on both sides:
    - read tracks post the body to `reader/v1/systemone`;
    - harness tracks run `harness.run_episode` against `chat/v1/chat/completions`
-     (temperature 0, `seed = body.seed + turn`) and keep the raw outputs.
+     without temperature overrides or per-request seeds (unsupported by the pinned
+     diffusion engine) and keep the raw outputs. Case generation and replay are
+     reproducible; model-generated transcripts are not guaranteed deterministic.
 
    Items are posted in batches under 900 KiB.
 5. **Scoring as answers arrive.** For every item, the container rebuilds the case from the
