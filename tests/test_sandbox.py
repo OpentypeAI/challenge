@@ -54,15 +54,19 @@ def _port_base() -> int:
 HOSTILE = Path(__file__).with_name("hostile_vllm.py")
 
 
-def _backend(tmp_path: Path, hostile: bool = False) -> sandbox.ProcessBackend:
-    """The serve bootstrap as a local process: the fake reader (which records its pid) and
-    the fake vllm, or the hostile one."""
+PROXY = Path(__file__).with_name("proxy_reader.py")
+
+
+def _backend(tmp_path: Path, hostile: bool = False, proxy: bool = False) -> sandbox.ProcessBackend:
+    """The serve bootstrap as a local process: the fake reader (which records its pid), or a
+    reader proxying to its upstream as the pinned one does; the fake vllm or the hostile one."""
     base = _port_base()
     pid_file = tmp_path / "reader.pid"
     reader = tmp_path / "structured_server.py"
     future = "from __future__ import annotations\n"
     record = f"import os\nopen({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
-    reader.write_text(FAKE.read_text().replace(future, future + record, 1))
+    source = (PROXY if proxy else FAKE).read_text()
+    reader.write_text(source.replace(future, future + record, 1))
     vllm = (
         (sys.executable, str(HOSTILE), str(pid_file), str(base + 10))
         if hostile
@@ -379,12 +383,13 @@ def test_non_ascii_replies_never_overflow_the_frame_cap(tmp_path):
 
 def test_a_deeply_nested_reply_is_answered_at_once(tmp_path):
     """json.loads raised RecursionError in a relay thread, which died without replying: the
-    controller waited out the whole read timeout."""
+    controller waited out the whole read timeout. A reply that is not JSON, all processes
+    alive, is a content fault of the served process."""
     import time
 
     start = time.monotonic()
     (deep, after), launcher = _hostile(tmp_path, ["/deep", "/error"])
-    assert deep == 502 and after == 500
+    assert deep == 502 and after == 500  # the 500 is relayed, ambiguous
     assert time.monotonic() - start < 15
     assert launcher.content_fault("champion") is not None
 
@@ -410,7 +415,7 @@ def test_a_dead_reader_ends_the_relay_before_a_spoofed_port_answers(tmp_path):
     """The served process kills the pinned reader and listens on its port: no reader reply
     is relayed once the reader exited (checked before and after every request)."""
     (spoof, reader), launcher = _hostile(tmp_path, ["/spoof"], reader_after=True)
-    assert spoof == 200
+    assert spoof == "ConnectError"  # the reader died while it ran: voided too
     assert reader == "ConnectError"  # never the forged {"answers": {"forged": true}}
     assert launcher.failures and launcher.failures[-1].get("exited") == "reader"
 
@@ -423,16 +428,58 @@ def test_a_reader_dying_during_a_request_voids_its_reply(tmp_path):
         def poll(self) -> int:
             return -9
 
+        def wait(self, timeout: float) -> int:
+            return -9
+
     replies: list[dict] = []
-    relay: Any = sandbox._relay  # duck-typed writer and process
+    relay: Any = sandbox._relay  # duck-typed writer and processes
     relay(
         replies.append,
         "http://127.0.0.1:1",
         {"id": 3, "to": "reader", "path": "/", "body": {}},
         1,
-        Dead(),
+        (Dead(), Dead()),
     )
-    assert replies == [{"id": 3, "status": 599, "body": {"error": "the reader exited"}}]
+    assert replies == [{"id": 3, "status": 599, "body": {"error": "a served process exited"}}]
+
+
+def test_a_dead_engine_masked_by_the_reader_is_never_the_candidates(tmp_path):
+    """The pinned reader answers 500/502 when its vllm fails or is gone. A GPU fault killing
+    vllm mid-read must retry, never reject: the reply becomes a transport failure and no
+    content fault is recorded."""
+    launcher = sandbox.SandboxLauncher(_backend(tmp_path, hostile=True, proxy=True), canvas=64)
+
+    async def go() -> list[Any]:
+        seen: list[Any] = []
+        async with launcher({"challenger": _model(tmp_path)}, {"challenger": []}, 0.9) as urls:
+            async with launcher.client() as client:
+                for path in ("/error", "/die", "/error"):
+                    try:
+                        reply = await client.post(
+                            urls["challenger"]["reader"] + path, json={}, timeout=20
+                        )
+                        seen.append(reply.status_code)
+                    except Exception as error:  # noqa: BLE001 - recorded
+                        seen.append(type(error).__name__)
+        return seen
+
+    # a live engine's 500 is masked as 502: ambiguous, never a content fault; then the engine
+    # dies: the reader's masked 500 is voided; then nothing is relayed any more
+    assert asyncio.run(go()) == [502, "ConnectError", "ConnectError"]
+    assert launcher.content_fault("challenger") is None
+
+
+def test_a_live_5xx_is_not_the_candidates_either(monkeypatch):
+    """Worker side: a 5xx with every process alive stays ambiguous and retries."""
+    from opentype_challenge import worker
+
+    class Launcher:
+        def content_fault(self, side: str) -> None:
+            return None
+
+    instance = worker.Worker(None, None, Launcher())  # type: ignore[arg-type]
+    error = worker.JobFailed("challenger http://x returned 500", retry=True)
+    assert instance._content_fault(error, "challenger").retry is True
 
 
 def test_limits_never_raise_an_inherited_hard_limit():
@@ -488,3 +535,37 @@ def test_a_build_child_is_capped_and_its_failure_is_the_kernels(tmp_path, monkey
     frame = json.loads(stdout.getvalue())
     assert "build_failed" in frame and len(frame["build_failed"]) <= 2000
     assert (tmp_path / "k" / "logs" / "build.log").stat().st_size <= 1 << 20
+
+
+def test_stdin_lines_are_sent_in_drained_chunks_under_the_sdk_buffer():
+    """Modal's sandbox stdin refuses a write past 2 MiB between drains (BufferError, found by
+    the relay probe at 1 MiB of escaped input): a line goes in drained chunks under that."""
+
+    class Stdin:
+        limit = 2 << 20
+
+        def __init__(self) -> None:
+            self.buffer, self.sent = b"", b""
+
+        def write(self, data: bytes) -> None:
+            if len(self.buffer) + len(data) > self.limit:
+                raise BufferError("Buffer size exceed limit. Call drain to flush the buffer.")
+            self.buffer += data
+
+        class _Drain:
+            def __init__(self, outer: Any) -> None:
+                self.outer = outer
+
+            async def aio(self) -> None:
+                self.outer.sent += self.outer.buffer
+                self.outer.buffer = b""
+
+        @property
+        def drain(self) -> Any:
+            return Stdin._Drain(self)
+
+    stdin = Stdin()
+    line = json.dumps({"pad": "\U0001f600" * 1_500_000}, ensure_ascii=False) + "\n"
+    assert len(line.encode()) > 2 * Stdin.limit
+    asyncio.run(sandbox._send_chunked(stdin, line))
+    assert stdin.sent.decode() == line and stdin.buffer == b""

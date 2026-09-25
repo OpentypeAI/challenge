@@ -630,8 +630,9 @@ class Worker:
 
     def _content_fault(self, error: JobFailed, served: str) -> JobFailed:
         """A candidate run failing mid-run is the candidate's only on a content fault of its
-        own server (a 5xx or a broken answer); a crash, a hang or a lost channel may be the
-        fresh placement's, and retries (bounded by MAX_ATTEMPTS)."""
+        own server (an answer that is not JSON or too large, all processes alive); a 5xx, a
+        crash, a hang or a lost channel may be the fresh placement's and retries (bounded by
+        MAX_ATTEMPTS, then the submission fails without a verdict)."""
         fault = getattr(self.launcher, "content_fault", lambda _: None)(served)
         if not error.retry or fault is None:
             return error

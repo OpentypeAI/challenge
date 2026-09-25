@@ -299,8 +299,9 @@ def _forward(base: str, request: Mapping[str, Any], timeout: float) -> dict[str,
 
 
 def _upstream(request: Mapping[str, Any], error: str) -> dict[str, Any]:
-    """The served process answered, with something the relay refuses (not JSON, too large):
-    a content fault of what it serves, which no hardware produces."""
+    """The served process answered, with bytes the relay refuses (not JSON, too large). Only
+    this is attributed to what it serves; a 5xx is not (the pinned reader turns a dead or
+    failing vllm into a 500/502, and a GPU fault can make a live vllm answer 500)."""
     return {"id": request["id"], "status": 599, "origin": "upstream", "body": {"error": error}}
 
 
@@ -392,7 +393,7 @@ def serve(
                 except (ValueError, KeyError, TypeError, RecursionError):
                     out({"failed": "malformed request"})
                     break
-                pool.submit(_relay, out, base, request, timeout, processes[0])
+                pool.submit(_relay, out, base, request, timeout, tuple(processes))
     finally:
         _stop(processes)
     return 0
@@ -416,23 +417,30 @@ def _tails(log_dir: Path) -> dict[str, str]:
     return {name: _tail(log_dir / f"{name}.log", LOG_TAIL) for name in ("reader", "vllm")}
 
 
+EXIT_GRACE = 1.0  # seconds a reply waits for a served process that may be dying
+
+
 def _relay(
     out: _Out,
     base: str,
     request: Mapping[str, Any],
     timeout: float,
-    reader: subprocess.Popen[bytes],
+    processes: Sequence[subprocess.Popen[bytes]],
 ) -> None:
-    """One request, always answered. A reader reply counts only if the pinned reader is alive
-    once it is received: a live reader still holds its port (bound before any miner code ran,
-    and a process of another uid cannot share it), so the reply came from it. A dead reader
-    ends the relay: its port could be taken by the served process."""
+    """One request, always answered. A reply counts only if every served process is still
+    alive once it is received: a live reader still holds its port (bound before any miner
+    code ran; another uid cannot share it), so a reader reply came from it; and a reply given
+    while vllm died (the reader masks a dead upstream as a 500/502) is the placement's
+    question, not an answer. Such a reply becomes a transport failure (retried)."""
     try:
         reply = _forward(base, request, timeout)
     except Exception as error:  # noqa: BLE001 - every request gets an answer
-        reply = _upstream(request, f"relay: {error!r}"[:300])
-    if request.get("to") == "reader" and reader.poll() is not None:
-        reply = {"id": request["id"], "status": 599, "body": {"error": "the reader exited"}}
+        reply = {"id": request["id"], "status": 599, "body": {"error": f"relay: {error!r}"[:300]}}
+    if int(reply.get("status", 599)) >= 500 or reply.get("origin"):
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            processes[-1].wait(timeout=EXIT_GRACE)  # an engine in the middle of dying
+    if any(p.poll() is not None for p in processes):
+        reply = {"id": request["id"], "status": 599, "body": {"error": "a served process exited"}}
     out(reply)
 
 
@@ -577,12 +585,13 @@ class RelayTransport(httpx.AsyncBaseTransport):
         finally:
             live.pending.pop(number, None)
         status = int(reply["status"])
-        if reply.get("origin") == "upstream" or 500 <= status < 599:
-            # the served process answered and the answer is broken: a content fault
-            self.launcher.faults.append({"side": side, "status": status, "body": reply.get("body")})
-            return httpx.Response(502 if status == 599 else status, json=reply.get("body"))
-        if status == 599:  # no answer: a crash, a hang or a lost channel
+        if reply.get("origin") == "upstream":
+            # the served process answered bytes the relay refuses (not JSON, too large)
+            self.launcher.faults.append({"side": side, "body": reply.get("body")})
+            return httpx.Response(502, json=reply.get("body"), request=request)
+        if status == 599:  # no answer: a crash, a hang, a dead process or a lost channel
             raise httpx.ConnectError(str(reply.get("body")), request=request)
+        # a 5xx stays ambiguous (hardware or the served code): the worker retries it
         return httpx.Response(status, json=reply.get("body"), request=request)
 
 
@@ -623,9 +632,10 @@ class SandboxLauncher:
         return dict(self._profile)
 
     def content_fault(self, side: str) -> dict[str, Any] | None:
-        """The first broken answer (5xx, not JSON, too large) a server of `side` gave since
-        its launch: evidence against what it serves, unlike a crash, a hang or a lost channel,
-        which a fresh placement's host can cause too."""
+        """The first answer a server of `side` gave since its launch that the relay refused
+        (not JSON, too large) while every served process stayed alive: evidence against what
+        it serves. A 5xx, a crash, a hang or a lost channel is not: a fresh placement's
+        hardware causes those too."""
         return next((f for f in self.faults if f["side"] == side), None)
 
     def quiescent(self) -> bool:
@@ -789,6 +799,8 @@ class SandboxLauncher:
             live.pump.cancel()
             with contextlib.suppress(BaseException):
                 await live.pump
+        with contextlib.suppress(BaseException):
+            await live.frames.aclose()  # type: ignore[attr-defined]  # an async generator
         gone = await live.channel.close()
         if self.live.get(live.side) is live:
             del self.live[live.side]
@@ -906,13 +918,24 @@ class ModalBackend:
         return _ModalChannel(sandbox)
 
 
+STDIN_CHUNK = 1 << 20  # Modal buffers at most 2 MiB of sandbox stdin between drains
+
+
+async def _send_chunked(stdin: Any, line: str) -> None:
+    """One line as bytes in chunks under the SDK's write buffer, each drained before the next
+    (the reader reassembles bytes, so a chunk may end inside a UTF-8 character)."""
+    data = line.encode()
+    for start in range(0, len(data), STDIN_CHUNK):
+        stdin.write(data[start : start + STDIN_CHUNK])
+        await stdin.drain.aio()
+
+
 class _ModalChannel:
     def __init__(self, sandbox: Any):
         self.sandbox = sandbox
 
     async def send(self, line: str) -> None:
-        self.sandbox.stdin.write(line.encode())
-        await self.sandbox.stdin.drain.aio()
+        await _send_chunked(self.sandbox.stdin, line)
 
     async def chunks(self) -> AsyncIterator[str]:
         async for chunk in self.sandbox.stdout:

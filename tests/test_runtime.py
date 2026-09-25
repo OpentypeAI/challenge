@@ -1220,7 +1220,7 @@ def test_startup_failures_blame_the_candidate_only_after_a_healthy_reference(
 @pytest.mark.parametrize(
     "fault,retry",
     [
-        ({"side": "challenger", "status": 500, "body": {}}, False),  # it answered, broken
+        ({"side": "challenger", "body": {"error": "not json"}}, False),  # it answered, unparsable
         (None, True),  # no answer: a crash, a hang or a lost channel may be the placement's
     ],
 )

@@ -159,6 +159,7 @@ def relay_probe(max_mib: int = 7) -> dict:
     sandbox's stdio exactly as the relay reads it (no GPU, no volume, no network, no miner
     code): does Modal split, merge, truncate or reorder long lines?"""
     import asyncio
+    import contextlib
     import hashlib
     import time
 
@@ -175,8 +176,8 @@ def relay_probe(max_mib: int = 7) -> dict:
         )  # fmt: skip
         channel = sandbox._ModalChannel(box)
         rows = []
+        frames = sandbox._lines(channel)
         try:
-            frames = sandbox._lines(channel)
             for n, size in enumerate(sizes):
                 pad = "é" * (size // 2)
                 start = time.monotonic()
@@ -195,6 +196,8 @@ def relay_probe(max_mib: int = 7) -> dict:
         except Exception as error:  # noqa: BLE001 - the first size that breaks is the answer
             rows.append({"error": repr(error)[:500]})
         finally:
+            with contextlib.suppress(BaseException):
+                await frames.aclose()
             await channel.close()
         return {"rows": rows, "ok": all(r.get("up_ok") and r.get("down_ok") for r in rows)}
 

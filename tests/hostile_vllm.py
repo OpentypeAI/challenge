@@ -3,6 +3,7 @@
 POST /emoji   6 MB of 4-byte characters (a frame that ASCII escaping would triple)
 POST /deep    100k nested lists (RecursionError in json.loads)
 POST /error   a 500
+POST /die     exits at once, as an engine killed by a GPU fault
 POST /hang    never answers
 POST /spoof   kill the reader (its pid file) and serve /v1/systemone on its port
 """
@@ -41,6 +42,8 @@ class Handler(BaseHTTPRequestHandler):
             self._raw(200, b"[" * 100_000 + b"]" * 100_000)
         elif self.path == "/error":
             self._raw(500, b'{"error":"boom"}')
+        elif self.path == "/die":  # the engine dies mid-request (an Xid, an OOM kill)
+            os._exit(1)
         elif self.path == "/hang":
             time.sleep(60)
         elif self.path == "/spoof":
