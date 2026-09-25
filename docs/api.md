@@ -85,7 +85,7 @@ constants. New in 2.0: `window.bank_digest`, `plan`, `tracks`, `teacher`, and
   "plan": {"decisions": {"weight": 0.35, "cases": 4000}, "longctx": {"weight": 0.25, "cases": 800},
            "ops": {"weight": 0.15, "cases": 1000}, "paint": {"weight": 0.15, "cases": 600},
            "sql": {"weight": 0.1, "cases": 1000}},
-  "tracks": {"decisions": {"weight": 0.35, "cases": 4000, "results": 162400}, "...": {}},
+  "tracks": {"decisions": {"weight": 0.35, "cases": 4000, "results": 5200}, "...": {}},
   "teacher": {"state": "ready", "judge": true, "judgments_pending": 0},
   "crowns_paused": false,
   "constants": {"g_min": 0.0513, "z": 2.326, "guard_max": 0.002, "duel_cases": 7400,
@@ -164,7 +164,7 @@ The body is at most 64 KiB. It returns `201` with the submission.
   "id": "s_a1c580f2a43edaeb", "hotkey": "5D...", "repo": "you/model", "revision": "...",
   "digest": "...", "state": "queued", "reason": null, "intake": 1, "created_at": "...",
   "job": {"id": "j_...", "state": "leased", "judgments_pending": 0, "champion": 1, "window": 1,
-          "cases": 7400, "paired": 12000, "attempts": 0, "verdict": null, "evidence": null,
+          "cases": 7400, "paired": 2600, "attempts": 0, "verdict": null, "evidence": null,
           "reason": null}
 }
 ```

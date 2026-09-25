@@ -173,7 +173,8 @@ def test_a_full_transcript_of_bombs_replays_fast():
     outputs = [json.dumps({"tool": "sql", "args": {"query": query}})] * sqltask.TURNS
     start = time.monotonic()
     assert score(case(4, 0).body, outputs) == 1.0
-    assert time.monotonic() - start < 1.5  # 2.6 s at the old 2M-step budget
+    # ~0.7 s locally, up to ~1.7 s on shared CI runners; 2.6 s locally at the old 2M-step budget
+    assert time.monotonic() - start < 2.5
 
 
 def test_observation_is_bounded():
