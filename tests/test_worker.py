@@ -261,6 +261,7 @@ def test_until_empty_runs_jobs_until_the_queue_is_empty(monkeypatch, tmp_path):
         cli.main(["worker", "--api", "http://x", "--token-file", str(token), "--workdir",
                   str(tmp_path), "--once", "--until-empty"])  # fmt: skip
 
+
 @pytest.mark.parametrize("status,expected_calls", [(401, 1), (403, 1), (503, 5)])
 def test_until_empty_api_failure_is_bounded(monkeypatch, tmp_path, status, expected_calls):
     from opentype_challenge import pins, worker

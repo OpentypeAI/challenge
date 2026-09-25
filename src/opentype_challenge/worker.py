@@ -312,6 +312,7 @@ class _ItemError(Exception):
 class ApiUnavailable(RuntimeError):
     """The API exhausted its bounded transport/service retries."""
 
+
 class Api:
     def __init__(self, base: str, token: str, client: httpx.AsyncClient):
         self.base, self.client = base.rstrip("/"), client
