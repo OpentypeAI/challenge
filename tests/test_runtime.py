@@ -1217,3 +1217,20 @@ def test_one_side_fidelity_passes_complete_a_real_job(tmp_path):
     assert job["paired"] == lease["cases"]  # both one-side passes landed on every case
     store.complete(lease["job"], lease["lease"], {"runtime": seconds_of(evidence_of())})
     assert store.submission(sid)["job"]["verdict"]["decision"] == "crown"
+
+
+def test_withdrawing_the_calibration_parks_runtime_work(tmp_path):
+    store = lane_store(tmp_path)
+    sid = runtime_submit(store, "5R", {"max_num_seqs": 128})["id"]
+    lease = store.lease("runtime")
+    assert lease is not None
+    answer_both(store, lease, {"champion": "exact", "challenger": "exact"})
+    time_tasks(store, lease)
+    store.set_calibration(None)  # mid-job: the job duels again, parked until reopened
+    store.complete(lease["job"], lease["lease"], {"runtime": seconds_of(evidence_of())})
+    assert store.submission(sid)["state"] == "queued"
+    store.requeue(store.submission(sid)["job"]["id"])  # no calibration: still no crash
+    assert store.lease("runtime") is None
+    store.set_calibration(calibration_json(version="pilot-2"))
+    again = store.lease("runtime")
+    assert again is not None and again["runtime"]["calibration"]["version"] == "pilot-2"

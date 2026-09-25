@@ -816,13 +816,15 @@ class Store:
         ).fetchone()
         if not self._target_current(db, job):  # callers expire such jobs first
             raise StoreError(409, "a runtime job never moves off its signed target")
+        if job["lane"] == "runtime" and self._calibration(db) is None:
+            return  # calibration withdrawn: stays queued; the lease targets it once reopened
         champion, window = self._champion(db), self._window(db)
         mix, retired = self._mix(db, champion["id"])
         judge = self.judge
         if job["lane"] == "runtime":
             # fidelity on every measured track, no judge; the candidate duels stock
             calibration = self._calibration(db)
-            assert calibration is not None  # the lane is open while it has jobs
+            assert calibration is not None  # checked above
             measured = runtime.fidelity_tracks(calibration)
             plan = {
                 t: TrackPlan(1 / len(measured), self.settings.runtime_fidelity_cases)
