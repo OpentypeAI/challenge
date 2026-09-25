@@ -487,6 +487,12 @@ def test_judge_png_averages_and_gives_up(tmp_path):
     assert run(go(unreadable)) is None
     assert len(calls) == 2 * teacher.JUDGE_ATTEMPTS * teacher.VALID_ATTEMPTS
 
+    def down(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    with pytest.raises(GatewayError):  # an outage is not an unreadable render
+        run(go(down))
+
 
 # ---------------------------------------------------------------------------
 # Live smoke test against the operator gateway.

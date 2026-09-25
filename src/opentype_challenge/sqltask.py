@@ -34,7 +34,9 @@ MAX_TOKENS = 1024
 MAX_QUERY = 4000  # characters of query text
 MAX_ROWS = 50
 MAX_OBS = 4000  # characters of one query observation
-MAX_STEPS = 2_000_000  # VM steps per query
+# VM steps per query: the worst adversarial query then stops in ~0.06 s; reference queries
+# take < 10k steps and a four-way analyst join ~200k.
+MAX_STEPS = 500_000
 MAX_LIST = 20  # answer list length a spec may have
 ATTEMPTS = 200
 
@@ -420,10 +422,10 @@ def _number(value: Any) -> float | None:
 
 
 def _same_number(answer: Any, expected: float) -> bool:
+    """Within half a cent of the gold: any rounding to 2 decimals (half-up as SQLite's ROUND,
+    or half-even) of the exact gold passes, so the grade names no rounding convention."""
     got = _number(answer)
-    return got is not None and math.isclose(
-        round(got, 2), round(expected, 2), rel_tol=1e-6, abs_tol=1e-9
-    )
+    return got is not None and abs(got - expected) <= 0.005 + 1e-6 * abs(expected) + 1e-9
 
 
 def _fold(value: Any) -> str | None:

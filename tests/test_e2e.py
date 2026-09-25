@@ -422,6 +422,9 @@ def test_stale_champion_requeues_and_earliest_intake_wins(
     assert store.submission(b)["job"]["state"] == "scored"
     asyncio.run(_answer_perfectly(client, lease_a))
     assert store.submission(a)["state"] == "crowned"
+    # the duel ran on the empty bank (public templates only): the crown pays nothing
+    board = client.get("/v1/leaderboard").json()["hotkeys"][first.hotkey]
+    assert store.submission(a)["job"]["verdict"]["g_lcb"] > 0 and board["entitlement"] == 0
     job_b = store.submission(b)["job"]
     assert store.submission(b)["state"] == "queued" and job_b["id"] != lease_b["job"]
     assert job_b["champion"] == 2  # re-targeted at the new champion

@@ -293,6 +293,20 @@ def _track_metrics(pairs: Sequence[Paired]) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _halves(pairs: Sequence[Paired], keep: set[int]) -> tuple[list[Paired], list[Paired]]:
+    """The kept pairs split by the parity of their rank within their track, ranked by case
+    index over all pairs: every track splits evenly, so each half replicates the whole
+    composite whatever the plan's interleave. A decisions-only duel gets v1's halves."""
+    halves: tuple[list[Paired], list[Paired]] = ([], [])
+    rank: dict[str, int] = {}
+    for p in sorted(pairs, key=lambda p: p.index):
+        k = rank.get(p.track, 0)
+        rank[p.track] = k + 1
+        if p.index in keep:
+            halves[k % 2].append(p)
+    return halves
+
+
 def verdict(
     pairs: Sequence[Paired],
     retired: set[int],
@@ -300,10 +314,11 @@ def verdict(
     weights: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """The crown rule. Halves are the even and odd case indices. With weights: the composite
-    g, the retired-level guard on decisions and the per-track regression guard."""
+    g with halves by within-track rank, the retired-level guard on decisions and the
+    per-track regression guard."""
     active = [p for p in pairs if not _is_guard(p, retired)]
     guard = [p for p in pairs if _is_guard(p, retired)]
-    if weights is None:
+    if weights is None:  # v1: even and odd case indices
         g, se = log_ratio([p.champion.loss for p in active], [p.challenger.loss for p in active])
         halves = [
             lcb(
@@ -315,8 +330,8 @@ def verdict(
     else:
         g, se = composite(moments(active), weights)
         halves = []
-        for h in (0, 1):
-            g_h, se_h = composite(moments(p for p in active if p.index % 2 == h), weights)
+        for half in _halves(pairs, {p.index for p in active}):
+            g_h, se_h = composite(moments(half), weights)
             halves.append(g_h - Z99 * se_h)
     g_lcb = min(halves)
     guard_ucb = ratio_ucb(

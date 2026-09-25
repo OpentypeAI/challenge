@@ -41,11 +41,11 @@ def test_default_plan():
     assert tracks.TRACKS == ("decisions", "longctx", "ops", "sql", "paint")
     assert set(tracks.ENVS) == {"ops", "sql", "paint"}
     assert {t: (p.weight, p.cases) for t, p in DEFAULT_PLAN.items()} == {
-        "decisions": (0.35, 20_000),
+        "decisions": (0.35, 4_000),
         "longctx": (0.25, 800),
-        "ops": (0.15, 300),
-        "sql": (0.10, 300),
-        "paint": (0.15, 200),
+        "ops": (0.15, 1_000),
+        "sql": (0.10, 1_000),
+        "paint": (0.15, 600),
     }
     assert sum(p.weight for p in DEFAULT_PLAN.values()) == pytest.approx(1.0)
 

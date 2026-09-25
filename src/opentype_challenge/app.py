@@ -131,6 +131,7 @@ class Config:
             return Path(value) if value else None
 
         cap = os.environ.get("OPENTYPE_WINDOW_ENTITLEMENT_CAP")
+        empty_cap = os.environ.get("OPENTYPE_EMPTY_BANK_CAP")
         plan = os.environ.get("OPENTYPE_PLAN")
         return cls(
             slug=os.environ.get("CHALLENGE_SLUG", "opentype"),
@@ -143,6 +144,7 @@ class Config:
                 duel_cases=int(os.environ.get("OPENTYPE_DUEL_CASES", "40000")),
                 max_pending=int(os.environ.get("OPENTYPE_MAX_PENDING", "4")),
                 window_cap=float(cap) if cap else None,
+                empty_bank_cap=float(empty_cap) if empty_cap else 0.0,
                 plan=plan_from_json(json.loads(plan)) if plan else None,
             ),
             window_hours=float(os.environ.get("OPENTYPE_WINDOW_HOURS", "24")),
@@ -271,9 +273,16 @@ def create_app(
 
     async def judge_pending() -> int:
         """Judge the pending sides (each case's sides in its seed order), then settle the jobs
-        with nothing left to judge. Returns the number of sides judged here."""
+        with nothing left to judge. Returns the number of sides judged here. A judge that
+        raises (gateway outage, closed at shutdown) leaves its side pending for a later pass;
+        only None (the judge's replies about this render were unreadable) excludes the pair.
+
+        ponytail: a long outage holds its jobs in 'judging'; add an operator deadline if that
+        ever bites.
+        """
         done = 0
-        while True:
+        down = False
+        while not down:
             batch = await run(store.pending_judgments)
             with claims_lock:
                 mine = [
@@ -291,8 +300,10 @@ def create_app(
                     if judge is not None:
                         try:
                             loss = await judge(item["brief"], item["rubric"], item["png"])
-                        except Exception:  # an unreadable judge excludes the pair
-                            log.exception("judge call failed")
+                        except Exception:
+                            log.exception("judge call failed; the side stays pending")
+                            down = True
+                            break
                     await run(
                         store.record_judgment, item["job"], item["case_index"], item["side"], loss
                     )
@@ -342,9 +353,11 @@ def create_app(
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         tasks = [asyncio.create_task(background()), asyncio.create_task(builder())]
         yield
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        # judge calls started by complete too: they must not outlive the gateway
+        futures: list[asyncio.Future[Any]] = [*tasks, *running]
+        for future in futures:
+            future.cancel()
+        await asyncio.gather(*futures, return_exceptions=True)
         await client.aclose()
         if sync_client is not None:
             sync_client.close()

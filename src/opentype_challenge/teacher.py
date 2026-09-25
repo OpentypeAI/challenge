@@ -104,6 +104,10 @@ class GatewayError(Exception):
         self.retry = retry
 
 
+class InvalidReply(GatewayError):
+    """The gateway answered, but no reply validated: a content failure, not an outage."""
+
+
 def _models(value: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in value.split(",") if part.strip())
 
@@ -346,7 +350,7 @@ class Gateway:
                 reason = str(exc) if isinstance(exc, ValueError) else "malformed response"
                 continue
             return value
-        raise GatewayError(f"{model}: no valid result ({reason})", retry=True)
+        raise InvalidReply(f"{model}: no valid result ({reason})", retry=True)
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -404,7 +408,7 @@ async def _verdicts(
             try:
                 verdict = await gateway.json(model, system, user, schema)
                 paint.judge_loss([verdict], items)  # ids exactly 1..items
-            except (GatewayError, ValueError):
+            except (InvalidReply, ValueError):  # an outage (other GatewayError) propagates
                 continue
             return verdict
         return None
@@ -416,7 +420,8 @@ async def _verdicts(
 async def judge_png(
     gateway: Gateway, config: TeacherConfig, brief: str, rubric: Sequence[str], png: bytes
 ) -> float | None:
-    """§6 judge loss averaged over config.judges; None when any judge cannot be read."""
+    """§6 judge loss averaged over config.judges; None when any judge's replies cannot be
+    read. A gateway outage raises GatewayError: the side stays pending."""
     verdicts = await _verdicts(gateway, config, brief, rubric, png)
     return None if verdicts is None else paint.judge_loss(verdicts, len(rubric) + 1)
 

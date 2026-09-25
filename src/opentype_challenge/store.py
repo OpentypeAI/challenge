@@ -101,6 +101,9 @@ RESULT_COLUMNS = (
 WINDOW_COLUMNS = "id, secret, commitment, opened_at, closed_at, bank_digest"
 
 
+UNJUDGED_MAX = 0.05  # share of judged cases a crowned duel may drop as unreadable
+
+
 class StoreError(Exception):
     def __init__(self, status: int, detail: str):
         super().__init__(detail)
@@ -113,6 +116,9 @@ class Settings:
     max_pending: int = 4
     window_cap: float | None = None
     plan: Mapping[str, TrackPlan] | None = None
+    # entitlement cap (epoch-masses) of a crown whose duel ran on the empty bank: its cases
+    # are all public templates a miner can train on, so by default it pays nothing
+    empty_bank_cap: float = 0.0
 
     def track_plan(self) -> Mapping[str, TrackPlan]:
         """The configured plan; v1's duel_cases gives a decisions-only plan (tests)."""
@@ -854,13 +860,19 @@ class Store:
             return self._submission(db, job["submission_id"])
 
     def _settle(self, db: sqlite3.Connection, job_id: str) -> None:
-        """Score a job whose answers are all in: pairs with an unjudged side are dropped on
-        both sides, then the verdict, the champion's level stats and the crown queue."""
+        """Score a job whose answers are all in: a pair whose two renders the judge could not
+        read is dropped on both sides, then the verdict, the champion's level stats and the
+        crown queue. A crown is refused when more than UNJUDGED_MAX of the judged cases were
+        dropped, since the drop depends on the renders."""
         job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         unjudged = db.execute(
-            "SELECT DISTINCT case_index FROM judgments WHERE job_id=? AND state='unjudged'",
+            "SELECT case_index FROM judgments WHERE job_id=? GROUP BY case_index "
+            "HAVING sum(state='unjudged') = 2",
             (job_id,),
         ).fetchall()
+        judged = db.execute(
+            "SELECT count(DISTINCT case_index) FROM judgments WHERE job_id=?", (job_id,)
+        ).fetchone()[0]
         db.executemany(
             "DELETE FROM results WHERE job_id=? AND case_index=?",
             [(job_id, r[0]) for r in unjudged],
@@ -870,6 +882,9 @@ class Store:
             pairs, set(json.loads(job["retired"])), bool(job["stopped"]), _weights(job)
         )
         result["unjudged"] = len(unjudged)
+        result["unjudged_max"] = UNJUDGED_MAX
+        if judged and len(unjudged) > UNJUDGED_MAX * judged:
+            result["crown"] = False
         db.execute(
             "UPDATE jobs SET state='scored', lease=NULL, verdict=?, finished_at=? WHERE id=?",
             (_dumps(result), self._now(), job_id),
@@ -916,8 +931,9 @@ class Store:
         return out
 
     def record_judgment(self, job_id: str, case_index: int, side: str, loss: float | None) -> None:
-        """A judged side becomes a result; None marks the case unjudged (dropped on both
-        sides when the job settles)."""
+        """A judged side becomes a result. None (the judge could not read this side's
+        render) forfeits the side with loss 1, as a render is the model's own output; when
+        both sides are unreadable the case is unjudged and dropped on both sides at settle."""
         with self._tx() as db:
             row = db.execute(
                 "SELECT * FROM judgments WHERE job_id=? AND case_index=? AND side=? "
@@ -926,17 +942,10 @@ class Store:
             ).fetchone()
             if row is None:
                 return  # the job was released or requeued meanwhile
-            if loss is None:
-                db.execute(
-                    "UPDATE judgments SET state='unjudged' WHERE job_id=? AND case_index=?",
-                    (job_id, case_index),
-                )
-                return
-            score = scoring.harness_score(loss)
+            score = scoring.harness_score(1.0 if loss is None else loss)
             db.execute(
-                "UPDATE judgments SET state='judged', loss=? WHERE job_id=? AND case_index=? "
-                "AND side=?",
-                (score.loss, job_id, case_index, side),
+                "UPDATE judgments SET state=?, loss=? WHERE job_id=? AND case_index=? AND side=?",
+                ("unjudged" if loss is None else "judged", score.loss, job_id, case_index, side),
             )
             db.execute(
                 f"INSERT OR IGNORE INTO results ({RESULT_COLUMNS}) "  # noqa: S608
@@ -1104,6 +1113,11 @@ class Store:
             (window["id"],),
         ).fetchone()[0]
         amount = ledger.entitlement_units(result["g_lcb"], window_total, self.settings.window_cap)
+        duel_bank = db.execute(
+            "SELECT bank_digest FROM windows WHERE id=?", (job["window_id"],)
+        ).fetchone()[0]
+        if duel_bank == bank.EMPTY_BANK.digest:
+            amount = min(amount, int(self.settings.empty_bank_cap * ledger.UNITS))
         db.execute(
             "INSERT INTO entitlements (hotkey, champion_id, window_id, amount, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
@@ -1210,10 +1224,14 @@ class Store:
                 if db.execute("SELECT 1 FROM meta WHERE key='next_bank'").fetchone()
                 else "configured"
             )
+            # the latest started duel only: a PK range scan of at most one plan's rows, never
+            # the all-time table, since every store call waits on this lock
             track_counts = {
                 r[0]: r[1]
                 for r in db.execute(
-                    "SELECT track, count(*) FROM results GROUP BY track ORDER BY track"
+                    "SELECT track, count(*) FROM results WHERE job_id=(SELECT id FROM jobs "
+                    "WHERE state != 'queued' ORDER BY created_at DESC, id DESC LIMIT 1) "
+                    "GROUP BY track ORDER BY track"
                 ).fetchall()
             }
             judging = db.execute("SELECT count(*) FROM judgments WHERE state='pending'").fetchone()[
@@ -1247,6 +1265,7 @@ class Store:
                     "retire_accuracy": scoring.RETIRE_ACCURACY,
                     "max_pending": self.settings.max_pending,
                     "window_entitlement_cap": self.settings.window_cap,
+                    "empty_bank_entitlement_cap": self.settings.empty_bank_cap,
                     "base": {"repo": pins.BASE_REPO, "revision": pins.BASE_REVISION},
                 },
             }

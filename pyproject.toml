@@ -48,6 +48,9 @@ target-version = "py312"
 line-length = 100
 src = ["src", "tests"]
 
+[tool.ruff.format]
+exclude = ["*.md"]  # docs code blocks are illustrative snippets, owned by the docs
+
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC", "S"]
 ignore = ["S101", "S311"]

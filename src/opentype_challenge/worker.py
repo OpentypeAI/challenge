@@ -35,6 +35,9 @@ from .crypto import manifest_problem
 
 SIDES = ("champion", "challenger")
 BATCH_BYTES = 900 * 1024
+# The container replays every harness transcript inline before it answers: 8 items x 12
+# turns x <= 0.06 s per query (sqltask.MAX_STEPS) keeps one POST far below the 30 s proxy.
+BATCH_HARNESS = 8
 PAGE = 100
 CONCURRENCY = 64
 READ_TIMEOUT = 300.0
@@ -529,16 +532,22 @@ class Worker:
 
 
 def _batches(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-    """Split answers into request bodies under BATCH_BYTES."""
+    """Split answers into request bodies under BATCH_BYTES and BATCH_HARNESS transcripts."""
     batches: list[list[dict[str, Any]]] = [[]]
-    size = 0
+    size = replays = 0
     for item in items:
         length = len(json.dumps(item, separators=(",", ":"))) + 1
-        if batches[-1] and (size + length > BATCH_BYTES or len(batches[-1]) >= 2000):
+        harness_item = "transcript" in item
+        if batches[-1] and (
+            size + length > BATCH_BYTES
+            or len(batches[-1]) >= 2000
+            or (harness_item and replays >= BATCH_HARNESS)
+        ):
             batches.append([])
-            size = 0
+            size = replays = 0
         batches[-1].append(item)
         size += length
+        replays += harness_item
     return [batch for batch in batches if batch]
 
 

@@ -331,7 +331,7 @@ It never contains the gold, the expected actions or the rubric.
     replay is exact.
   - Only one statement starting with `SELECT`, `WITH` or `VALUES` runs (`EXPLAIN` is
     refused: it leaks pointers).
-  - A progress handler aborts after 2,000,000 VM steps. Limits: `SQLITE_LIMIT_LENGTH` 1000,
+  - A progress handler aborts after 500,000 VM steps. Limits: `SQLITE_LIMIT_LENGTH` 1000,
     `SQL_LENGTH` 4000, `LIKE_PATTERN_LENGTH` 100, `COMPOUND_SELECT` 20, `EXPR_DEPTH` 100,
     `ATTACHED` 0, `temp_store=MEMORY`, no statement cache.
   - The query text is capped at 4,000 characters; NUL or unencodable characters come back
@@ -391,8 +391,11 @@ It never contains the gold, the expected actions or the rubric.
   disagree about `n`; with `items` (the rubric length + 1) it also rejects a short verdict.
 - The two sides of a case are judged in separate calls, in an order drawn from the case
   seed (`Random(f"judge|{seed}")`).
-- If an item cannot be judged after 5 attempts, the pair is excluded on **both** sides and
-  counted in the verdict as `unjudged`.
+- A side whose render the judge cannot read (no valid verdict after 5 attempts) forfeits
+  with loss 1. Only when **both** renders are unreadable is the pair excluded on both sides
+  and counted in the verdict as `unjudged`; a duel that drops more than `UNJUDGED_MAX`
+  (5 %) of its judged cases is not crowned. A gateway outage (or a gateway closed at
+  shutdown) is not a verdict: the side stays pending and a later pass judges it.
 
 ## 7. Worker
 
@@ -418,10 +421,12 @@ It never contains the gold, the expected actions or the rubric.
 
 - **Plan.** `Settings.plan` maps each track to `TrackPlan(weight, cases)`. It is loaded
   from the env `OPENTYPE_PLAN` (JSON `{track: {"weight", "cases"}}`). The default is
-  (21,600 cases in total):
+  (7,400 cases in total, sized so `π_t·se_t` is about equal across tracks; on simulated
+  losses a null duel has `g − g_LCB ≈ 0.07`, so the minimum crownable composite `g` is
+  about `G_MIN + 0.07 ≈ 0.12`):
 
   ```text
-  decisions 0.35/20000   longctx 0.25/800   ops 0.15/300   sql 0.10/300   paint 0.15/200
+  decisions 0.35/4000   longctx 0.25/800   ops 0.15/1000   sql 0.10/1000   paint 0.15/600
   ```
 
   `effective_plan(plan, bank, judge)` is what a job runs. A track whose cases cannot all be
@@ -449,7 +454,9 @@ It never contains the gold, the expected actions or the rubric.
 - **Per-track statistics.** For each track with at least 2 pairs, `g_t, se_t` is v1's
   `log_ratio` on that track's case sums.
 - **Composite.** `g = Σ π_t g_t / Σ π_t` and `se = sqrt(Σ π_t² se_t²) / Σ π_t`, over the
-  tracks present. `g_LCB` is the min over the even and odd halves of the composite LCB99.
+  tracks present. `g_LCB` is the min over the two halves of the composite LCB99; a
+  pair's half is the parity of its rank within its track (by case index), so every track
+  splits evenly between the halves.
 - **Crown.** A challenger is crowned when all of these hold (the per-track guard uses all
   active pairs, not the halves):
   - `g_LCB ≥ g_min`;
@@ -459,8 +466,9 @@ It never contains the gold, the expected actions or the rubric.
   - the duel was not early-stopped.
 - **Early stop.** v1's rule applied to the composite.
 - The verdict reports `tracks: {t: {g, se, pairs, champion_loss, challenger_loss,
-  accuracy, regressed}}`, `track_guard: {pairs, min}` and `unjudged` (pairs excluded because
-  a side could not be judged). Only decisions pairs feed the ladder statistics.
+  accuracy, regressed}}`, `track_guard: {pairs, min}`, `unjudged` (pairs excluded because
+  neither side could be judged) and `unjudged_max`. Only decisions pairs feed the ladder
+  statistics.
 
 ### Windows and the bank builder
 
@@ -473,6 +481,9 @@ It never contains the gold, the expected actions or the rubric.
   next bank is ever ready, so windows rotate only on `POST /v1/admin/window/rotate`, which
   always works and opens the new window with the next bank or, when none is ready, the
   empty bank.
+- A crown whose duel ran on the empty bank (all cases are public templates a miner can
+  train on) still takes the throne, but its entitlement is capped at
+  `OPENTYPE_EMPTY_BANK_CAP` epoch-masses (`Settings.empty_bank_cap`, default 0).
 - `sha256(secret)` and `bank_digest` are published when a window opens.
 - The secret and the bank items are published when the window closes:
   `GET /v1/windows/{id}/bank?offset&limit`, paged under 6 MiB.
@@ -545,7 +556,8 @@ It never contains the gold, the expected actions or the rubric.
 
 - `teacher.judge_png(gateway, config, brief, rubric, png) -> float | None` returns the
   judge loss of §6, averaged over `config.judges`. It retries each judge up to 5 times and
-  returns `None` when any judge cannot be read. The container and the depict negative
+  returns `None` when any judge's replies cannot be read; a gateway outage raises
+  `GatewayError`. The container and the depict negative
   control both use it.
 - `scoring.TrackMoments = tuple[int, float, float, float, float, float]` holds
   `(n, sa, sb, saa, sbb, sab)` for one track.

@@ -300,3 +300,43 @@ def test_early_stop_with_weights_uses_the_composite():
     even = retrack(simulated_duel(random.Random(4), 0.9, 0.0, 6_000), "decisions")
     assert s.early_stop(even + worse_ops, set(), {"decisions": 0.5, "ops": 0.5})
     assert not s.early_stop(even + worse_ops, set(), {"decisions": 1.0})
+
+
+@pytest.mark.parametrize(
+    "plan",
+    [
+        {"decisions": (0.5, 300), "ops": (0.5, 300)},
+        {"decisions": (0.4, 20_000), "longctx": (0.2, 800), "ops": (0.2, 300), "sql": (0.2, 300)},
+    ],
+)
+def test_halves_split_every_track_evenly(plan):
+    from opentype_challenge import tracks
+
+    full = {t: tracks.TrackPlan(w, n) for t, (w, n) in plan.items()}
+    zero = s.CaseScore(0.0, 1, 1, 1, 0.0, 0)
+    pairs = [
+        s.Paired(i, 1, zero, zero, tracks.track_of(i, full))
+        for i in range(sum(n for _, n in plan.values()))
+    ]
+    halves = s._halves(pairs, {p.index for p in pairs})
+    for track in plan:
+        counts = [sum(p.track == track for p in half) for half in halves]
+        assert abs(counts[0] - counts[1]) <= 1, (track, counts)
+
+
+def test_default_plan_balances_the_track_errors():
+    """Null duel under DEFAULT_PLAN: no track dominates the composite SE, which is ~0.017
+    (0.027 with the former 20k-decisions plan)."""
+    from opentype_challenge.tracks import DEFAULT_PLAN
+
+    rng = random.Random(0)
+    n = {t: p.cases for t, p in DEFAULT_PLAN.items()}
+    pairs = retrack(simulated_duel(rng, 0.9, 0.0, PER_CASE * n["decisions"]), "decisions")
+    pairs += retrack(simulated_duel(rng, 0.9, 0.0, PER_CASE * n["longctx"]), "longctx", 10**5)
+    for i, track in enumerate(("ops", "sql", "paint")):
+        pairs += harness_duel(rng, n[track], 0.4, 0.4, track, 2 * 10**5 + i * 10**4)
+    weights = {t: p.weight for t, p in DEFAULT_PLAN.items()}
+    result = s.verdict(pairs, set(), False, weights)
+    shares = [weights[t] * m["se"] for t, m in result["tracks"].items()]
+    assert max(shares) < 4 * min(shares), result["tracks"]
+    assert result["se"] < 0.02

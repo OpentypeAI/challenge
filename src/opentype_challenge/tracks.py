@@ -32,12 +32,15 @@ class TrackPlan:
     cases: int
 
 
+# Counts sized so pi_t * se_t is about equal across tracks (0/1 harness losses need ~5x the
+# cases of a 6-decision read case): null g - g_LCB ~0.07, down from ~0.12 with 20k decisions.
+# ponytail: se_t measured on simulated losses; resize from the Phase 0 base-model losses.
 DEFAULT_PLAN: dict[str, TrackPlan] = {
-    "decisions": TrackPlan(0.35, 20_000),
+    "decisions": TrackPlan(0.35, 4_000),
     "longctx": TrackPlan(0.25, 800),
-    "ops": TrackPlan(0.15, 300),
-    "sql": TrackPlan(0.10, 300),
-    "paint": TrackPlan(0.15, 200),
+    "ops": TrackPlan(0.15, 1_000),
+    "sql": TrackPlan(0.10, 1_000),
+    "paint": TrackPlan(0.15, 600),
 }
 
 PlanKey = tuple[tuple[str, TrackPlan], ...]

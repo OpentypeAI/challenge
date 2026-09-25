@@ -12,7 +12,15 @@ import pytest
 from opentype_challenge import generator as g
 from opentype_challenge import harness, longctx, ops, paint, sqltask, tracks
 from opentype_challenge.bank import EMPTY_BANK, cases_digest
-from opentype_challenge.worker import BATCH_BYTES, Api, JobFailed, VllmLauncher, Worker, _batches
+from opentype_challenge.worker import (
+    BATCH_BYTES,
+    BATCH_HARNESS,
+    Api,
+    JobFailed,
+    VllmLauncher,
+    Worker,
+    _batches,
+)
 
 from . import fake_inference as fake
 
@@ -203,6 +211,15 @@ def test_batches_stay_under_the_request_cap():
     for batch in batches:
         body = json.dumps({"lease": "l" * 64, "items": batch}, separators=(",", ":"))
         assert len(body) < BATCH_BYTES + 1024 < 1 << 20
+
+
+def test_batches_cap_the_replays_of_one_request():
+    reads = [{"case_index": i, "side": "champion", "answers": {}} for i in range(100)]
+    plays = [{"case_index": i, "side": "champion", "transcript": ["x"]} for i in range(100, 120)]
+    batches = _batches(reads + plays)
+    assert [i for b in batches for i in b] == reads + plays
+    assert all(sum("transcript" in i for i in b) <= BATCH_HARNESS for b in batches)
+    assert len(batches) == 3
 
 
 def test_vllm_command_and_urls():

@@ -205,21 +205,21 @@ def test_judgments_lifecycle_with_an_unjudgeable_case(tmp_path):
     assert renders[(depicts[0]["index"], "challenger")] != paint.blank_png()
 
     unjudged = depicts[0]["index"]
-    for item in pending:
+    first = pending[0]
+    assert first["case_index"] == unjudged
+    store.record_judgment(first["job"], unjudged, first["side"], None)
+    assert store.pending_judgments() and store.settle_judged() == []  # still pending
+    for item in store.pending_judgments():
         blank = item["png"] == paint.blank_png()
         loss = None if item["case_index"] == unjudged else (1.0 if blank else 0.0)
         store.record_judgment(item["job"], item["case_index"], item["side"], loss)
-        if item["case_index"] == unjudged:
-            break  # the other side of an unjudged case is never judged
-    assert store.pending_judgments() and store.settle_judged() == []  # still pending
-    for item in store.pending_judgments():
-        store.record_judgment(item["job"], item["case_index"], item["side"], 0.0)
     assert store.settle_judged() == [lease["job"]]
 
     result = store.submission(sid)
     verdict = result["job"]["verdict"]
-    assert verdict["unjudged"] == 1
+    assert verdict["unjudged"] == 1  # both renders unreadable: dropped on both sides
     assert verdict["tracks"]["paint"]["pairs"] == 11 == result["job"]["paired"]
+    assert verdict["unjudged_max"] == 0.05 and not verdict["crown"]  # 1 of < 12 judged
     assert result["job"]["state"] in {"rejected", "crowned"} or result["state"] == "queued"
     assert result["job"]["evidence"] == {"w": 1}
 
@@ -433,3 +433,68 @@ def test_a_v1_database_migrates_in_place(tmp_path):
     assert job["plan"] == {"decisions": {"cases": 2, "weight": 1.0}} and job["beacon"] is None
     assert store.status()["window"]["id"] == 2
     store_of(tmp_path)  # a second open is a no-op
+
+
+def test_status_counts_only_the_latest_duel_by_primary_key(tmp_path):
+    store = store_of(tmp_path)
+    rows = [
+        ("old-job", i, side, 1, 0.0, 1, 1, 1, 0.0, 0, "decisions")
+        for i in range(50)
+        for side in ("champion", "challenger")
+    ]
+    with store._tx() as db:
+        db.executemany("INSERT INTO results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+    assert store.status()["tracks"]["decisions"]["results"] == 0  # no started job: no scan
+    plan = store._db.execute(
+        "EXPLAIN QUERY PLAN SELECT track, count(*) FROM results WHERE job_id=? GROUP BY track",
+        ("x",),
+    ).fetchall()
+    assert any("USING PRIMARY KEY" in str(tuple(r)) for r in plan), plan
+
+
+def test_one_unreadable_render_forfeits_that_side_only(tmp_path):
+    store = depict_store(tmp_path)
+    sid = enqueue(store, "a")["id"]
+    lease = lease_of(store)
+    answer_paint(store, lease)
+    store.complete(lease["job"], lease["lease"], {})
+    for item in store.pending_judgments():
+        # the challenger's render is never readable: it cannot hide a loss by being dropped
+        loss = None if item["side"] == "challenger" else 0.0
+        store.record_judgment(item["job"], item["case_index"], item["side"], loss)
+    assert store.settle_judged() == [lease["job"]]
+    verdict = store.submission(sid)["job"]["verdict"]
+    paint_track = verdict["tracks"]["paint"]
+    assert verdict["unjudged"] == 0 and paint_track["pairs"] == 12
+    depicts = store._db.execute(
+        "SELECT count(*) FROM judgments WHERE side='challenger'"
+    ).fetchone()[0]
+    assert paint_track["challenger_loss"] >= depicts  # each unreadable side scored loss 1
+
+
+def test_a_judge_outage_leaves_the_sides_pending(make_client):
+    calls: list[int] = []
+
+    async def judge(brief: str, rubric: list[str], png: bytes) -> float | None:
+        calls.append(1)
+        raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+    client = make_client(judge=judge, plan={"paint": TrackPlan(1.0, 12)})
+    store = client.app.state.store
+    with_bank(store, [BankItem.make("depict", DEPICT)])
+    sid = enqueue(store, "a")["id"]
+    lease = client.post("/v1/worker/lease", headers=bearer(WORKER)).json()
+    answer_paint(store, lease)
+    job = client.post(
+        f"/v1/worker/jobs/{lease['job']}/complete",
+        headers=bearer(WORKER),
+        json={"lease": lease["lease"], "evidence": {}},
+    ).json()["job"]
+    # each pass (complete's, maybe a racing background one) stops at its first failure
+    assert len(calls) <= 2
+    assert job["state"] == "judging" and job["judgments_pending"] > 0
+    assert store.submission(sid)["job"]["state"] == "judging"
+    assert (
+        store._db.execute("SELECT count(*) FROM judgments WHERE state != 'pending'").fetchone()[0]
+        == 0
+    )

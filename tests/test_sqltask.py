@@ -75,6 +75,16 @@ def test_answer_normalisation():
     assert not sqltask.correct(unordered, ["a"], ["a", "a"])
 
 
+def test_scalar_accepts_any_two_decimal_rounding():
+    spec = {"kind": "avg_qty", "params": {"category": "toys"}}
+    for gold in (2.125, 2.625, 3.125):
+        low, high = gold - 0.005, gold + 0.005
+        for got in (low, high, gold, f"{high:.2f}"):
+            assert sqltask.correct(spec, got, gold), (got, gold)
+        assert not sqltask.correct(spec, gold + 0.01, gold)
+        assert not sqltask.correct(spec, gold - 0.0151, gold)
+
+
 @pytest.mark.parametrize(
     "query",
     [
@@ -147,6 +157,17 @@ def test_bombs_stop_fast(query):
     result = db.query(query)
     assert time.monotonic() - start < 2.0
     assert "error" in result or len(json.dumps(result)) < 10_000
+
+
+def test_a_full_transcript_of_bombs_replays_fast():
+    query = (
+        "SELECT DISTINCT printf('%.990c','x')||a.rowid||b.rowid||c.rowid FROM order_items a, "
+        "order_items b, order_items c LIMIT 1 OFFSET 5000000"
+    )
+    outputs = [json.dumps({"tool": "sql", "args": {"query": query}})] * sqltask.TURNS
+    start = time.monotonic()
+    assert score(case(4, 0).body, outputs) == 1.0
+    assert time.monotonic() - start < 1.5  # 2.6 s at the old 2M-step budget
 
 
 def test_observation_is_bounded():
