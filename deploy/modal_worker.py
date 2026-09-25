@@ -41,6 +41,7 @@ work = modal.Volume.from_name("opentype-worker-work", create_if_missing=True)
     secrets=[modal.Secret.from_name("opentype-worker")],
     timeout=24 * 3600,
     max_containers=1,
+    scaledown_window=2,  # release the paid GPU promptly after a drain or empty check
     schedule=modal.Cron("*/10 * * * *"),
 )
 def duel() -> None:
