@@ -121,8 +121,8 @@ def chat_problem(body: Any) -> str | None:
         return "expected a system message then a user message"
     if not isinstance(body.get("model"), str) or type(body.get("max_tokens")) is not int:
         return "model and max_tokens are required"
-    if body.get("temperature") != 0.0 or type(body.get("seed")) is not int:
-        return "temperature 0.0 and an int seed are required"
+    if body.get("temperature", 1.0) != 1.0 or body.get("seed") is not None:
+        return "diffusion models reject temperature overrides and seeds"
     return None
 
 

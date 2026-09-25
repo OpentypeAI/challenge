@@ -462,13 +462,11 @@ class Worker:
             url = urls[side]["chat"] + "/v1/chat/completions"
             max_tokens = int(body["limits"]["max_tokens"])
 
-            async def generate(messages: list[dict[str, Any]], seed: int) -> str:
+            async def generate(messages: list[dict[str, Any]], _seed: int) -> str:
                 request = {
                     "model": side,
                     "messages": messages,
                     "max_tokens": max_tokens,
-                    "temperature": 0.0,
-                    "seed": seed,
                 }
                 data = (await post(side, url, request)).json()
                 try:

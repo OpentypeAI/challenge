@@ -133,19 +133,18 @@ def test_pages_to_completion_and_replays_to_the_oracle():
             assert set(exact["answers"]) == set(case["body"]["questions"])
     # the chat requests are exactly §7's shape
     for request in inference.chats:
-        assert set(request) == {"model", "messages", "max_tokens", "temperature", "seed"}
-        assert request["temperature"] == 0.0 and request["model"] in URLS
+        assert set(request) == {"model", "messages", "max_tokens"}
+        assert request["model"] in URLS
         assert request["messages"][0]["content"].startswith("OpenType harness: ")
 
 
-def test_seeds_follow_the_body_seed_per_turn():
+def test_diffusion_chat_omits_unsupported_sampling_parameters():
     case = served_cases()[2]
     assert case["track"] == "ops"
     inference = FakeInference({"champion": "exact", "challenger": "exact"})
     asyncio.run(run_read(FakeApi([case]), inference, 1))
-    seeds = sorted({r["seed"] for r in inference.chats})
-    turns = len(seeds)
-    assert seeds == [case["body"]["seed"] + t for t in range(turns)]
+    assert inference.chats
+    assert all("seed" not in r and "temperature" not in r for r in inference.chats)
     assert all(r["max_tokens"] == case["body"]["limits"]["max_tokens"] for r in inference.chats)
 
 
