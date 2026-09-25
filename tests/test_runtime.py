@@ -196,6 +196,10 @@ def test_candidate_failures_on_healthy_infrastructure_reject():
     for block in slow["blocks"]:
         block["runs"]["C"]["short"]["p95_ms"] = 900.0
     assert "latency" in runtime.verdict(CAL, slow, GOODS, GOODS, CASES)["reason"]
+    minority = evidence_of()  # two slow blocks of five: a median would pass them
+    for block in minority["blocks"][:2]:
+        block["runs"]["C"]["short"]["p95_ms"] = 900.0
+    assert "latency" in runtime.verdict(CAL, minority, GOODS, GOODS, CASES)["reason"]
     worse = Fidelity(loss=12.0, decisions=100, determined=80, correct=78, cases=4)
     wrong = Fidelity(loss=10.0, decisions=100, determined=80, correct=70, cases=4)
     for track in GOODS:  # every measured track is guarded, not only decisions
@@ -1265,6 +1269,7 @@ def _one_cell(**over: Any) -> dict[str, Any]:
         {"bootstrap_resamples": runtime.MAX_RESAMPLES + 1},
         {"cells": _one_cell(cases=runtime.MAX_CELL_CASES + 1)},
         {"cells": _one_cell(concurrency=runtime.MAX_CONCURRENCY + 1)},
+        {"cells": {"x" * (runtime.MAX_CELL_NAME + 1): _one_cell()["a"]}},
     ],
 )
 def test_calibration_workload_is_bounded(over):

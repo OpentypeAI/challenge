@@ -202,7 +202,7 @@ opentype-challenge miner runtime-submit --api https://<gateway>/challenge/openty
   scores every output against gold; a task counts only if it is right and within its
   cell's latency SLO, divided by wall time. Your gain is the fixed-weight mean over cells of
   `ln(goodput_C / max(goodput_B, goodput_B'))`; the crown needs its 99 % block-bootstrap
-  lower bound above the published margin, no p95 latency regression, and no half-Brier or
+  lower bound above the published margin, no p95 latency regression beyond the tolerance in any block, and no half-Brier or
   accuracy regression against stock vLLM on the same cases, on every measured track. Metrics you declare are ignored.
 - Credit: `g_LCB x credit_per_log_gain` epoch-masses, capped per crown, paid FIFO from the
   runtime budget (0.25 of each epoch). Only gain above the best gain already paid on the

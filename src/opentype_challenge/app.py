@@ -129,7 +129,7 @@ class Timing(Answer):
 
     side: Literal["B", "C", "B2"]  # type: ignore[assignment]
     block: int = Field(ge=0, le=runtime.MAX_BLOCKS)
-    cell: str = Field(max_length=64)
+    cell: str = Field(max_length=runtime.MAX_CELL_NAME)
     ms: float = Field(ge=0, allow_inf_nan=False)
 
 

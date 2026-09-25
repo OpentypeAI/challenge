@@ -35,6 +35,7 @@ MAX_BLOCKS = 999
 MAX_CELL_CASES = 10_000
 MAX_CONCURRENCY = 1024
 MAX_RESAMPLES = 100_000
+MAX_CELL_NAME = 64  # the timings API's cell bound
 CELL_TRACKS = ("decisions", "longctx", "ops", "sql")  # no judge in the runtime lane
 
 # Options checked against vllm/engine/arg_utils.py and vllm/config/scheduler.py at the pinned
@@ -138,7 +139,7 @@ class Calibration:
     blocks: int
     max_drift: float  # |ln(goodput B / goodput B')| above this in any cell: NO_DECISION
     min_gain: float  # the noise margin the 99 % LCB must clear
-    latency_tolerance: float  # candidate p95 <= (1 + this) * min(p95 B, p95 B')
+    latency_tolerance: float  # every block: candidate p95 <= (1 + this) * min(p95 B, p95 B')
     fidelity_loss_tolerance: float  # candidate loss per decision - stock's
     fidelity_accuracy_tolerance: float  # stock accuracy - candidate's
     bootstrap_resamples: int
@@ -169,6 +170,8 @@ class Calibration:
             raise RuntimeError_("cells must be a non-empty object")
         cells = {}
         for name, cell in cells_raw.items():
+            if not isinstance(name, str) or not 0 < len(name) <= MAX_CELL_NAME:
+                raise RuntimeError_(f"cell names must be 1 to {MAX_CELL_NAME} characters")
             if not isinstance(cell, Mapping) or set(cell) != set(Cell.__dataclass_fields__):
                 raise RuntimeError_(
                     f"cell {name}: keys must be {sorted(Cell.__dataclass_fields__)}"
@@ -363,6 +366,7 @@ def verdict(
         "block_gains": gains,
         "gain_mean": sum(gains) / len(gains),
         "latency_ratio_median": {n: _median(v) for n, v in sorted(latency.items())},
+        "latency_ratio_max": {n: max(v) for n, v in sorted(latency.items())},
         # shown, never paid on its own: the same speed-up already drives goodput
         "seconds_per_ok_task": {s: _median(v) for s, v in cost.items()},
         "calibration": cal.version,
@@ -383,7 +387,8 @@ def verdict(
             return _reject(f"{track}: loss regressed against the stock reference", **detail)
         if acc_s - acc_c > cal.fidelity_accuracy_tolerance:
             return _reject(f"{track}: accuracy regressed against the stock reference", **detail)
-    slow = [n for n, v in latency.items() if _median(v) > 1 + cal.latency_tolerance]
+    # every block must hold the guard: a median would let a minority of slow blocks through
+    slow = [n for n, v in latency.items() if max(v) > 1 + cal.latency_tolerance]
     if slow:
         return _reject(f"p95 latency regressed in {slow}", **detail)
     g_lcb = _lcb(gains, cal.bootstrap_resamples, digest(evidence))
