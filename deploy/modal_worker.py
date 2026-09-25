@@ -6,7 +6,7 @@
 Needs a worker image with `--until-empty` (2.1.0 or later on the `stable` channel).
 
 A cron wakes the worker every 10 minutes. It runs duels until the queue is empty and
-exits, so the GPUs are billed only while a duel runs. The work volume keeps the champion's
+exits. Startup and empty-queue checks also incur GPU billing. The work volume keeps the champion's
 weights between runs. OPENTYPE_API (at deploy time) is the master's /challenge/opentype URL.
 """
 

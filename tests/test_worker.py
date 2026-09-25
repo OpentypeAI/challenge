@@ -236,7 +236,7 @@ def test_vllm_command_and_urls():
 def test_until_empty_runs_jobs_until_the_queue_is_empty(monkeypatch, tmp_path):
     from opentype_challenge import cli, pins, worker
 
-    runs = iter([True, RuntimeError("master down"), True, False])
+    runs = iter([True, True, False])
     calls: list[int] = []
 
     async def run_once(self):
@@ -256,7 +256,52 @@ def test_until_empty_runs_jobs_until_the_queue_is_empty(monkeypatch, tmp_path):
     monkeypatch.setattr(worker, "sha256_file", lambda path: pins.STRUCTURED_SERVER_SHA256)
     cli.main(["worker", "--api", "http://x", "--token-file", str(token), "--workdir",
               str(tmp_path), "--until-empty"])  # fmt: skip
-    assert len(calls) == 4  # an outage backs off and retries; the empty queue ends the run
+    assert len(calls) == 3  # the empty queue ends the run
     with pytest.raises(SystemExit):
         cli.main(["worker", "--api", "http://x", "--token-file", str(token), "--workdir",
                   str(tmp_path), "--once", "--until-empty"])  # fmt: skip
+
+@pytest.mark.parametrize("status,expected_calls", [(401, 1), (403, 1), (503, 5)])
+def test_until_empty_api_failure_is_bounded(monkeypatch, tmp_path, status, expected_calls):
+    from opentype_challenge import pins, worker
+
+    calls = []
+
+    def reply(request):
+        calls.append(request)
+        return httpx.Response(status, text="unavailable")
+
+    async def no_sleep(seconds):
+        pass
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(reply)) as client:
+            instance = Worker(Api("http://x", "t", client), tmp_path, VllmLauncher())
+            with pytest.raises(RuntimeError):
+                await instance.run_forever(until_empty=True)
+
+    monkeypatch.setattr(worker.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(worker, "sha256_file", lambda path: pins.STRUCTURED_SERVER_SHA256)
+    asyncio.run(run())
+    assert len(calls) == expected_calls
+
+
+def test_polling_worker_retries_transient_outage(monkeypatch, tmp_path):
+    from opentype_challenge import pins, worker
+
+    runs = iter([worker.ApiUnavailable("master down"), RuntimeError("fatal")])
+    sleeps = []
+
+    async def run_once(self):
+        raise next(runs)
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(worker.Worker, "run_once", run_once)
+    monkeypatch.setattr(worker.asyncio, "sleep", sleep)
+    monkeypatch.setattr(worker, "sha256_file", lambda path: pins.STRUCTURED_SERVER_SHA256)
+    instance = Worker(None, tmp_path, VllmLauncher())  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="fatal"):
+        asyncio.run(instance.run_forever())
+    assert sleeps == [30.0]
