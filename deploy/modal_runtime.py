@@ -2,6 +2,7 @@
 
     modal run deploy/modal_runtime.py::stage          # CPU, network: download + verify, once
     modal run deploy/modal_runtime.py::smoke --moe-backend cutlass --cases 8
+    modal run deploy/modal_runtime.py::kernel_smoke --cases 8 [--control]
 
 `stage` writes the pinned nvidia NVFP4 export plus the base support files into the dedicated
 volume `opentype-nvfp4-snapshot` (never the quality worker's volume), verifies every sha256
@@ -124,6 +125,131 @@ def smoke(moe_backend: str = "cutlass", cases: int = 8, max_model_len: int = 327
             "placements": launcher.placements,
             "cases": rows,
             "ok": sum(r["ok"] for r in rows),
+            "quiescent": launcher.quiescent(),
+        }
+
+    try:
+        result = asyncio.run(go())
+    except Exception:
+        print(json.dumps({"failures": launcher.failures}, indent=2)[-20000:])
+        raise
+    print(json.dumps(result, indent=2))
+    return result
+
+
+# Known-correct RMSNorm for the slot (the same math as vllm.ir.ops.rms_norm: fp32 statistics,
+# weight in the input dtype); CONTROL writes zeros, so a run with it must visibly break.
+RMS_KERNEL = """import triton
+import triton.language as tl
+
+
+@triton.jit
+def rms_norm_kernel(x_ptr, w_ptr, out_ptr, x_row_stride, out_row_stride, n_cols, eps,
+                    BLOCK_SIZE: tl.constexpr):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < n_cols
+    x = tl.load(x_ptr + row * x_row_stride + cols, mask=mask, other=0.0).to(tl.float32)
+    var = tl.sum(x * x, axis=0) / n_cols
+    y = (x * tl.rsqrt(var + eps)).to(out_ptr.dtype.element_ty)
+    w = tl.load(w_ptr + cols, mask=mask, other=0.0)
+    tl.store(out_ptr + row * out_row_stride + cols, y * w, mask=mask)
+"""
+CONTROL_KERNEL = RMS_KERNEL.replace("y * w, mask=mask", "y * w * 0.0, mask=mask")
+
+
+@app.function(
+    image=image,
+    cpu=2,
+    memory=8192,
+    volumes={SNAPSHOT: snapshot.with_mount_options(read_only=True)},
+    timeout=3 * 3600,
+)
+def kernel_smoke(
+    moe_backend: str = "cutlass", cases: int = 8, max_model_len: int = 32768, control: bool = False
+) -> dict:
+    """The kernel slot end to end, no speed claim: build the known-correct kernel in a CPU
+    sandbox, then serve the same cases in distinct fresh B300 sandboxes, one at a time: stock,
+    then with the kernel selected (and, with --control, the zero kernel, which must break the
+    answers: proof the slot runs). Reports per-case outcomes and answer distance from stock."""
+    import asyncio
+    import time
+    from pathlib import Path
+
+    from opentype_challenge import runtime, sandbox
+    from opentype_challenge.worker import Worker
+
+    if moe_backend not in runtime.MOE_BACKENDS or not 1 <= cases <= 16:
+        raise SystemExit(f"--moe-backend one of {runtime.MOE_BACKENDS}, --cases 1..16")
+    model = _directory()
+    if sandbox.weights_identity(model)["weights"] != "modelopt-nvfp4":
+        raise SystemExit("run `stage` first: the snapshot does not verify as NVFP4")
+    backend = sandbox.ModalBackend(app, image, snapshot, Path(SNAPSHOT), timeout=2400)
+    launcher = sandbox.SandboxLauncher(backend, max_model_len=max_model_len, ready_timeout=1800)
+    argv = runtime.serving_argv({**runtime.PROFILE_FIXED, "moe_backend": moe_backend})
+    cell = runtime.Cell("decisions", cases, cases, 60000.0, 1.0, False)
+    work = [runtime.cell_case("kernel-smoke", "short", cell, i) for i in range(cases)]
+    kernels = {"correct": runtime.normalize_kernel({"slot": "rms_norm", "source": RMS_KERNEL})}
+    if control:
+        kernels["control"] = runtime.normalize_kernel(
+            {"slot": "rms_norm", "source": CONTROL_KERNEL}
+        )
+
+    async def serve(kernel: dict | None) -> list[dict]:
+        extra = [*argv, *runtime.kernel_argv(kernel)]
+        async with launcher(
+            {"champion": model}, {"champion": extra}, 0.9, {"champion": kernel}
+        ) as urls:
+            async with launcher.client() as client:
+
+                async def call(url: str, body: dict) -> dict | None:
+                    try:
+                        response = await client.post(url, json=body, timeout=600)
+                        data = response.json() if response.status_code == 200 else None
+                    except Exception:  # noqa: BLE001 - reported per case
+                        return None
+                    return data if isinstance(data, dict) else None
+
+                rows = []
+                for case in work:
+                    item = await Worker._task(call, urls["champion"], case)
+                    rows.append(
+                        {
+                            "ok": runtime.task_ok(case, item),
+                            "error": item.get("error"),
+                            "vectors": runtime.answer_vectors(case, item),
+                        }
+                    )
+                return rows
+
+    async def go() -> dict:
+        arch = 103  # B300 (sm_103), as the profile's compute_cap reports it
+        built = {name: await launcher.build(k, arch) for name, k in kernels.items()}
+        sessions: dict[str, dict] = {}
+        stock: list[dict] = []
+        for name, kernel in [("stock", None), *kernels.items()]:
+            started = time.monotonic()
+            rows = await serve(kernel)
+            stock = rows if name == "stock" else stock
+            sessions[name] = {
+                "seconds": round(time.monotonic() - started, 1),
+                "ok": sum(r["ok"] for r in rows),
+                "errors": sum(bool(r["error"]) for r in rows),
+                "distance_from_stock": round(
+                    sum(
+                        runtime._distance(a["vectors"] or {}, b["vectors"] or {})
+                        for a, b in zip(stock, rows, strict=True)
+                    )
+                    / len(rows),
+                    4,
+                ),
+                "profile": launcher.profile(),
+            }
+        return {
+            "built": built,
+            "kernels": {n: runtime.kernel_ref(k) for n, k in kernels.items()},
+            "sessions": sessions,
+            "placements": launcher.placements,  # distinct sandboxes; the same GPU is not promised
             "quiescent": launcher.quiescent(),
         }
 
