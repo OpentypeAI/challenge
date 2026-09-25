@@ -21,15 +21,25 @@ from typing import Annotated, Any, Literal
 import httpx
 from fastapi import FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    RootModel,
+    StrictBool,
+    StrictInt,
+    ValidationError,
+)
 
-from . import __version__, bank, generator, pins, teacher, tracks
+from . import __version__, bank, generator, pins, runtime, teacher, tracks
 from .crypto import (
     CryptoError,
     decode_hotkey,
     encode_hotkey,
     manifest_digest,
     manifest_problem,
+    runtime_digest,
+    runtime_message,
     submit_message,
     verify,
 )
@@ -74,6 +84,29 @@ class Submission(Strict):
     signature: str = Field(pattern=r"^(0x)?[0-9a-fA-F]{128}$")
 
 
+class RuntimeTarget(Strict):
+    champion: int = Field(ge=1)
+    digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class RuntimeSubmission(Strict):
+    """Only allowlisted vLLM options: no argv, env, image, plugin, reader or kernel."""
+
+    target: RuntimeTarget
+    profile: str = Field(pattern=r"^[0-9a-f]{64}$")
+    options: dict[str, StrictBool | StrictInt] = Field(
+        min_length=1, max_length=len(runtime.OPTIONS)
+    )
+    hotkey: str = Field(max_length=66)
+    nonce: str = Field(pattern=r"^[0-9a-f]{32}$")
+    exp: int
+    signature: str = Field(pattern=r"^(0x)?[0-9a-fA-F]{128}$")
+
+
+class LanesFrom(Strict):
+    epoch: int = Field(ge=0, lt=2**64)
+
+
 class Answer(Strict):
     """A read item (answers, reads), a harness item (transcript) or a failure (error)."""
 
@@ -89,6 +122,19 @@ class Answer(Strict):
 
 class Lease(Strict):
     lease: str = Field(max_length=64)
+
+
+class Timing(Answer):
+    """One timed runtime task: the raw output (scored by the container) and its latency."""
+
+    side: Literal["B", "C", "B2"]  # type: ignore[assignment]
+    block: int = Field(ge=0, le=runtime.MAX_BLOCKS)
+    cell: str = Field(max_length=runtime.MAX_CELL_NAME)
+    ms: float = Field(ge=0, allow_inf_nan=False)
+
+
+class Timings(Lease):
+    items: list[Timing] = Field(min_length=1, max_length=2000)
 
 
 class Answers(Lease):
@@ -498,6 +544,38 @@ def create_app(
         )
         return result
 
+    @app.post("/v1/runtime/submissions", status_code=201)
+    async def submit_runtime(request: Request) -> dict[str, Any]:
+        item: RuntimeSubmission = await body(request, SUBMIT_BODY_MAX, RuntimeSubmission)
+        try:
+            options = runtime.normalize_options(item.options)
+        except runtime.RuntimeError_ as error:
+            raise StoreError(422, str(error)) from None
+        now = int(clock())
+        if not now < item.exp <= now + MAX_EXP_SECONDS:
+            raise StoreError(400, f"exp must be in the future and within {MAX_EXP_SECONDS} s")
+        try:
+            public = decode_hotkey(item.hotkey)
+        except CryptoError:
+            raise StoreError(400, "invalid hotkey") from None
+        target = item.target.model_dump()
+        digest = runtime_digest(config.slug, target, item.profile, options)
+        signature = bytes.fromhex(item.signature.removeprefix("0x"))
+        if not verify(public, runtime_message(public, digest, item.nonce, item.exp), signature):
+            raise StoreError(401, "signature verification failed")
+        ss58 = encode_hotkey(public)
+        if ss58 not in await metagraph.hotkeys():
+            raise StoreError(403, "the hotkey is not registered on the subnet")
+        result: dict[str, Any] = await run(
+            store.submit_runtime, ss58, target, item.profile, options, digest, item.nonce, item.exp
+        )
+        return result
+
+    @app.get("/v1/runtime")
+    async def runtime_view() -> dict[str, Any]:
+        result: dict[str, Any] = await run(store.runtime_status)
+        return result
+
     @app.get("/v1/submissions/{submission_id}")
     async def submission(submission_id: str) -> dict[str, Any]:
         result: dict[str, Any] = await run(store.submission, submission_id)
@@ -509,9 +587,13 @@ def create_app(
         _require(config.worker_token_file, authorization)
 
     @app.post("/v1/worker/lease")
-    async def lease(authorization: Annotated[str | None, Header()] = None) -> Response:
+    async def lease(
+        lane: Annotated[Literal["quality", "runtime"], Query()] = "quality",
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> Response:
+        """Workers ask for their lane; a worker that does not ask gets quality jobs only."""
         worker(authorization)
-        job = await run(store.lease)
+        job = await run(store.lease, lane)
         if job is None:
             return Response(status_code=204)
         return JSONResponse(job)
@@ -548,6 +630,16 @@ def create_app(
         item: Answers = await body(request, WORKER_BODY_MAX, Answers)
         rows = [a.model_dump() for a in item.items]
         result: dict[str, Any] = await run(store.record_answers, job_id, item.lease, rows)
+        return result
+
+    @app.post("/v1/worker/jobs/{job_id}/timings")
+    async def timings(
+        job_id: str, request: Request, authorization: Annotated[str | None, Header()] = None
+    ) -> dict[str, Any]:
+        worker(authorization)
+        item: Timings = await body(request, WORKER_BODY_MAX, Timings)
+        rows = [t.model_dump() for t in item.items]
+        result: dict[str, Any] = await run(store.record_timings, job_id, item.lease, rows)
         return result
 
     @app.post("/v1/worker/jobs/{job_id}/complete")
@@ -609,6 +701,28 @@ def create_app(
         item: Pause = await body(request, SUBMIT_BODY_MAX, Pause)
         await run(store.set_crowns_paused, item.paused)
         return {"crowns_paused": item.paused}
+
+    @app.put("/v1/admin/runtime/calibration")
+    async def calibration(
+        request: Request, authorization: Annotated[str | None, Header()] = None
+    ) -> dict[str, Any]:
+        """The operator's pilot result; null withdraws it and closes the runtime lane."""
+        admin(authorization)
+        raw: RootModel[Any] = await body(request, SUBMIT_BODY_MAX, RootModel[Any])
+        try:
+            published = await run(store.set_calibration, raw.root)
+        except runtime.RuntimeError_ as error:
+            raise StoreError(422, str(error)) from None
+        return {"calibration": published}
+
+    @app.put("/v1/admin/lanes")
+    async def lanes(
+        request: Request, authorization: Annotated[str | None, Header()] = None
+    ) -> dict[str, Any]:
+        """Schedule the 75/25 split from a future epoch (once, never retroactive)."""
+        admin(authorization)
+        item: LanesFrom = await body(request, SUBMIT_BODY_MAX, LanesFrom)
+        return {"lanes_from_epoch": await run(store.set_lanes_from, item.epoch)}
 
     @app.post("/v1/admin/jobs/{job_id}/requeue")
     async def requeue(

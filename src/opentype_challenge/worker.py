@@ -21,7 +21,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,9 +29,10 @@ from typing import Any, Protocol
 
 import httpx
 
-from . import __version__, harness, pins, tracks
+from . import __version__, harness, pins, runtime, tracks
 from .bank import case_line
 from .crypto import manifest_problem
+from .generator import Case
 
 SIDES = ("champion", "challenger")
 BATCH_BYTES = 900 * 1024
@@ -49,6 +50,9 @@ MAX_MODEL_LEN = 131072  # longctx level 5 (~100k tokens) fits with headroom
 STRUCTURED_SERVER = Path(
     os.environ.get("OPENTYPE_STRUCTURED_SERVER", "/opt/opentype/structured_server.py")
 )
+# Written by the Dockerfile's worker stage from its VLLM_IMAGE build argument. Self-reported
+# by an operator-owned worker, not an attestation (docs/operator.md, runtime lane).
+BUILD_MANIFEST = Path("/opt/opentype/build.json")
 
 
 class JobFailed(Exception):
@@ -57,6 +61,14 @@ class JobFailed(Exception):
     def __init__(self, reason: str, retry: bool):
         super().__init__(reason)
         self.reason, self.retry = reason, retry
+
+
+class ServeFailed(JobFailed):
+    """A server of one side never became healthy."""
+
+    def __init__(self, reason: str, side: str):
+        super().__init__(reason, retry=True)
+        self.side = side
 
 
 def sha256_file(path: Path) -> str:
@@ -149,13 +161,25 @@ Urls = Mapping[str, Mapping[str, str]]  # {side: {"reader": url, "chat": url}}
 
 class Launcher(Protocol):
     def __call__(
-        self, models: Mapping[str, Path]
+        self,
+        models: Mapping[str, Path],
+        extra: Mapping[str, Sequence[str]] | None = None,
+        share: float | None = None,
     ) -> AbstractAsyncContextManager[dict[str, dict[str, str]]]:
-        """Serve each side's model; yield {side: {"reader": systemone URL, "chat": vllm URL}}."""
+        """Serve each side's model; yield {side: {"reader": systemone URL, "chat": vllm URL}}.
+        extra: allowlisted vllm flags per side; share: GPU memory share of each server."""
         ...
 
     def evidence(self) -> dict[str, Any]:
         """What serves the reads: versions and file digests."""
+        ...
+
+    def profile(self) -> dict[str, Any]:
+        """The serving profile a runtime measurement runs under, gpu and driver included."""
+        ...
+
+    def quiescent(self) -> bool:
+        """Every serving process is gone and no process holds the GPU."""
         ...
 
 
@@ -170,6 +194,8 @@ class VllmLauncher:
     log_dir: Path = field(default_factory=lambda: Path("/tmp"))  # noqa: S108
     vllm: tuple[str, ...] = ("vllm",)
     reader: Path = STRUCTURED_SERVER
+    dtype: str = "bfloat16"
+    _live: list[subprocess.Popen[bytes]] = field(default_factory=list, repr=False)
 
     def evidence(self) -> dict[str, Any]:
         return {
@@ -180,12 +206,44 @@ class VllmLauncher:
             "max_model_len": self.max_model_len,
         }
 
+    def profile(self) -> dict[str, Any]:
+        """What this host actually runs: the image named by the baked build manifest, the
+        installed vllm, the reader's hash, the launcher's own flags and the GPU. Refuses the
+        job (infrastructure) when any of it cannot be read."""
+        gpu, driver = _gpu_identity()
+        try:
+            image = json.loads(BUILD_MANIFEST.read_text())["vllm_image"]
+        except (OSError, ValueError, KeyError, TypeError):
+            image = None
+        profile = {
+            "vllm_image": image,
+            "vllm_version": _package_version("vllm"),
+            "structured_server_sha256": sha256_file(self.reader) if self.reader.exists() else None,
+            "base": f"{pins.BASE_REPO}@{pins.BASE_REVISION}",
+            "dtype": self.dtype,
+            "canvas": self.canvas,
+            "max_model_len": self.max_model_len,
+            "gpu_memory_utilization": runtime.PROFILE_FIXED["gpu_memory_utilization"],
+            "gpu": gpu,
+            "driver": driver,
+        }
+        missing = sorted(k for k, v in profile.items() if not v)
+        if missing:
+            raise JobFailed(f"cannot read this worker's serving profile: {missing}", retry=True)
+        return profile
+
+    def quiescent(self) -> bool:
+        return not self._live and _gpu_idle()
+
     def ports(self, side: str) -> tuple[int, int]:
         """(vllm port, structured server port) of one side."""
         offset = SIDES.index(side)
         return self.port_base + offset, self.port_base + 10 + offset
 
-    def commands(self, side: str, model: Path) -> list[list[str]]:
+    def commands(
+        self, side: str, model: Path, extra: Sequence[str] = (), share: float | None = None
+    ) -> list[list[str]]:
+        """extra: allowlisted flags from runtime.options_argv, after the fixed ones."""
         vllm_port, reader_port = self.ports(side)
         return [
             [
@@ -199,9 +257,9 @@ class VllmLauncher:
                 "--host",
                 "127.0.0.1",
                 "--dtype",
-                "bfloat16",
+                self.dtype,
                 "--gpu-memory-utilization",
-                str(self.memory_share),
+                str(self.memory_share if share is None else share),
                 "--diffusion-config",
                 json.dumps({"canvas_length": self.canvas}),
                 "--max-logprobs",
@@ -211,6 +269,7 @@ class VllmLauncher:
                 str(self.max_model_len),
                 "--limit-mm-per-prompt",
                 json.dumps({"image": 1}),
+                *extra,
             ],
             [
                 sys.executable,
@@ -232,19 +291,30 @@ class VllmLauncher:
 
     @asynccontextmanager
     async def __call__(
-        self, models: Mapping[str, Path]
+        self,
+        models: Mapping[str, Path],
+        extra: Mapping[str, Sequence[str]] | None = None,
+        share: float | None = None,
     ) -> AsyncIterator[dict[str, dict[str, str]]]:
         processes: list[subprocess.Popen[bytes]] = []
-        env = {**os.environ, "HF_HUB_OFFLINE": "1"}
+        env = {**scrubbed_env(), "HF_HUB_OFFLINE": "1"}
+        self._live = processes
         try:
             async with httpx.AsyncClient() as client:
                 for side, model in models.items():
-                    serve, reader = self.commands(side, model)
+                    serve, reader = self.commands(side, model, (extra or {}).get(side, ()), share)
                     vllm_port, reader_port = self.ports(side)
-                    processes.append(self._spawn(serve, env, f"vllm-{side}"))
-                    await _wait_health(client, f"http://127.0.0.1:{vllm_port}/health", processes)
-                    processes.append(self._spawn(reader, env, f"reader-{side}"))
-                    await _wait_health(client, f"http://127.0.0.1:{reader_port}/health", processes)
+                    try:
+                        processes.append(self._spawn(serve, env, f"vllm-{side}"))
+                        await _wait_health(
+                            client, f"http://127.0.0.1:{vllm_port}/health", processes
+                        )
+                        processes.append(self._spawn(reader, env, f"reader-{side}"))
+                        await _wait_health(
+                            client, f"http://127.0.0.1:{reader_port}/health", processes
+                        )
+                    except JobFailed as error:
+                        raise ServeFailed(error.reason, side) from None
             yield {
                 side: {
                     "reader": f"http://127.0.0.1:{self.ports(side)[1]}",
@@ -262,12 +332,53 @@ class VllmLauncher:
                 except subprocess.TimeoutExpired:
                     with contextlib.suppress(ProcessLookupError):
                         os.killpg(process.pid, signal.SIGKILL)
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        process.wait(timeout=30)
+            # quiescent() reports a process that outlived SIGKILL
+            self._live = [p for p in processes if p.poll() is None]
 
     def _spawn(self, command: list[str], env: dict[str, str], name: str) -> subprocess.Popen[bytes]:
         log = (self.log_dir / f"{name}.log").open("wb")
         return subprocess.Popen(  # noqa: S603 - fixed argv, no shell
             command, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
         )
+
+
+SECRET_WORDS = ("TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL", "AUTH")
+
+
+def scrubbed_env() -> dict[str, str]:
+    """The worker's environment without anything that looks like a credential."""
+    return {k: v for k, v in os.environ.items() if not any(w in k.upper() for w in SECRET_WORDS)}
+
+
+def _nvidia_smi(*query: str) -> list[str] | None:
+    try:
+        out = subprocess.run(  # noqa: S603 - fixed argv
+            ["nvidia-smi", *query, "--format=csv,noheader"],  # noqa: S607
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _gpu_identity() -> tuple[str, str]:
+    rows = _nvidia_smi("--query-gpu=name,driver_version")
+    if not rows:
+        return "", ""  # unreadable: profile() refuses the job
+    names = {row.rsplit(",", 1)[0].strip() for row in rows}
+    drivers = {row.rsplit(",", 1)[-1].strip() for row in rows}
+    return ",".join(sorted(names)), ",".join(sorted(drivers))
+
+
+def _gpu_idle() -> bool:
+    """No compute process on any visible GPU; unknown (no nvidia-smi) is not idle."""
+    rows = _nvidia_smi("--query-compute-apps=pid")
+    return rows is not None and not rows
 
 
 async def _wait_health(
@@ -344,10 +455,12 @@ class Worker:
     fetch: Fetch = hf_fetch
     concurrency: int = CONCURRENCY
     inference: httpx.AsyncClient | None = None
+    lane: str = "quality"
 
     async def run_once(self) -> bool:
         """Lease and run one job. False when the queue is empty."""
-        response = await self.api.call("POST", "/v1/worker/lease")
+        params = {"lane": self.lane} if self.lane != "quality" else None
+        response = await self.api.call("POST", "/v1/worker/lease", params=params)
         if response.status_code == 204:
             return False
         job = response.json()
@@ -361,7 +474,10 @@ class Worker:
         job_dir = self.workdir / job["job"]
         beat = asyncio.create_task(self._heartbeat(job))
         try:
-            evidence.update(await self._duel(job, job_dir, evidence))
+            if job.get("lane", "quality") != self.lane:
+                raise JobFailed(f"leased a {job.get('lane')} job on a {self.lane} worker", True)
+            run = self._bench if self.lane == "runtime" else self._duel
+            evidence.update(await run(job, job_dir, evidence))
             evidence["seconds"] = round(time.time() - started, 1)
             await self.api.call(
                 "POST",
@@ -415,6 +531,183 @@ class Worker:
             timings["read_seconds"] = round(time.time() - t1, 1)
         return {"timings": timings, **counts}
 
+    async def _bench(self, job: dict[str, Any], job_dir: Path, evidence: dict[str, Any]) -> dict:
+        """A runtime job on the champion's weights: fidelity reads of stock vs candidate, then
+        calibration.blocks blocks of B / C / B' measured one server at a time, with a
+        quiescence check before and after each. Only allowlisted flags reach vllm. The stock
+        or incumbent server always starts first: if it fails the host is at fault (retry);
+        if only the candidate then fails to start, its options are (reject)."""
+        spec = job["runtime"]
+        cal = runtime.Calibration.from_json(spec["calibration"])
+        flags = {
+            "B": runtime.options_argv(spec["incumbent"]),
+            "C": runtime.options_argv(spec["candidate"]),
+        }
+        profile = self.launcher.profile()
+        if profile != cal.profile:
+            raise JobFailed("this worker does not match the calibrated profile", retry=True)
+        base = await asyncio.to_thread(base_snapshot, self.workdir / "base", self.fetch)
+        try:
+            model, evidence["champion_files"] = await asyncio.to_thread(
+                self._champion, job["champion"], base
+            )
+        except JobFailed as error:
+            raise JobFailed(f"champion: {error.reason}", retry=True) from None
+        share = float(cal.profile["gpu_memory_utilization"])
+        # fidelity: stock ("champion", pristine flags, independent of B) then candidate
+        # ("challenger"), each alone on the GPU at the calibrated share, like the timing
+        self._require_quiescent("before stock fidelity")
+        async with self.launcher({"champion": model}, {"champion": []}, share=share) as urls:
+            counts = await self._read(job, urls, ("champion",))
+        self._require_quiescent("before candidate fidelity")
+        try:
+            async with self.launcher(
+                {"challenger": model}, {"challenger": flags["C"]}, share=share
+            ) as urls:
+                candidate = await self._read(job, urls, ("challenger",))
+        except ServeFailed as error:
+            # stock served healthily alone on this GPU just before
+            raise _candidate_fault(error, "challenger") from None
+        counts["errors"] += candidate["errors"]
+        blocks = []
+        for number in range(cal.blocks):
+            seconds, quiescent = {}, []
+            for side in runtime.SIDES:
+                self._require_quiescent(f"before {side}")
+                try:
+                    async with self.launcher(
+                        {"champion": model},
+                        {"champion": flags["C" if side == "C" else "B"]},
+                        share=share,
+                    ) as urls:
+                        seconds[side], tasks = await self._measure(job, cal, urls["champion"])
+                except ServeFailed as error:
+                    # C's server runs as "champion"; B served healthily just before it
+                    raise _candidate_fault(error, "champion" if side == "C" else None) from None
+                await self._post_timings(job, number, side, tasks)
+                quiescent.append(self.launcher.quiescent())
+                if not quiescent[-1]:
+                    break
+            blocks.append(
+                {"order": list(runtime.SIDES), "seconds": seconds, "quiescent": quiescent}
+            )
+            if not all(quiescent):
+                break  # reported as is: the verdict is NO_DECISION
+        return {**counts, "runtime": {"profile": profile, "blocks": blocks}}
+
+    async def _post_timings(
+        self, job: dict[str, Any], block: int, side: str, tasks: list[dict[str, Any]]
+    ) -> None:
+        """Raw outputs and latencies; the container scores them, the worker never does."""
+        items = [{**t, "block": block, "side": side} for t in tasks]
+        for batch in _batches(items):
+            await self.api.call(
+                "POST",
+                f"/v1/worker/jobs/{job['job']}/timings",
+                json={"lease": job["lease"], "items": batch},
+            )
+
+    def _require_quiescent(self, when: str) -> None:
+        if not self.launcher.quiescent():
+            raise JobFailed(f"the GPU is not quiescent {when}", retry=True)
+
+    async def _measure(
+        self, job: dict[str, Any], cal: runtime.Calibration, urls: Mapping[str, str]
+    ) -> tuple[dict[str, float], list[dict[str, Any]]]:
+        """Monotonic seconds per cell and every timed task's raw output and latency (ms from
+        the worker's clock); cold cells first, a warm cell after one untimed pass."""
+        client = self.inference or httpx.AsyncClient()
+        seconds: dict[str, float] = {}
+        tasks: list[dict[str, Any]] = []
+        try:
+            for name, cell in sorted(cal.cells.items(), key=lambda item: item[1].warm):
+                cases = [
+                    runtime.cell_case(job["runtime"]["seed"], name, cell, i)
+                    for i in range(cell.cases)
+                ]
+                if cell.warm:
+                    await self._timed(client, urls, cases, cell.concurrency)
+                start = time.monotonic()
+                results = await self._timed(client, urls, cases, cell.concurrency)
+                seconds[name] = time.monotonic() - start
+                tasks += [
+                    {"cell": name, "case_index": i, "ms": ms, **item}
+                    for i, (ms, item) in enumerate(results)
+                ]
+        finally:
+            if self.inference is None:
+                await client.aclose()
+        return seconds, tasks
+
+    async def _timed(
+        self,
+        client: httpx.AsyncClient,
+        urls: Mapping[str, str],
+        cases: Sequence[Case],
+        concurrency: int,
+    ) -> list[tuple[float, dict[str, Any]]]:
+        """(latency ms, output item) per task; the latency counts from the moment the task
+        may run, so the server's own queueing is included. A harness task is a whole
+        episode."""
+        limit = asyncio.Semaphore(concurrency)
+
+        async def call(url: str, body: Mapping[str, Any]) -> dict[str, Any] | None:
+            try:
+                response = await client.post(url, json=body, timeout=READ_TIMEOUT)
+                data = response.json() if response.status_code == 200 else None
+            except (httpx.HTTPError, ValueError):
+                return None
+            return data if isinstance(data, dict) else None
+
+        async def task(case: Case) -> tuple[float, dict[str, Any]]:
+            async with limit:
+                start = time.monotonic()
+                item = await self._task(call, urls, case)
+                return (time.monotonic() - start) * 1000, item
+
+        return list(await asyncio.gather(*(task(case) for case in cases)))
+
+    @staticmethod
+    async def _task(
+        call: Callable[[str, Mapping[str, Any]], Awaitable[dict[str, Any] | None]],
+        urls: Mapping[str, str],
+        case: Case,
+    ) -> dict[str, Any]:
+        """The raw output item, as a duel reports it; never a verdict on it."""
+        body = case.body
+        if case.track not in tracks.ENVS:
+            data = await call(urls["reader"] + "/v1/systemone", body)
+            if data is None:
+                return {"error": "the reader failed"}
+            answers = data.get("answers")
+            return {
+                "answers": {q: slim(a) for q, a in answers.items()}
+                if isinstance(answers, dict)
+                else {},
+                "reads": reads_of(data),
+            }
+        failed = False
+
+        async def generate(messages: list[dict[str, Any]], _seed: int) -> str:
+            nonlocal failed
+            request = {
+                "model": "champion",
+                "messages": messages,
+                "max_tokens": int(body["limits"]["max_tokens"]),
+            }
+            data = await call(urls["chat"] + "/v1/chat/completions", request)
+            try:
+                content = data["choices"][0]["message"]["content"] if data else None
+            except (KeyError, IndexError, TypeError):
+                content = None
+            if not isinstance(content, str):
+                failed = True
+                return ""
+            return content
+
+        transcript = await harness.run_episode(tracks.ENVS[case.track], body, generate)
+        return {"error": "the chat server failed"} if failed else {"transcript": transcript}
+
     def _champion(self, manifest: Mapping[str, Any], base: Path) -> tuple[Path, dict[str, str]]:
         """The champion's verified weights, kept across jobs by manifest digest (it is public
         and duels every challenger); challenger weights are deleted after each job."""
@@ -429,8 +722,15 @@ class Worker:
         record.write_text(json.dumps(resolved, sort_keys=True))
         return directory, resolved
 
-    async def _read(self, job: dict[str, Any], urls: Urls) -> dict[str, Any]:
-        """Page through every case, run both sides and post the answer items in batches."""
+    async def _read(
+        self,
+        job: dict[str, Any],
+        urls: Urls,
+        sides: Sequence[str] = SIDES,
+    ) -> dict[str, Any]:
+        """Page through every case, run `sides` and post the answer items in batches. The
+        container stores each side's results on their own, so sides may come in separate
+        passes (the runtime fidelity serves one side at a time)."""
         client = self.inference or httpx.AsyncClient()
         limit = asyncio.Semaphore(self.concurrency)
         cases_hash = hashlib.sha256()
@@ -504,7 +804,7 @@ class Worker:
                     cases_hash.update(case_line(case["body"]))
                 fetched += len(cases)
                 offset += len(cases)
-                items = await asyncio.gather(*(run(side, c) for c in cases for side in SIDES))
+                items = await asyncio.gather(*(run(side, c) for c in cases for side in sides))
                 errors += sum("error" in item for item in items)
                 for batch in _batches(items):
                     result = (
@@ -537,6 +837,14 @@ class Worker:
                 if until_empty:
                     return
                 await asyncio.sleep(idle)
+
+
+def _candidate_fault(error: ServeFailed, candidate: str | None) -> JobFailed:
+    """The candidate's server failing to start after a reference server was healthy on the
+    same GPU is the candidate's fault; any other start failure is the host's (retry)."""
+    if candidate is not None and error.side == candidate:
+        return JobFailed(f"the candidate options failed to serve: {error.reason}", retry=False)
+    return error
 
 
 def _batches(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:

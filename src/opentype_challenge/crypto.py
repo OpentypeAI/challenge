@@ -92,6 +92,29 @@ def submit_message(public: bytes, digest: str, nonce: str, exp: int) -> bytes:
     return f"{SUBMIT_DOMAIN}|{public.hex()}|{digest}|{nonce}|{exp}".encode()
 
 
+RUNTIME_DOMAIN = "opentype-runtime-v1"
+
+
+def runtime_digest(
+    slug: str, target: Mapping[str, object], profile_digest: str, options: Mapping[str, object]
+) -> str:
+    """What a runtime submission signs: challenge, lane, target model, profile and options."""
+    body = {
+        "challenge": slug,
+        "lane": "runtime",
+        "options": dict(sorted(options.items())),
+        "profile": profile_digest,
+        "target": dict(sorted(target.items())),
+    }
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def runtime_message(public: bytes, digest: str, nonce: str, exp: int) -> bytes:
+    """A distinct domain, so a weights signature never verifies as a runtime one."""
+    return f"{RUNTIME_DOMAIN}|{public.hex()}|{digest}|{nonce}|{exp}".encode()
+
+
 def sign_with_seed(seed: bytes, message: bytes) -> tuple[bytes, bytes]:
     """(public key, signature) with the Substrate sr25519 signing context."""
     if len(seed) != 32:

@@ -267,3 +267,47 @@ Body `{"lease", "reason", "retry": true, "evidence": {...}}`. `retry: true` re-q
 | `PUT /v1/admin/ladder` | `{"order": [levels], "width": n}` | `{"order", "width", "retired"}`; `400` on unknown or duplicate levels, or a bad width |
 | `PUT /v1/admin/crowns` | `{"paused": bool}` | `{"crowns_paused"}` |
 | `POST /v1/admin/jobs/{job}/requeue` | none | the submission with a fresh queued job; `409` for a crowned job |
+| `PUT /v1/admin/runtime/calibration` | the calibration object, or `null` | `{"calibration"}` (its public form); `422` on any missing, extra or out-of-range key, or a profile that differs from the pinned serving profile. `null` closes the runtime lane |
+| `PUT /v1/admin/lanes` | `{"epoch": n}` | `{"lanes_from_epoch"}`; the 75/25 split pays from epoch `n` on. Once only; `409` when `n` is not past every persisted epoch |
+
+## Runtime lane
+
+### `GET /v1/runtime`
+
+`{"open", "lanes_from_epoch", "budgets", "options", "kernels", "calibration", "target",
+"incumbent", "queue", "crowns"}`. `target` is `{"champion", "digest"}` of the current quality
+champion; `calibration.profile_digest` is what a submission signs. `kernels` says why miner
+kernels are disabled.
+
+### `POST /v1/runtime/submissions`
+
+```json
+{"target": {"champion": 3, "digest": "<64 hex>"}, "profile": "<64 hex>",
+ "options": {"max_num_seqs": 128}, "hotkey": "<ss58>", "nonce": "<32 hex>", "exp": 1790000200,
+ "signature": "<128 hex>"}
+```
+
+The signature is sr25519 over `opentype-runtime-v1|<pubkey hex>|<digest>|<nonce>|<exp>`,
+where `digest` is the sha256 of the canonical JSON
+`{"challenge", "lane": "runtime", "options", "profile", "target"}`. A weights signature never
+verifies here. `options` holds only allowlisted keys (`GET /v1/runtime`); unknown keys and
+any other field are `422`. `503` while the lane is closed; `409` for a stale target or
+profile, a reused nonce, the incumbent's own options, or a second open runtime submission of
+the hotkey (its quality slot is separate). `201` returns the submission.
+
+### Worker
+
+`POST /v1/worker/lease?lane=runtime` leases runtime jobs; without `lane` a worker gets quality
+jobs only. A runtime lease is never handed out while any job is leased, and nothing is leased
+while a runtime job is. Its body has `"lane": "runtime"`, `"challenger": null` and
+`"runtime": {"calibration", "incumbent", "candidate", "seed"}`. Its cases are fidelity reads
+(`champion` = stock, `challenger` = candidate, posted in two one-side passes) on every track a calibrated cell measures
+(decisions always). Timed tasks go to `POST /v1/worker/jobs/<id>/timings`
+`{"lease", "items": [{"block", "side": "B"|"C"|"B2", "cell", "case_index", "ms",
+"answers"?, "reads"?, "transcript"?, "error"?}]}`: raw outputs only (an `ok` field is
+`422`); the container rebuilds the case from the seed, scores it against gold and returns
+`{"accepted", "ok"}`. `complete` carries
+`evidence.runtime = {"profile", "blocks": [{"order": ["B","C","B2"], "seconds": {side:
+{cell: s}}, "quiescent"}]}`. A runtime job whose signed target is no longer the champion is
+expired, never requeued. While a runtime job waits, a quality lease can be `204` so the GPU
+drains (bounded, see operator.md §8).

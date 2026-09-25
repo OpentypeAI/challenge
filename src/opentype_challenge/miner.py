@@ -13,11 +13,14 @@ from typing import Any
 
 import httpx
 
+from . import runtime
 from .crypto import (
     allowed_file,
     encode_hotkey,
     manifest_digest,
     manifest_problem,
+    runtime_digest,
+    runtime_message,
     sign_with_seed,
     submit_message,
 )
@@ -89,6 +92,48 @@ def signed_submission(
         "exp": exp,
         "signature": signature.hex(),
     }
+
+
+def signed_runtime_submission(
+    slug: str,
+    target: dict[str, Any],
+    profile: str,
+    options: dict[str, Any],
+    signer: Signer,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """A runtime submission: allowlisted vLLM options for the current champion's weights on
+    the calibrated profile (both read from GET /v1/runtime)."""
+    options = runtime.normalize_options(options)
+    digest = runtime_digest(slug, target, profile, options)
+    nonce = secrets.token_hex(16)
+    exp = int(now if now is not None else time.time()) + EXP_SECONDS
+    signature = signer.sign(runtime_message(signer.public, digest, nonce, exp))
+    return {
+        "target": target,
+        "profile": profile,
+        "options": options,
+        "hotkey": encode_hotkey(signer.public),
+        "nonce": nonce,
+        "exp": exp,
+        "signature": signature.hex(),
+    }
+
+
+def runtime_state(api: str) -> dict[str, Any]:
+    response = httpx.get(api.rstrip("/") + "/v1/runtime", timeout=30)
+    if response.status_code != 200:
+        raise SystemExit(f"{response.status_code} {response.text}")
+    result: dict[str, Any] = response.json()
+    return result
+
+
+def post_runtime(api: str, body: dict[str, Any]) -> dict[str, Any]:
+    response = httpx.post(api.rstrip("/") + "/v1/runtime/submissions", json=body, timeout=60)
+    if response.status_code != 201:
+        raise SystemExit(f"runtime submission refused: {response.status_code} {response.text}")
+    result: dict[str, Any] = response.json()
+    return result
 
 
 def post(api: str, body: dict[str, Any]) -> dict[str, Any]:

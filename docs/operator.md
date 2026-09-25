@@ -98,8 +98,9 @@ volume.
 
 State is a single SQLite database, `/data/opentype.sqlite3` (WAL). It holds windows with
 their secrets and banks, the next bank, submissions, jobs, results, pending judgments (with
-PNGs), champions, the ledger and every persisted epoch body. A v1 database is migrated in
-place at startup. Take a backup before you upgrade from 1.x. Back it up with SQLite's online backup API (for example
+PNGs), champions, the ledger and every persisted epoch body. A v1 or v2 database is migrated
+in place at startup. Take a backup before you upgrade. Rolling back to a binary older than
+the runtime lane is not supported on a migrated file: restore the backup instead. Back it up with SQLite's online backup API (for example
 `sqlite3.connect(src).backup(dst)`), never with a plain file copy while the container runs.
 
 Burn-in: run with the id registered but absent from the trust root, check
@@ -218,6 +219,8 @@ opentype-challenge audit --api https://<cortex-master>/challenge/opentype \
 | pause or resume crowns (anchors regress, or an incident) | `PUT /v1/admin/crowns {"paused": true}`. Scored winners wait. Resuming settles them in intake order |
 | change the ladder | `PUT /v1/admin/ladder {"order": [3,4,5,6,7,8], "width": 2}` |
 | re-run a job (worker incident, suspect evidence) | `POST /v1/admin/jobs/<job>/requeue`. Its results are discarded and a fresh job is queued. A crowned job cannot be re-queued |
+| schedule the 75/25 split | `PUT /v1/admin/lanes {"epoch": n}`, once, past every persisted epoch. See §8 |
+| publish or withdraw the runtime calibration | `PUT /v1/admin/runtime/calibration <object or null>`. See §8 |
 
 All admin calls need `Authorization: Bearer <admin.token>`. See [api.md](api.md).
 
@@ -254,3 +257,93 @@ digests.
 `src/opentype_challenge/pins.py` pins the base model revision and the sha256 of every base
 file. `Dockerfile` pins the Python, uv and vLLM images and the `structured_server.py`
 source and sha256. Changing any pin is a release.
+
+## 8. Runtime lane
+
+Two lanes share the challenge's emission: **quality** 750 000 000 and **runtime**
+250 000 000 units of every epoch (1e9 = one epoch-mass). `full_share_mass` stays 1.0; a lane
+with nothing owed burns its share rather than giving it to the other.
+
+### Activation
+
+`PUT /v1/admin/lanes {"epoch": n}` with `n` past every epoch already served. Until `n` the
+historical rule pays (one budget, quality only); every served epoch replays byte for byte.
+From `n` on, quality debt, old debt included at its full amount, is repaid from 0.75 per
+epoch. Check the Cortex emission mode before scheduling: nothing here changes the signed
+emission configuration.
+
+### Calibration (required before any runtime submission)
+
+The runtime lane stays closed, and no timing is accepted, until you publish a calibration.
+Every threshold in it comes from your own pilot; this repository ships none.
+
+1. On the reference hardware (H200 first), run the worker with `--lane runtime` against a
+   staging container, reference against reference (stock options on both sides), with an
+   explicit GPU budget. Nothing here launches it for you.
+2. Measure the B/B' drift and the block-to-block spread per cell; choose `max_drift`,
+   `min_gain`, `blocks` and `bootstrap_resamples` so that a stock-vs-stock job is rejected.
+3. Publish `{"version", "profile", "cells", "blocks", "max_drift", "min_gain",
+   "latency_tolerance", "fidelity_loss_tolerance", "fidelity_accuracy_tolerance",
+   "bootstrap_resamples", "credit_per_log_gain", "credit_cap"}`. `profile` must equal the
+   pinned serving profile (`runtime.PROFILE_FIXED`) plus the `gpu` and `driver` strings the
+   worker reads from `nvidia-smi` and the `vllm_version` it reads from the installed
+   package. The worker builds its profile from what it runs: `vllm_image` from
+   `/opt/opentype/build.json` (written by the Dockerfile's worker stage from its
+   `VLLM_IMAGE` build argument), the installed vllm version, the reader's sha256 and its
+   own dtype, canvas and length flags. It refuses a job (infrastructure retry) when any of
+   them cannot be read or differs from the calibration.
+
+   Trust limit: this is self-reported by a worker you operate, not an attestation. The
+   manifest is only as good as the build that wrote it and the host that runs it; a
+   modified worker can report anything. Run runtime workers only on hardware and images you
+   control. Each cell is `{"track" (decisions, longctx, ops or sql),
+   "cases", "concurrency", "slo_ms", "weight", "warm"}`; weights sum to 1.
+
+Changing the calibration makes every running runtime job duel again under the new one. A
+submission signs the profile digest: if the new calibration changes the profile, its
+queued and running runtime work expires and miners sign again. Withdrawing the calibration
+(`null`) parks runtime work in the queue until one is published again. Caps:
+`blocks` <= 999, `bootstrap_resamples` <= 100 000, per cell `cases` <= 10 000 and
+`concurrency` <= 1024.
+
+### Runtime workers
+
+`opentype-challenge worker --lane runtime` on dedicated, operator-owned hardware whose
+profile matches the calibration. A runtime job leases only when no other job of this
+challenge is leased, and nothing leases while it runs (ponytail: exclusion is per
+challenge, not per GPU). While a runtime job waits and a runtime worker polled within two
+minutes, quality leases pause after `Settings.runtime_every` (4) of them so the GPU drains;
+a runtime lease resets the count, and without a polling runtime worker quality never
+pauses. The worker:
+
+- serves the champion's weights with stock flags (fidelity side `champion`), then with the
+  candidate's flags (side `challenger`), one server at a time at the calibrated
+  `gpu_memory_utilization`, exactly as in the timed blocks, for the fidelity cases, which
+  the container scores;
+- then, for each block, starts one `vllm serve` (plus the pinned reader) at a time for B,
+  C and B', checks that every process exited and `nvidia-smi` lists no compute process
+  before and after each, posts every timed task's raw output and latency to
+  `/v1/worker/jobs/<id>/timings` and reports each run's `time.monotonic()` seconds; the
+  container scores the outputs against gold. A failed check stops the job and the verdict
+  is `NO_DECISION`;
+- starts the stock (fidelity) or incumbent (B) server alone first: if it fails to start, the host
+  is at fault (retry); if only the candidate then fails to start, its options are
+  (rejected, no retry). Option combinations the pinned `SchedulerConfig` refuses
+  (`max_num_batched_tokens < max_num_seqs`; chunked prefill off with
+  `max_num_batched_tokens < max_model_len`) are refused at intake;
+- passes only flags produced by `runtime.options_argv` from the allowlist, and an
+  environment without any variable whose name looks like a credential.
+
+Allowlisted options (each a parsed `vllm serve` flag at the pinned nightly `7f1a5398`;
+their effect on DiffusionGemma is what the benchmark measures): `max_num_seqs`,
+`max_num_batched_tokens`, `enable_chunked_prefill`, `enable_prefix_caching`. Anything else
+is refused at intake.
+
+### Kernels: disabled
+
+Miner kernels (Triton, CuTe or any compiled artifact) are **not accepted** and are never
+loaded by any worker. They need a GPU guest with verified host and GPU isolation, blocked
+network, read-only weights, resource limits and verified teardown. None of the available
+backends is verified for this: the Cortex bubblewrap sandbox is CPU-only and its Firecracker
+guests boot with `pci=off`. Enabling kernels is a separate delivery that starts with
+choosing and validating such a backend.

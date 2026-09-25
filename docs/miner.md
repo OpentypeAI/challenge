@@ -171,10 +171,45 @@ States are `queued` (including `judging`), `crowned`, `rejected` (`early stop`,
 ## 6. Getting paid
 
 A crown creates an entitlement of `g_LCB / g_min` epochs of the challenge's share. It is
-paid first in, first out, and it is **kept after you are dethroned**. `GET /v1/leaderboard`
+paid first in, first out, and it is **kept after you are dethroned**. Once the operator
+schedules the two lanes, quality credits (old ones too, at their full amount) are paid
+from 0.75 of each epoch and runtime credits from 0.25. `GET /v1/leaderboard`
 shows each crown's entitlement, paid and outstanding amounts.
 
-## 7. Checking the duel
+## 7. The runtime lane (25 %)
+
+A second, independent competition: serve the current quality champion's weights faster
+with vLLM options. It opens only after the operator publishes a calibration measured on the
+reference hardware; until then `GET /v1/runtime` says `"open": false` and submissions are
+refused.
+
+```bash
+opentype-challenge miner runtime-submit --api https://<gateway>/challenge/opentype \
+  --options '{"max_num_seqs": 128, "enable_prefix_caching": true}' \
+  --wallet-name w --wallet-hotkey h
+```
+
+- Only the options listed in `GET /v1/runtime` are accepted. No command line, environment,
+  image, plugin, reader, tokenizer or kernel.
+- The signature binds the challenge, the lane, the champion you target, the calibrated
+  profile and your options. When the quality champion changes, an open runtime submission
+  expires, even mid-measurement: sign a new one against the new champion. Combinations the
+  pinned vLLM refuses (`max_num_batched_tokens` below `max_num_seqs`, or chunked prefill
+  off with `max_num_batched_tokens` below 131072) are refused at intake; options that fail
+  to start a server after the reference started are rejected.
+- A trusted worker measures the incumbent, your options, then the incumbent again, block
+  after block, on one exclusive GPU, and reports each task's raw output and latency. The container
+  scores every output against gold; a task counts only if it is right and within its
+  cell's latency SLO, divided by wall time. Your gain is the fixed-weight mean over cells of
+  `ln(goodput_C / max(goodput_B, goodput_B'))`; the crown needs its 99 % block-bootstrap
+  lower bound above the published margin, no p95 latency regression beyond the tolerance in any block, and no half-Brier or
+  accuracy regression against stock vLLM on the same cases, on every measured track. Metrics you declare are ignored.
+- Credit: `g_LCB x credit_per_log_gain` epoch-masses, capped per crown, paid FIFO from the
+  runtime budget (0.25 of each epoch). Only gain above the best gain already paid on the
+  profile is paid, so recertifying the same options on new weights crowns but pays nothing.
+- One open submission per hotkey in each lane; you can hold both.
+
+## 8. Checking the duel
 
 After the window closes, `GET /v1/windows/<id>` reveals the secret and the jobs, and
 `GET /v1/windows/<id>/bank` publishes the bank. Rebuild your duel's cases and compare the
