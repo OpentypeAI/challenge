@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from . import bank, harness, ledger, paint, pins, scoring, tracks
+from . import bank, harness, ledger, paint, pins, runtime, scoring, tracks
 from .crypto import manifest_digest
 from .generator import Case
 from .tracks import TrackPlan
@@ -29,7 +29,7 @@ DEFAULT_DUEL_CASES = 40_000
 PAGE_BYTES = 6 * 1024 * 1024  # case and bank pages stay under this much JSON
 CASE_CACHE_BYTES = 128 * 1024 * 1024
 BANK_CACHE = 4  # parsed banks kept in memory (one per window)
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -42,8 +42,10 @@ CREATE TABLE IF NOT EXISTS nonces (
 CREATE TABLE IF NOT EXISTS submissions (
   intake INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, hotkey TEXT NOT NULL,
   repo TEXT NOT NULL, revision TEXT NOT NULL, files TEXT NOT NULL, digest TEXT NOT NULL,
-  state TEXT NOT NULL, reason TEXT, created_at INTEGER NOT NULL, job_id TEXT);
+  state TEXT NOT NULL, reason TEXT, created_at INTEGER NOT NULL, job_id TEXT,
+  lane TEXT NOT NULL DEFAULT 'quality', options TEXT, target INTEGER);
 CREATE INDEX IF NOT EXISTS submissions_hotkey ON submissions (hotkey, state);
+CREATE INDEX IF NOT EXISTS submissions_lane ON submissions (lane, state);
 CREATE TABLE IF NOT EXISTS champions (
   id INTEGER PRIMARY KEY, submission_id TEXT, hotkey TEXT, repo TEXT NOT NULL,
   revision TEXT NOT NULL, files TEXT NOT NULL, digest TEXT NOT NULL, job_id TEXT,
@@ -58,7 +60,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   attempts INTEGER NOT NULL DEFAULT 0, stopped INTEGER NOT NULL DEFAULT 0, verdict TEXT,
   evidence TEXT, reason TEXT, created_at INTEGER NOT NULL, finished_at INTEGER,
   plan TEXT NOT NULL DEFAULT '', beacon TEXT, beacon_fetched INTEGER NOT NULL DEFAULT 0,
-  judge INTEGER NOT NULL DEFAULT 0);
+  judge INTEGER NOT NULL DEFAULT 0, lane TEXT NOT NULL DEFAULT 'quality',
+  incumbent_id INTEGER NOT NULL DEFAULT 0, calibration TEXT);
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs (state);
 CREATE TABLE IF NOT EXISTS results (
   job_id TEXT NOT NULL, case_index INTEGER NOT NULL, side TEXT NOT NULL, level INTEGER NOT NULL,
@@ -74,26 +77,43 @@ CREATE TABLE IF NOT EXISTS judgments (
 CREATE TABLE IF NOT EXISTS entitlements (
   id INTEGER PRIMARY KEY, hotkey TEXT NOT NULL, champion_id INTEGER NOT NULL,
   window_id INTEGER NOT NULL, amount INTEGER NOT NULL, paid INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL);
+  created_at INTEGER NOT NULL, lane TEXT NOT NULL DEFAULT 'quality');
+CREATE TABLE IF NOT EXISTS runtime_incumbents (
+  id INTEGER PRIMARY KEY, submission_id TEXT NOT NULL, hotkey TEXT NOT NULL,
+  model_champion_id INTEGER NOT NULL, options TEXT NOT NULL, options_digest TEXT NOT NULL,
+  profile_digest TEXT NOT NULL, calibration TEXT NOT NULL, job_id TEXT NOT NULL,
+  g_lcb REAL NOT NULL, total_gain REAL NOT NULL, credited INTEGER NOT NULL,
+  crowned_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS runtime_tasks (
+  job_id TEXT NOT NULL, block INTEGER NOT NULL, side TEXT NOT NULL, cell TEXT NOT NULL,
+  case_index INTEGER NOT NULL, ms REAL NOT NULL, ok INTEGER NOT NULL, error INTEGER NOT NULL,
+  PRIMARY KEY (job_id, block, side, cell, case_index)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS epochs (epoch INTEGER PRIMARY KEY, body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS payments (
   epoch INTEGER NOT NULL, entitlement_id INTEGER NOT NULL, amount INTEGER NOT NULL,
   PRIMARY KEY (epoch, entitlement_id));
 """.replace("{EMPTY_DIGEST}", bank.EMPTY_BANK.digest)
 
-# v1 -> v2 in place: v1 has these tables without the new columns (user_version 0).
-MIGRATE_V1 = f"""
-BEGIN;
-ALTER TABLE windows ADD COLUMN bank TEXT NOT NULL DEFAULT '[]';
-ALTER TABLE windows ADD COLUMN bank_digest TEXT NOT NULL DEFAULT '{bank.EMPTY_BANK.digest}';
-ALTER TABLE jobs ADD COLUMN plan TEXT NOT NULL DEFAULT '';
-ALTER TABLE jobs ADD COLUMN beacon TEXT;
-ALTER TABLE jobs ADD COLUMN beacon_fetched INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE jobs ADD COLUMN judge INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE results ADD COLUMN track TEXT NOT NULL DEFAULT 'decisions';
-PRAGMA user_version={SCHEMA_VERSION};
-COMMIT;
-"""
+# In-place migrations, one transaction: every column v1 lacks for v2, then v2 lacks for v3
+# (the lanes; existing rows become quality). Each column is added only when it is missing, so
+# the migration reads the schema, not user_version: a v3 file that an older binary re-stamped
+# as v2 migrates to v3 without touching its data.
+MIGRATIONS = (
+    ("windows", "bank", "TEXT NOT NULL DEFAULT '[]'"),
+    ("windows", "bank_digest", f"TEXT NOT NULL DEFAULT '{bank.EMPTY_BANK.digest}'"),
+    ("jobs", "plan", "TEXT NOT NULL DEFAULT ''"),
+    ("jobs", "beacon", "TEXT"),
+    ("jobs", "beacon_fetched", "INTEGER NOT NULL DEFAULT 0"),
+    ("jobs", "judge", "INTEGER NOT NULL DEFAULT 0"),
+    ("results", "track", "TEXT NOT NULL DEFAULT 'decisions'"),
+    ("submissions", "lane", "TEXT NOT NULL DEFAULT 'quality'"),
+    ("submissions", "options", "TEXT"),
+    ("submissions", "target", "INTEGER"),
+    ("jobs", "lane", "TEXT NOT NULL DEFAULT 'quality'"),
+    ("jobs", "incumbent_id", "INTEGER NOT NULL DEFAULT 0"),
+    ("jobs", "calibration", "TEXT"),
+    ("entitlements", "lane", "TEXT NOT NULL DEFAULT 'quality'"),
+)
 RESULT_COLUMNS = (
     "job_id, case_index, side, level, loss, decisions, determined, correct, under_loss, under, "
     "track"
@@ -101,6 +121,8 @@ RESULT_COLUMNS = (
 WINDOW_COLUMNS = "id, secret, commitment, opened_at, closed_at, bank_digest"
 
 
+RUNTIME_WORKER_SECONDS = 120  # a runtime worker polls every 30 s when idle
+EXPIRED = "the quality champion changed: sign a new runtime submission for the new weights"
 UNJUDGED_MAX = 0.05  # share of judged cases a crowned duel may drop as unreadable
 JUDGE_DEADLINE_SECONDS = 6 * 3600  # a judging job settles without its missing sides after this
 
@@ -120,6 +142,10 @@ class Settings:
     # entitlement cap (epoch-masses) of a crown whose duel ran on the empty bank: its cases
     # are all public templates a miner can train on, so by default it pays nothing
     empty_bank_cap: float = 0.0
+    # fidelity read cases a runtime candidate and the stock reference both answer
+    runtime_fidelity_cases: int = 2_000
+    # quality leases between two runtime leases while a runtime job waits
+    runtime_every: int = 4
 
     def track_plan(self) -> Mapping[str, TrackPlan]:
         """The configured plan; v1's duel_cases gives a decisions-only plan (tests)."""
@@ -218,11 +244,13 @@ class Store:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=FULL")
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
-        v1 = self._db.execute(
+        existing = self._db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='windows'"
         ).fetchone()
-        if version == 0 and v1:
-            self._db.executescript(MIGRATE_V1)
+        if version > SCHEMA_VERSION:
+            raise RuntimeError(f"state schema v{version} is newer than this build's")
+        if existing:
+            self._migrate()
         self._db.executescript(SCHEMA)  # idempotent DDL; executescript commits on its own
         self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         with self._tx() as db:
@@ -242,6 +270,20 @@ class Store:
             )
 
     # -- plumbing ----------------------------------------------------------
+
+    def _migrate(self) -> None:
+        """One transaction: add the missing columns; a failure leaves the file untouched."""
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            for table, column, ddl in MIGRATIONS:
+                have = {r[1] for r in self._db.execute(f"PRAGMA table_info({table})")}
+                if column not in have:
+                    self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        except BaseException:
+            self._db.execute("ROLLBACK")
+            raise
+        self._db.execute("COMMIT")
 
     def _now(self) -> int:
         return int(self.clock())
@@ -270,6 +312,239 @@ class Store:
 
     def _set_meta(self, db: sqlite3.Connection, key: str, value: Any) -> None:
         db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (key, _dumps(value)))
+
+    def _meta_opt(self, db: sqlite3.Connection, key: str) -> Any:
+        row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return None if row is None else json.loads(row[0])
+
+    # -- lanes ---------------------------------------------------------------
+
+    def _calibration_raw(self, db: sqlite3.Connection) -> str | None:
+        value = self._meta_opt(db, "runtime_calibration")
+        return None if value is None else _dumps(value)
+
+    def _calibration(self, db: sqlite3.Connection) -> runtime.Calibration | None:
+        value = self._meta_opt(db, "runtime_calibration")
+        return None if value is None else runtime.Calibration.from_json(value)
+
+    def _runtime_open(self, db: sqlite3.Connection) -> bool:
+        """Runtime intake needs the operator's calibration and the lane split scheduled."""
+        return (
+            self._calibration(db) is not None and self._meta_opt(db, "lanes_from_epoch") is not None
+        )
+
+    def _incumbent(self, db: sqlite3.Connection) -> sqlite3.Row | None:
+        """The runtime incumbent certified on the current champion's weights and the current
+        profile; None means the stock configuration."""
+        calibration = self._calibration(db)
+        if calibration is None:
+            return None
+        row: sqlite3.Row | None = db.execute(
+            "SELECT * FROM runtime_incumbents WHERE model_champion_id=? AND profile_digest=? "
+            "ORDER BY id DESC LIMIT 1",
+            (self._champion(db)["id"], calibration.profile_digest),
+        ).fetchone()
+        return row
+
+    def set_calibration(self, raw: Any) -> dict[str, Any] | None:
+        """Publish (or, with None, withdraw) the runtime calibration. Runtime jobs duelling
+        under the previous one become stale and duel again under the new one."""
+        calibration = None if raw is None else runtime.Calibration.from_json(raw)
+        with self._tx() as db:
+            if calibration is None:
+                db.execute("DELETE FROM meta WHERE key='runtime_calibration'")
+            else:
+                self._set_meta(db, "runtime_calibration", raw)
+            self._finalize(db)
+        return None if calibration is None else calibration.public()
+
+    def set_lanes_from(self, epoch: int) -> int:
+        """Schedule the 75/25 split from `epoch` on: once, and only past every persisted
+        epoch, so no published epoch changes."""
+        with self._tx() as db:
+            if self._meta_opt(db, "lanes_from_epoch") is not None:
+                raise StoreError(409, "the lane split is already scheduled")
+            last = db.execute("SELECT max(epoch) FROM epochs").fetchone()[0]
+            if last is not None and epoch <= last:
+                raise StoreError(409, f"epoch {last} is already persisted; pick a later one")
+            self._set_meta(db, "lanes_from_epoch", epoch)
+        return epoch
+
+    def submit_runtime(
+        self,
+        hotkey: str,
+        target: Mapping[str, Any],
+        profile_digest: str,
+        options: Mapping[str, Any],
+        digest: str,
+        nonce: str,
+        exp: int,
+    ) -> dict[str, Any]:
+        """A signed vLLM option set for the current champion's weights on the pinned profile."""
+        with self._tx() as db:
+            if not self._runtime_open(db):
+                raise StoreError(503, "the runtime lane is closed until the operator calibrates it")
+            calibration = self._calibration(db)
+            assert calibration is not None
+            db.execute("DELETE FROM nonces WHERE exp < ?", (self._now(),))
+            if db.execute("SELECT 1 FROM nonces WHERE nonce=?", (nonce,)).fetchone():
+                raise StoreError(409, "nonce already used")
+            champion = self._champion(db)
+            if target != {"champion": champion["id"], "digest": champion["digest"]}:
+                raise StoreError(409, "the target is not the current quality champion")
+            if profile_digest != calibration.profile_digest:
+                raise StoreError(409, "the profile is not the calibrated profile")
+            if db.execute(
+                "SELECT 1 FROM submissions WHERE hotkey=? AND state='queued' AND lane='runtime'",
+                (hotkey,),
+            ).fetchone():
+                raise StoreError(409, "this hotkey already has an open runtime submission")
+            pending = db.execute(
+                "SELECT count(*) FROM submissions WHERE state='queued' AND lane='runtime'"
+            ).fetchone()[0]
+            if pending >= self.settings.max_pending:
+                raise StoreError(429, "the runtime queue is full, retry later")
+            incumbent = self._incumbent(db)
+            if incumbent is not None and json.loads(incumbent["options"]) == dict(options):
+                raise StoreError(409, "the options are those of the runtime incumbent")
+            db.execute("INSERT INTO nonces VALUES (?, ?, ?)", (nonce, hotkey, exp))
+            submission_id = "r_" + secrets.token_hex(8)
+            db.execute(
+                "INSERT INTO submissions (id, hotkey, repo, revision, files, digest, state, "
+                "created_at, lane, options, target) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, 'runtime', ?, ?)",
+                (
+                    submission_id,
+                    hotkey,
+                    champion["repo"],
+                    champion["revision"],
+                    champion["files"],
+                    digest,
+                    self._now(),
+                    _dumps(dict(options)),
+                    champion["id"],
+                ),
+            )
+            self._new_job(db, submission_id)
+            return self._submission(db, submission_id)
+
+    def _runtime_fidelity(
+        self, db: sqlite3.Connection, job_id: str, side: str
+    ) -> dict[str, runtime.Fidelity]:
+        rows = db.execute(
+            "SELECT track, sum(loss), sum(decisions), sum(determined), sum(correct), count(*) "
+            "FROM results WHERE job_id=? AND side=? GROUP BY track",
+            (job_id, side),
+        ).fetchall()
+        return {r[0]: runtime.Fidelity(float(r[1]), r[2], r[3], r[4], r[5]) for r in rows}
+
+    def _settle_runtime(self, db: sqlite3.Connection, job: sqlite3.Row) -> None:
+        """The verdict is recomputed here from the trusted worker's measurements and the
+        fidelity answers the container scored; nothing the candidate declares counts."""
+        calibration = runtime.Calibration.from_json(json.loads(job["calibration"]))
+        evidence = json.loads(job["evidence"]) if job["evidence"] else {}
+        measured = evidence.get("runtime")
+        tasks = db.execute(
+            "SELECT block, side, cell, ms, ok, error FROM runtime_tasks WHERE job_id=?",
+            (job["id"],),
+        ).fetchall()
+        if isinstance(measured, Mapping):
+            blocks = runtime.runs_from_tasks(
+                calibration, measured.get("blocks"), [dict(t) for t in tasks]
+            )
+            measured = {"profile": measured.get("profile"), "blocks": blocks}
+        result = runtime.verdict(
+            calibration,
+            measured,
+            self._runtime_fidelity(db, job["id"], "challenger"),
+            self._runtime_fidelity(db, job["id"], "champion"),
+            {track: plan.cases for track, plan in _job_plan(job).items()},
+        )
+        db.execute(
+            "UPDATE jobs SET state='scored', lease=NULL, verdict=?, finished_at=? WHERE id=?",
+            (_dumps(result), self._now(), job["id"]),
+        )
+        self._finalize(db)
+
+    def _finalize_runtime(self, db: sqlite3.Connection, paused: bool) -> None:
+        """Scored runtime jobs in intake order: stale ones duel again (or expire when the
+        champion changed), NO_DECISION is an infrastructure retry, the rest reject or crown."""
+        progress = True
+        while progress:
+            progress = False
+            scored = db.execute(
+                "SELECT j.*, s.intake FROM jobs j JOIN submissions s ON s.id=j.submission_id "
+                "WHERE j.state='scored' AND j.lane='runtime' ORDER BY s.intake"
+            ).fetchall()
+            for job in scored:
+                if self._stale(db, job):
+                    self._terminal(db, job["id"], "superseded", "the runtime target changed")
+                    self._new_job(db, job["submission_id"])
+                    progress = True
+                    break
+                result = json.loads(job["verdict"])
+                if result["decision"] == "no_decision":
+                    self._release(db, job["id"], f"no decision: {result['reason']}")
+                    progress = True
+                    break
+                if not result["crown"]:
+                    self._terminal(db, job["id"], "rejected", result["reason"])
+                    progress = True
+                    break
+                blocked = db.execute(
+                    "SELECT 1 FROM jobs j JOIN submissions s ON s.id=j.submission_id "
+                    "WHERE j.lane='runtime' AND s.intake < ? "
+                    "AND j.state IN ('queued', 'leased', 'judging', 'scored')",
+                    (job["intake"],),
+                ).fetchone()
+                if paused or blocked:
+                    continue
+                self._crown_runtime(db, job)
+                progress = True
+                break
+
+    def _crown_runtime(self, db: sqlite3.Connection, job: sqlite3.Row) -> None:
+        """A new incumbent. Credit pays only the certified gain over stock past the best one
+        already certified on this profile, so recertifying on new weights, or resubmitting an
+        option set that was already paid, earns nothing."""
+        submission = db.execute(
+            "SELECT * FROM submissions WHERE id=?", (job["submission_id"],)
+        ).fetchone()
+        calibration = runtime.Calibration.from_json(json.loads(job["calibration"]))
+        result = json.loads(job["verdict"])
+        incumbent = self._incumbent(db)
+        total = (incumbent["total_gain"] if incumbent else 0.0) + result["g_lcb"]
+        best = db.execute(
+            "SELECT coalesce(max(total_gain), 0) FROM runtime_incumbents WHERE profile_digest=?",
+            (calibration.profile_digest,),
+        ).fetchone()[0]
+        amount = runtime.credit_units(calibration, max(total - best, 0.0), ledger.UNITS)
+        cursor = db.execute(
+            "INSERT INTO runtime_incumbents (submission_id, hotkey, model_champion_id, options, "
+            "options_digest, profile_digest, calibration, job_id, g_lcb, total_gain, credited, "
+            "crowned_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                submission["id"],
+                submission["hotkey"],
+                job["champion_id"],
+                submission["options"],
+                runtime.digest(json.loads(submission["options"])),
+                calibration.profile_digest,
+                calibration.version,
+                job["id"],
+                result["g_lcb"],
+                total,
+                amount,
+                self._now(),
+            ),
+        )
+        incumbent_id = cursor.lastrowid
+        db.execute(
+            "INSERT INTO entitlements (hotkey, champion_id, window_id, amount, created_at, lane) "
+            "VALUES (?, ?, ?, ?, ?, 'runtime')",
+            (submission["hotkey"], incumbent_id, self._window(db)["id"], amount, self._now()),
+        )
+        self._terminal(db, job["id"], "crowned", f"runtime incumbent {incumbent_id}")
 
     # -- windows -----------------------------------------------------------
 
@@ -477,11 +752,12 @@ class Store:
             if db.execute("SELECT 1 FROM nonces WHERE nonce=?", (nonce,)).fetchone():
                 raise StoreError(409, "nonce already used")
             if db.execute(
-                "SELECT 1 FROM submissions WHERE hotkey=? AND state='queued'", (hotkey,)
+                "SELECT 1 FROM submissions WHERE hotkey=? AND state='queued' AND lane='quality'",
+                (hotkey,),
             ).fetchone():
                 raise StoreError(409, "this hotkey already has an open submission")
             pending = db.execute(
-                "SELECT count(*) FROM submissions WHERE state='queued'"
+                "SELECT count(*) FROM submissions WHERE state='queued' AND lane='quality'"
             ).fetchone()[0]
             if pending >= self.settings.max_pending:
                 raise StoreError(429, "the duel queue is full, retry later")
@@ -499,29 +775,73 @@ class Store:
             return self._submission(db, submission_id)
 
     def _new_job(self, db: sqlite3.Connection, submission_id: str) -> str:
+        submission = db.execute(
+            "SELECT lane, target FROM submissions WHERE id=?", (submission_id,)
+        ).fetchone()
+        if submission["lane"] == "runtime" and submission["target"] != self._champion(db)["id"]:
+            # the signed target is never moved: the miner resubmits against the new champion
+            db.execute(
+                "UPDATE submissions SET state='expired', reason=? WHERE id=?",
+                (EXPIRED, submission_id),
+            )
+            return ""
         job_id = "j_" + secrets.token_hex(8)
         db.execute(
             "INSERT INTO jobs (id, submission_id, champion_id, window_id, seed, mix, retired, "
-            "cases, state, created_at) VALUES (?, ?, 0, 0, '', '{}', '[]', ?, 'queued', ?)",
-            (job_id, submission_id, self.settings.duel_cases, self._now()),
+            "cases, state, created_at, lane) VALUES (?, ?, 0, 0, '', '{}', '[]', ?, 'queued', ?, "
+            "?)",
+            (job_id, submission_id, self.settings.duel_cases, self._now(), submission["lane"]),
         )
         self._target(db, job_id)
         db.execute("UPDATE submissions SET job_id=? WHERE id=?", (job_id, submission_id))
         return job_id
 
+    def _target_current(self, db: sqlite3.Connection, job: sqlite3.Row) -> bool:
+        """A quality job may duel any current champion; a runtime job only the one its
+        submission signed."""
+        if job["lane"] != "runtime":
+            return True
+        target = db.execute(
+            "SELECT target FROM submissions WHERE id=?", (job["submission_id"],)
+        ).fetchone()[0]
+        return bool(target == self._champion(db)["id"])
+
     def _target(self, db: sqlite3.Connection, job_id: str) -> None:
         """Point a job at the current champion and window: fresh seed (with the job's drand
         beacon, if any), level mix, effective plan and judge flag."""
         job = db.execute(
-            "SELECT j.id, j.beacon, s.digest FROM jobs j JOIN submissions s "
-            "ON s.id=j.submission_id WHERE j.id=?",
+            "SELECT j.id, j.beacon, j.lane, j.submission_id, s.digest FROM jobs j "
+            "JOIN submissions s ON s.id=j.submission_id WHERE j.id=?",
             (job_id,),
         ).fetchone()
+        if not self._target_current(db, job):  # callers expire such jobs first
+            raise StoreError(409, "a runtime job never moves off its signed target")
         champion, window = self._champion(db), self._window(db)
         mix, retired = self._mix(db, champion["id"])
-        plan = tracks.effective_plan(
-            self.settings.track_plan(), self._bank(db, window["id"]), self.judge
-        )
+        judge = self.judge
+        if job["lane"] == "runtime":
+            # fidelity on every measured track, no judge; the candidate duels stock
+            calibration = self._calibration(db)
+            assert calibration is not None  # the lane is open while it has jobs
+            measured = runtime.fidelity_tracks(calibration)
+            plan = {
+                t: TrackPlan(1 / len(measured), self.settings.runtime_fidelity_cases)
+                for t in measured
+            }
+            judge, retired = False, []
+            incumbent = self._incumbent(db)
+            db.execute(
+                "UPDATE jobs SET incumbent_id=?, calibration=? WHERE id=?",
+                (
+                    incumbent["id"] if incumbent else 0,
+                    self._calibration_raw(db),
+                    job_id,
+                ),
+            )
+        else:
+            plan = tracks.effective_plan(
+                self.settings.track_plan(), self._bank(db, window["id"]), self.judge
+            )
         beacon = json.loads(job["beacon"]) if job["beacon"] else None
         db.execute(
             "UPDATE jobs SET champion_id=?, window_id=?, seed=?, mix=?, retired=?, plan=?, "
@@ -534,7 +854,7 @@ class Store:
                 _dumps(retired),
                 _dumps(plan_to_json(plan)),
                 sum(p.cases for p in plan.values()),
-                int(self.judge),
+                int(judge),
                 job_id,
             ),
         )
@@ -581,7 +901,45 @@ class Store:
 
     # -- worker ---------------------------------------------------------------
 
-    def lease(self) -> dict[str, Any] | None:
+    def lease(self, lane: str = "quality") -> dict[str, Any] | None:
+        """The next job of one lane. A runtime job never runs beside any other job: while one
+        is leased nothing else is handed out, and it waits for every leased job to finish.
+
+        ponytail: exclusion is global across this challenge's workers, not per GPU; add a
+        per-GPU reservation when runtime jobs are frequent enough for it to cost throughput."""
+        if lane not in runtime.LANES:
+            raise StoreError(400, f"lane must be one of {runtime.LANES}")
+        if lane == "runtime":
+            with self._tx() as db:
+                self._set_meta(db, "runtime_polled", self._now())
+        return self._lease(lane)
+
+    def _runtime_due(self, db: sqlite3.Connection) -> bool:
+        """Quality leases pause so leased quality jobs drain and the runtime job gets the GPU:
+        only while a runtime job is queued, a runtime worker polled within
+        RUNTIME_WORKER_SECONDS (no worker, no drain) and at least runtime_every quality
+        leases went out since the last runtime lease (quality keeps that share)."""
+        if not self._runtime_open(db):
+            return False
+        queued = db.execute("SELECT 1 FROM jobs WHERE lane='runtime' AND state='queued'").fetchone()
+        polled = self._meta_opt(db, "runtime_polled") or 0
+        since = self._meta_opt(db, "quality_since_runtime") or 0
+        return (
+            queued is not None
+            and self._now() - polled <= RUNTIME_WORKER_SECONDS
+            and since >= self.settings.runtime_every
+        )
+
+    def _count_lease(self, db: sqlite3.Connection, lane: str) -> None:
+        since = self._meta_opt(db, "quality_since_runtime") or 0
+        self._set_meta(db, "quality_since_runtime", since + 1 if lane == "quality" else 0)
+
+    def _exclusive_blocked(self, db: sqlite3.Connection, lane: str) -> bool:
+        """A leased runtime job blocks every lease; a runtime lease waits for all others."""
+        lanes = {r["lane"] for r in db.execute("SELECT lane FROM jobs WHERE state='leased'")}
+        return "runtime" in lanes or (lane == "runtime" and bool(lanes))
+
+    def _lease(self, lane: str) -> dict[str, Any] | None:
         # The drand beacon is fetched once per job, outside the lock (5 s timeout), and
         # stored on its first lease; retries reuse it. Expired leases are released first so
         # the head the beacon is fetched for is the job leased below; if a concurrent lease
@@ -600,18 +958,29 @@ class Store:
             with self._lock:
                 head = self._db.execute(
                     "SELECT j.id, j.beacon_fetched FROM jobs j JOIN submissions s "
-                    "ON s.id=j.submission_id WHERE j.state='queued' ORDER BY s.intake LIMIT 1"
+                    "ON s.id=j.submission_id WHERE j.state='queued' AND j.lane=? "
+                    "ORDER BY s.intake LIMIT 1",
+                    (lane,),
                 ).fetchone()
             if head is None or head["beacon_fetched"] or (beacon and beacon[0] == head["id"]):
                 break
             beacon = (head["id"], self.beacon())
         with self._tx() as db:
+            if self._exclusive_blocked(db, lane):
+                return None
+            if lane == "runtime" and not self._runtime_open(db):
+                return None
+            self._expire_runtime(db)
+            if lane == "quality" and self._runtime_due(db):
+                return None  # drain for the waiting runtime job
             job = db.execute(
                 "SELECT j.* FROM jobs j JOIN submissions s ON s.id=j.submission_id "
-                "WHERE j.state='queued' ORDER BY s.intake LIMIT 1"
+                "WHERE j.state='queued' AND j.lane=? ORDER BY s.intake LIMIT 1",
+                (lane,),
             ).fetchone()
             if job is None:
                 return None
+            self._count_lease(db, lane)
             champion = self._champion(db)
             if beacon is not None and beacon[0] == job["id"] and not job["beacon_fetched"]:
                 db.execute(
@@ -630,7 +999,7 @@ class Store:
             submission = db.execute(
                 "SELECT * FROM submissions WHERE id=?", (job["submission_id"],)
             ).fetchone()
-            return {
+            out = {
                 "job": job["id"],
                 "lease": lease,
                 "lease_expires": _iso(now + LEASE_SECONDS),
@@ -640,12 +1009,29 @@ class Store:
                 "challenger": _manifest(submission),
                 "base": {"repo": pins.BASE_REPO, "revision": pins.BASE_REVISION},
             }
+            if lane == "runtime":
+                incumbent = self._incumbent(db)
+                out["challenger"] = None  # same weights as the champion
+                out["lane"] = "runtime"
+                out["runtime"] = {
+                    "calibration": json.loads(job["calibration"]),
+                    "incumbent": json.loads(incumbent["options"]) if incumbent else {},
+                    "candidate": json.loads(submission["options"]),
+                    "seed": job["seed"],  # the private workload, sealed like a duel's cases
+                    "sides": {"champion": "stock", "challenger": "candidate"},
+                }
+            return out
 
     def _release(self, db: sqlite3.Connection, job_id: str, reason: str) -> None:
-        """Give a job back to the queue after an infrastructure failure, or fail it."""
+        """Give a job back to the queue after an infrastructure failure, or fail it. A runtime
+        job whose signed target is no longer the champion expires instead."""
         job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         db.execute("DELETE FROM results WHERE job_id=?", (job_id,))
         db.execute("DELETE FROM judgments WHERE job_id=?", (job_id,))
+        db.execute("DELETE FROM runtime_tasks WHERE job_id=?", (job_id,))
+        if not self._target_current(db, job):
+            self._terminal(db, job_id, "expired", EXPIRED)
+            return
         attempts = job["attempts"] + 1
         if attempts >= MAX_ATTEMPTS:
             self._terminal(db, job_id, "failed", f"{reason} ({attempts} attempts)")
@@ -680,11 +1066,22 @@ class Store:
             self._leased(db, job_id, lease)
             expires = self._now() + LEASE_SECONDS
             db.execute("UPDATE jobs SET lease_expires=? WHERE id=?", (expires, job_id))
-            stale = (
-                db.execute("SELECT champion_id FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
-                != self._champion(db)["id"]
+            stale = self._stale(
+                db, db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             )
         return {"lease_expires": _iso(expires), "stale": stale}
+
+    def _stale(self, db: sqlite3.Connection, job: sqlite3.Row) -> bool:
+        """The job no longer duels the current state of its lane."""
+        if job["champion_id"] != self._champion(db)["id"]:
+            return True
+        if job["lane"] != "runtime":
+            return False
+        incumbent = self._incumbent(db)
+        calibration = self._calibration(db)
+        return job["incumbent_id"] != (incumbent["id"] if incumbent else 0) or (
+            calibration is None or job["calibration"] != self._calibration_raw(db)
+        )
 
     def _case(self, job: sqlite3.Row, index: int) -> tuple[Case, int]:
         """Case `index` of a job and the length of its body's JSON (byte-bounded cache)."""
@@ -773,10 +1170,12 @@ class Store:
                 "UPDATE jobs SET lease_expires=? WHERE id=?",
                 (self._now() + LEASE_SECONDS, job_id),
             )
-            stopped = bool(job["stopped"]) or self._should_stop(db, job)
+            stopped = bool(job["stopped"]) or (
+                job["lane"] == "quality" and self._should_stop(db, job)
+            )
             if stopped and not job["stopped"]:
                 db.execute("UPDATE jobs SET stopped=1 WHERE id=?", (job_id,))
-            stale = job["champion_id"] != self._champion(db)["id"]
+            stale = self._stale(db, job)
             paired = self._paired_count(db, job_id)
             answered = self._answered_count(db, job_id)
         return {
@@ -843,10 +1242,53 @@ class Store:
             for r in rows
         ]
 
+    def record_timings(
+        self, job_id: str, lease: str, items: Sequence[Mapping[str, Any]]
+    ) -> dict[str, Any]:
+        """Timed runtime tasks: latency from the worker's clock, success only from the
+        container scoring the raw output against the case it rebuilds from the job's seed."""
+        with self._lock:
+            job = self._leased(self._db, job_id, lease)
+        if job["lane"] != "runtime":
+            raise StoreError(409, "timings belong to runtime jobs")
+        calibration = runtime.Calibration.from_json(json.loads(job["calibration"]))
+        rows = []
+        for raw in items:
+            item = {k: v for k, v in raw.items() if v is not None}
+            cell = calibration.cells.get(item["cell"])
+            if cell is None or not 0 <= item["case_index"] < cell.cases:
+                raise StoreError(400, f"no case {item['case_index']} in cell {item['cell']}")
+            if not item["block"] < calibration.blocks:
+                raise StoreError(400, f"block {item['block']} is outside the calibration")
+            case = runtime.cell_case(job["seed"], item["cell"], cell, item["case_index"])
+            ok = runtime.task_ok(case, item)
+            rows.append(
+                (
+                    job_id,
+                    item["block"],
+                    item["side"],
+                    item["cell"],
+                    item["case_index"],
+                    float(item["ms"]),
+                    int(ok),
+                    int("error" in item),
+                )
+            )
+        with self._tx() as db:
+            self._leased(db, job_id, lease)
+            db.executemany(
+                "INSERT OR IGNORE INTO runtime_tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows
+            )
+            db.execute(
+                "UPDATE jobs SET lease_expires=? WHERE id=?",
+                (self._now() + LEASE_SECONDS, job_id),
+            )
+        return {"accepted": len(rows), "ok": sum(r[6] for r in rows)}
+
     def complete(self, job_id: str, lease: str, evidence: Mapping[str, Any]) -> dict[str, Any]:
         with self._tx() as db:
             job = self._leased(db, job_id, lease)
-            stale = job["champion_id"] != self._champion(db)["id"]
+            stale = self._stale(db, job)
             answered = self._answered_count(db, job_id)
             if not (job["stopped"] or stale) and answered < job["cases"]:
                 raise StoreError(409, f"{answered} of {job['cases']} cases answered by both sides")
@@ -870,6 +1312,9 @@ class Store:
         crown queue. A crown is refused when more than UNJUDGED_MAX of the judged cases were
         dropped, since the drop depends on the renders."""
         job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if job["lane"] == "runtime":
+            self._settle_runtime(db, job)
+            return
         unjudged = db.execute(
             "SELECT case_index FROM judgments WHERE job_id=? GROUP BY case_index "
             "HAVING sum(state='unjudged') = 2 OR sum(state='expired') > 0",
@@ -1011,6 +1456,7 @@ class Store:
                 raise StoreError(409, "a crowned job cannot be requeued")
             db.execute("DELETE FROM results WHERE job_id=?", (job_id,))
             db.execute("DELETE FROM judgments WHERE job_id=?", (job_id,))
+            db.execute("DELETE FROM runtime_tasks WHERE job_id=?", (job_id,))
             self._terminal(db, job_id, "superseded", "requeued by the operator")
             db.execute(
                 "UPDATE submissions SET state='queued', reason=NULL WHERE id=?",
@@ -1061,7 +1507,8 @@ class Store:
             champion = self._champion(db)
             scored = db.execute(
                 "SELECT j.*, s.intake, s.files FROM jobs j JOIN submissions s "
-                "ON s.id=j.submission_id WHERE j.state='scored' ORDER BY s.intake"
+                "ON s.id=j.submission_id WHERE j.state='scored' AND j.lane='quality' "
+                "ORDER BY s.intake"
             ).fetchall()
             for job in scored:
                 if job["champion_id"] != champion["id"]:
@@ -1083,7 +1530,7 @@ class Store:
                     break
                 blocked = db.execute(
                     "SELECT 1 FROM jobs j JOIN submissions s ON s.id=j.submission_id "
-                    "WHERE j.champion_id=? AND s.intake < ? "
+                    "WHERE j.champion_id=? AND s.intake < ? AND j.lane='quality' "
                     "AND j.state IN ('queued', 'leased', 'judging', 'scored')",
                     (champion["id"], job["intake"]),
                 ).fetchone()
@@ -1092,6 +1539,7 @@ class Store:
                 self._crown(db, job)
                 progress = True
                 break
+        self._finalize_runtime(db, paused)
 
     def _crown(self, db: sqlite3.Connection, job: sqlite3.Row) -> None:
         """ponytail: no anchor telemetry (typed-decisions test, PhishNChips, Laya probes,
@@ -1122,7 +1570,8 @@ class Store:
         assert champion_id is not None
         self._add_level_stats(db, champion_id, self._pairs(db, job["id"]), "challenger")
         window_total = db.execute(
-            "SELECT coalesce(sum(amount), 0) FROM entitlements WHERE window_id=?",
+            "SELECT coalesce(sum(amount), 0) FROM entitlements WHERE window_id=? "
+            "AND lane='quality'",
             (window["id"],),
         ).fetchone()[0]
         amount = ledger.entitlement_units(result["g_lcb"], window_total, self.settings.window_cap)
@@ -1138,6 +1587,17 @@ class Store:
         )
         self._terminal(db, job["id"], "crowned", f"crowned as champion {champion_id}")
         self._retire_levels(db)
+        self._expire_runtime(db)
+
+    def _expire_runtime(self, db: sqlite3.Connection) -> None:
+        """Queued runtime jobs whose signed target is no longer the champion expire; the target
+        is never moved. A leased one turns stale and expires when it completes or is
+        released."""
+        for queued in db.execute(
+            "SELECT * FROM jobs WHERE lane='runtime' AND state='queued'"
+        ).fetchall():
+            if not self._target_current(db, queued):
+                self._terminal(db, queued["id"], "expired", EXPIRED)
 
     # -- weights ---------------------------------------------------------------
 
@@ -1151,17 +1611,34 @@ class Store:
             row = db.execute("SELECT body FROM epochs WHERE epoch=?", (epoch,)).fetchone()
             if row is not None:
                 return str(row["body"])
-            owed = [
-                ledger.Entitlement(r["id"], r["hotkey"], r["amount"], r["paid"])
-                for r in db.execute(
-                    "SELECT * FROM entitlements WHERE paid < amount ORDER BY id"
-                ).fetchall()
-            ]
-            payments = ledger.pay(owed)
+            start = self._meta_opt(db, "lanes_from_epoch")
+            split = start is not None and epoch >= start
+            # before the split the historical rule holds: quality credits share one epoch-mass
+            budgets = runtime.BUDGETS if split else {"quality": ledger.UNITS}
             by_id = {
                 r["id"]: r
-                for r in db.execute("SELECT id, hotkey, champion_id FROM entitlements").fetchall()
+                for r in db.execute(
+                    "SELECT id, hotkey, champion_id, lane FROM entitlements"
+                ).fetchall()
             }
+            payments: list[tuple[int, int]] = []
+            lanes: dict[str, dict[str, float]] = {}
+            for lane, budget in budgets.items():
+                owed = [
+                    ledger.Entitlement(r["id"], r["hotkey"], r["amount"], r["paid"])
+                    for r in db.execute(
+                        "SELECT * FROM entitlements WHERE paid < amount AND lane=? ORDER BY id",
+                        (lane,),
+                    ).fetchall()
+                ]
+                paid = ledger.pay(owed, budget)
+                payments += paid
+                spent = sum(amount for _, amount in paid)
+                lanes[lane] = {
+                    "budget": budget / ledger.UNITS,
+                    "paid": spent / ledger.UNITS,
+                    "burned": (budget - spent) / ledger.UNITS,  # never given to the other lane
+                }
             weights: dict[str, float] = {}
             paid_units = 0
             for entitlement_id, amount in payments:
@@ -1172,23 +1649,29 @@ class Store:
                 hotkey = by_id[entitlement_id]["hotkey"]
                 weights[hotkey] = weights.get(hotkey, 0) + amount
                 paid_units += amount
+            rows = []
+            for eid, amount in payments:
+                entry = {
+                    "entitlement": eid,
+                    "champion": by_id[eid]["champion_id"],
+                    "hotkey": by_id[eid]["hotkey"],
+                    "mass": amount / ledger.UNITS,
+                }
+                if split:
+                    entry["lane"] = by_id[eid]["lane"]
+                rows.append(entry)
+            metadata: dict[str, Any] = {
+                "payments": rows,
+                "burned": (ledger.UNITS - paid_units) / ledger.UNITS,
+            }
+            if split:
+                metadata["lanes"] = lanes
             body = {
                 "challenge_slug": slug,
                 "epoch": epoch,
                 "weights": {k: v / ledger.UNITS for k, v in sorted(weights.items())},
                 "full_share_mass": 1.0,
-                "metadata": {
-                    "payments": [
-                        {
-                            "entitlement": eid,
-                            "champion": by_id[eid]["champion_id"],
-                            "hotkey": by_id[eid]["hotkey"],
-                            "mass": amount / ledger.UNITS,
-                        }
-                        for eid, amount in payments
-                    ],
-                    "burned": (ledger.UNITS - paid_units) / ledger.UNITS,
-                },
+                "metadata": metadata,
                 "computed_at": _iso(self._now()),
             }
             text = json.dumps(body, sort_keys=True, separators=(",", ":"))
@@ -1206,7 +1689,8 @@ class Store:
             window = self._window(db)
             queue = db.execute(
                 "SELECT s.id, s.hotkey, s.intake, j.state, j.id AS job FROM submissions s "
-                "JOIN jobs j ON j.id=s.job_id WHERE s.state='queued' ORDER BY s.intake"
+                "JOIN jobs j ON j.id=s.job_id WHERE s.state='queued' AND s.lane='quality' "
+                "ORDER BY s.intake"
             ).fetchall()
             levels = []
             for level in [*active, *retired, *pending]:
@@ -1268,6 +1752,10 @@ class Store:
                 },
                 "teacher": {"state": teacher, "judge": self.judge, "judgments_pending": judging},
                 "crowns_paused": self._meta(db, "crowns_paused"),
+                "lanes": {
+                    "from_epoch": self._meta_opt(db, "lanes_from_epoch"),
+                    "runtime_open": self._runtime_open(db),
+                },
                 "constants": {
                     "g_min": scoring.G_MIN,
                     "z": scoring.Z99,
@@ -1283,11 +1771,56 @@ class Store:
                 },
             }
 
+    def runtime_status(self) -> dict[str, Any]:
+        """The runtime lane: open or not, calibration, incumbent, queue and allocations."""
+        with self._lock:
+            db = self._db
+            calibration = self._calibration(db)
+            champion = self._champion(db)
+            incumbent = self._incumbent(db)
+            queue = db.execute(
+                "SELECT s.id, s.hotkey, s.intake, j.state, j.id AS job FROM submissions s "
+                "JOIN jobs j ON j.id=s.job_id WHERE s.state='queued' AND s.lane='runtime' "
+                "ORDER BY s.intake"
+            ).fetchall()
+            history = db.execute(
+                "SELECT id, hotkey, model_champion_id, options, profile_digest, calibration, "
+                "job_id, g_lcb, credited, crowned_at FROM runtime_incumbents ORDER BY id"
+            ).fetchall()
+            return {
+                "open": self._runtime_open(db),
+                "lanes_from_epoch": self._meta_opt(db, "lanes_from_epoch"),
+                "budgets": {k: v / ledger.UNITS for k, v in runtime.BUDGETS.items()},
+                "options": {
+                    k: {"flag": v[0], "min": v[2], "max": v[3]} for k, v in runtime.OPTIONS.items()
+                },
+                "kernels": runtime.KERNELS,
+                "calibration": calibration.public() if calibration else None,
+                "target": {"champion": champion["id"], "digest": champion["digest"]},
+                "incumbent": None
+                if incumbent is None
+                else {
+                    "id": incumbent["id"],
+                    "hotkey": incumbent["hotkey"],
+                    "options": json.loads(incumbent["options"]),
+                },
+                "queue": [dict(row) for row in queue],
+                "crowns": [
+                    {
+                        **{k: row[k] for k in row.keys() if k != "options"},
+                        "options": json.loads(row["options"]),
+                        "credited": row["credited"] / ledger.UNITS,
+                        "crowned_at": _iso(row["crowned_at"]),
+                    }
+                    for row in history
+                ],
+            }
+
     def leaderboard(self) -> dict[str, Any]:
         with self._lock:
             rows = self._db.execute(
-                "SELECT c.*, e.amount, e.paid FROM champions c "
-                "LEFT JOIN entitlements e ON e.champion_id=c.id ORDER BY c.id"
+                "SELECT c.*, e.amount, e.paid FROM champions c LEFT JOIN entitlements e "
+                "ON e.champion_id=c.id AND e.lane='quality' ORDER BY c.id"
             ).fetchall()
         crowns = []
         totals: dict[str, dict[str, float]] = {}

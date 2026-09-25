@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Two lanes in one challenge: quality (75 %) and runtime (25 %), with separate queues,
+  champions, credits and FIFO. An unused lane burns its share. `PUT /v1/admin/lanes`
+  schedules the split from a future epoch; earlier epochs replay unchanged.
+- Runtime lane: `POST /v1/runtime/submissions` (signed allowlisted vLLM options for the
+  current champion on the calibrated profile), `GET /v1/runtime`,
+  `PUT /v1/admin/runtime/calibration`, `worker --lane runtime` (sequential B/C/B' blocks on
+  one exclusive GPU, quiescence checks) and `miner runtime-submit`. Closed until the
+  operator publishes a calibration. Miner kernels stay disabled.
+
+### Changed
+
+- State schema v3, migrated in place in one transaction that adds only missing columns
+  (safe on a v3 file re-stamped v2 by an older binary); existing rows become quality.
+  Older binaries cannot open a v3 file.
+- Runtime jobs never leave their signed target: retries, expired leases and `NO_DECISION`
+  expire them once the champion changed. Quality leases drain, bounded, for a waiting
+  runtime job. Timed task outputs are scored by the container (`/timings`); fidelity covers
+  every measured track. The worker profile comes from a baked build manifest and the
+  installed vllm and fails closed; candidate-only start failures are rejected.
+
 ## [2.1.0] - 2026-09-25
 
 ### Added

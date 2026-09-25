@@ -65,6 +65,7 @@ ARG VERSION=dev
 ARG REVISION=unknown
 ARG STRUCTURED_SERVER_URL=https://raw.githubusercontent.com/vllm-project/vllm/1b3b88ec2b7457aa030db4d0e7d8aaf04f6d0fb8/examples/features/structured_diffusion/structured_server.py
 ARG STRUCTURED_SERVER_SHA256=7cd9aa0081090c064eaac28db0f54f812749eeb3ae787d7f7653d2e35d8a938f
+ARG VLLM_IMAGE
 LABEL org.opencontainers.image.source="https://github.com/OpentypeAI/challenge" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}" \
@@ -81,6 +82,8 @@ RUN echo "${STRUCTURED_SERVER_SHA256}  /opt/opentype/structured_server.py" | sha
  && uv pip install --system --no-cache "py-sr25519-bindings>=0.2.3,<0.3" \
  && uv pip install --system --no-cache --no-deps /tmp/wheels/*.whl \
  && rm -rf /tmp/wheels \
+ && printf '{"vllm_image": "%s"}\n' "${VLLM_IMAGE}" > /opt/opentype/build.json \
+ && chmod 0444 /opt/opentype/build.json \
  && python3 -c "import fastapi, httpx, huggingface_hub, pydantic, sr25519, uvicorn, opentype_challenge"
 ENV OPENTYPE_STRUCTURED_SERVER=/opt/opentype/structured_server.py \
     OPENTYPE_WORKER_IMAGE="ghcr.io/opentypeai/challenge-worker:sha-${REVISION}" \

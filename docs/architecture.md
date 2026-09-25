@@ -24,12 +24,13 @@
 | `tracks.py` | `TRACKS`, `ENVS`, `TrackPlan`, `DEFAULT_PLAN`, `effective_plan`, `track_of`, `job_case`, `score_item` and `solve_body`. |
 | `scoring.py` | Half-Brier with forfeit, `harness_score`, the paired log ratio, `composite`, the per-track guard, the crown rule, early stop, the Wilson bound, the ladder and the duel mix. |
 | `ledger.py` | Integer entitlements and FIFO payment. |
-| `store.py` | The SQLite state machine: windows and banks, nonces, submissions, jobs (plan, beacon, judge flag), results with `track`, judgments, champions, level statistics, entitlements, epochs. It holds a byte-bounded case cache (128 MiB) and migrates a v1 database in place (`PRAGMA user_version` 2). |
+| `runtime.py` | The runtime lane: lane budgets (750 000 000 / 250 000 000 units), the vLLM option allowlist and its fixed flags, the operator `Calibration`, the private workload cells, and the pure `verdict` over B / C / B' measurements and fidelity sums. |
+| `store.py` | The SQLite state machine: windows and banks, nonces, submissions, jobs (plan, beacon, judge flag), results with `track`, judgments, champions, level statistics, entitlements, epochs. It holds a byte-bounded case cache (128 MiB) and migrates older databases in place in one transaction (`PRAGMA user_version` 3), adding each missing column found by `PRAGMA table_info`, so a v3 file that an older binary re-stamped as v2 migrates without a duplicate column. v3 adds a `lane` to submissions, jobs and entitlements (existing rows are `quality`), `runtime_incumbents` and `runtime_tasks`. Opening a v3 file with an older binary is not supported: it does not know the lanes. |
 | `app.py` | FastAPI routes, auth, body limits, the metagraph cache, teacher wiring, and background tasks for judging, settling, auto-rotation and the bank builder. |
 | `worker.py` | Weight assembly and verification, `VllmLauncher` (`--max-model-len`, `--limit-mm-per-prompt`), the read and episode loop, heartbeats and failure classification. |
 | `miner.py`, `crypto.py` | Manifests, sr25519 signing and verification, SS58. |
 | `pins.py` | The base revision and file digests, the vLLM image, the `structured_server.py` URL and sha256. |
-| `cli.py` | `serve`, `worker`, `generate` (every track), `audit`, `miner submit`, `miner status`. |
+| `cli.py` | `serve`, `worker [--lane runtime]`, `generate` (every track), `audit`, `miner submit`, `miner runtime-submit`, `miner status`. |
 
 ## Life of a submission
 
@@ -107,3 +108,40 @@ into the new window.
   `https://api.drand.sh/public/latest` and `{OPENTYPE_TEACHER_URL}/v1/chat/completions`.
 - The worker reaches the container only through the master proxy. Request bodies stay
   under 1 MiB and responses under 8 MiB (case pages are capped at 6 MiB).
+
+## Two lanes
+
+One challenge, one Cortex export, two independent competitions (see
+[operator.md](operator.md#8-runtime-lane)):
+
+- **quality** (75 %): everything above. Weights, tracks, half-Brier and crowns are unchanged;
+  `status.champion` is the quality champion.
+- **runtime** (25 %): the quality champion's weights served faster by allowlisted vLLM
+  options only. Its own queue, incumbent, credits and FIFO.
+
+Lanes are not tracks: tracks are renormalised inside a duel, lanes never are. From the
+scheduled epoch on, `weights` pays each lane with `ledger.pay` from its own budget; a lane
+with nothing owed burns its share, it never goes to the other lane. Before that epoch, and
+for every persisted epoch, the historical single-budget rule and bytes are unchanged. A
+hotkey paid in both lanes gets the sum.
+
+A runtime job pins two identities, the quality champion (`champion_id`, always the
+submission's signed target) and the runtime incumbent (`incumbent_id`, 0 = stock), plus the
+calibration it runs under. The signed target is never moved: every path that would requeue
+or retarget a runtime job (a quality crown, a retry, an expired lease, `NO_DECISION`, a stale
+completion) expires it once the target is no longer the champion, and the lane goes back to
+stock on the new weights. While a runtime job waits and a runtime worker polled in the last
+two minutes, quality leases pause after `runtime_every` (4) of them so the leased quality
+jobs drain and the runtime job gets the GPU; quality then gets its `runtime_every` again. Recertifying on new weights crowns but pays only certified gain above the best
+already paid on the profile.
+
+The runtime verdict (`runtime.verdict`) is recomputed by the container. The worker reports
+each timed task's raw output (read answers or harness transcript) and latency, and each
+run's monotonic seconds; it reports no success flag or count. The container rebuilds each
+case from the job's seed and counts a task only if its output scores right against gold
+(`runtime.task_ok`: every read answer valid with the untied gold argmax, or an episode that
+replays to zero loss) within the cell's SLO. Fidelity (stock vs candidate on the same
+cases) covers every track a cell measures, decisions always, each guarded separately. Anything malformed, non-finite, missing, drifting, reordered or
+non-quiescent is `NO_DECISION`: an infrastructure retry with no credit. A candidate that
+completes nothing, regresses half-Brier, accuracy or p95 latency, or shows no gain above the
+calibrated margin on healthy infrastructure is rejected.

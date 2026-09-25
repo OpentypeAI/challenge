@@ -45,6 +45,7 @@ def _worker(args: argparse.Namespace) -> None:
                     log_dir=Path(args.workdir),
                 ),
                 concurrency=args.concurrency,
+                lane=args.lane,
             )
             if args.once:
                 await worker.run_once()
@@ -189,15 +190,38 @@ def _audit(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
 
-def _miner_submit(args: argparse.Namespace) -> None:
+def _signer(args: argparse.Namespace) -> Any:
     from . import miner
 
     if args.seed_file:
-        signer = miner.seed_signer(Path(args.seed_file).read_text())
-    elif args.wallet_name and args.wallet_hotkey:
-        signer = miner.wallet_signer(args.wallet_name, args.wallet_hotkey, args.wallet_path)
-    else:
-        raise SystemExit("pass --seed-file or --wallet-name and --wallet-hotkey")
+        return miner.seed_signer(Path(args.seed_file).read_text())
+    if args.wallet_name and args.wallet_hotkey:
+        return miner.wallet_signer(args.wallet_name, args.wallet_hotkey, args.wallet_path)
+    raise SystemExit("pass --seed-file or --wallet-name and --wallet-hotkey")
+
+
+def _miner_runtime_submit(args: argparse.Namespace) -> None:
+    """Sign the options for the current champion and calibrated profile read from the API."""
+    from . import miner, runtime
+
+    signer = _signer(args)
+    state = miner.runtime_state(args.api)
+    if not state["open"] or state["calibration"] is None:
+        raise SystemExit("the runtime lane is closed: the operator has not calibrated it yet")
+    try:
+        options = runtime.normalize_options(json.loads(args.options))
+    except (ValueError, runtime.RuntimeError_) as error:
+        raise SystemExit(f"--options: {error}") from None
+    body = miner.signed_runtime_submission(
+        args.slug, state["target"], state["calibration"]["profile_digest"], options, signer
+    )
+    print(miner.post_runtime(args.api, body)["id"])
+
+
+def _miner_submit(args: argparse.Namespace) -> None:
+    from . import miner
+
+    signer = _signer(args)
     manifest = miner.hf_manifest(args.repo, args.revision)
     result = miner.post(args.api, miner.signed_submission(manifest, signer))
     print(result["id"])
@@ -226,6 +250,12 @@ def parser() -> argparse.ArgumentParser:
     worker.add_argument("--canvas", type=int, default=256)
     worker.add_argument("--max-model-len", type=int, default=131072)
     worker.add_argument("--concurrency", type=int, default=64)
+    worker.add_argument(
+        "--lane",
+        choices=("quality", "runtime"),
+        default="quality",
+        help="runtime: one exclusive GPU, sequential B/C/B' measurement (operator hardware)",
+    )
     mode = worker.add_mutually_exclusive_group()
     mode.add_argument("--once", action="store_true", help="run at most one job")
     mode.add_argument(
@@ -268,6 +298,15 @@ def parser() -> argparse.ArgumentParser:
     submit.add_argument("--wallet-hotkey")
     submit.add_argument("--wallet-path")
     submit.set_defaults(run=_miner_submit)
+    rsubmit = msub.add_parser(
+        "runtime-submit", help="submit vLLM options for the champion's weights (runtime lane)"
+    )
+    rsubmit.add_argument("--api", required=True)
+    rsubmit.add_argument("--slug", default="opentype")
+    rsubmit.add_argument("--options", required=True, help="e.g. '{\"max_num_seqs\": 128}'")
+    for flag in ("--seed-file", "--wallet-name", "--wallet-hotkey", "--wallet-path"):
+        rsubmit.add_argument(flag)
+    rsubmit.set_defaults(run=_miner_runtime_submit)
     stat = msub.add_parser("status")
     stat.add_argument("--api", required=True)
     stat.add_argument("--id", required=True)
