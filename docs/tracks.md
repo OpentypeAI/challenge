@@ -1,7 +1,8 @@
 # OpenType v2: tracks, teacher, harness (build contract)
 
-Status: the binding contract for v2. Every module below implements exactly these names and
-shapes. Where this file and older docs disagree, this file wins.
+Status: the binding contract for v2, kept in step with the code of 2.0.0. Every module below
+implements exactly these names and shapes. Where this file and older docs disagree, this file
+wins; where it and the code disagree, the code is the reference and this file is fixed.
 
 v1 measured one skill: typed decisions on short, template-rendered records. v2 measures
 whether a DiffusionGemma checkpoint is usable in production:
@@ -30,10 +31,10 @@ spec (round trip). Picture tasks are graded by a VLM judge on the container's ow
 | `ops.py` (new) | ops env | `ENV`, `LEVELS`, `buildable(bank)`, `make_case(rng, level, bank)`, `sample_intent(rng, level)`, `INTENT_SCHEMA`, `describe_intent(intent)`, `render_intent(intent)`, `reference_policy(messages)` |
 | `sqltask.py` (new) | sql env | `ENV`, `LEVELS`, `buildable(bank)`, `make_case(rng, level, bank)`, `reference_policy(messages)` |
 | `paint.py` (new) | paint env, render, checks, judge prompt | `ENV`, `LEVELS`, `buildable(bank)`, `make_case(rng, level, bank)`, `render_png(commands)`, `blank_png()`, `judge_request`, `judge_loss`, `reference_policy(messages)`, `STANDARD_RUBRIC` |
-| `teacher.py` (new) | gateway client, bank builder | `Gateway`, `GatewayError`, `TeacherConfig`, `build_bank`, `round_trip`, `BANK_KINDS` |
+| `teacher.py` (new) | gateway client, bank builder, judge | `Gateway`, `GatewayError`, `TeacherConfig`, `DEFAULT_TARGETS`, `build_bank`, `round_trip`, `judge_png`, `BANK_KINDS` (re-exported from `bank.py`) |
 | `scoring.py` | per-case loss, duel statistics | existing names + `Paired.track`, `harness_score`, `verdict(pairs, retired, stopped, weights)` |
-| `tracks.py` (new) | track plan and dispatch | `TRACKS`, `ENVS` (`{"ops": ops.ENV, "sql": sqltask.ENV, "paint": paint.ENV}`), `TrackPlan`, `DEFAULT_PLAN`, `track_of`, `job_case`, `score_item`, `solve_body(body)` |
-| `bank.py` | seeds, windows, bank snapshots | existing names + `Bank`, `bank_digest`, `drand_beacon`, `job_seed(secret, job_id, digest, beacon=None)` |
+| `tracks.py` (new) | track plan and dispatch | `TRACKS`, `ENVS` (`{"ops": ops.ENV, "sql": sqltask.ENV, "paint": paint.ENV}`), `BUILDERS`, `TrackPlan`, `DEFAULT_PLAN`, `effective_plan(plan, bank, judge=True)`, `track_of`, `job_case(seed, plan, mix, index, bank, judge=True)`, `score_item`, `solve_body(body)` |
+| `bank.py` | seeds, windows, bank snapshots | existing names + `BANK_KINDS`, `BankItem`, `Bank`, `EMPTY_BANK`, `bank_digest`, `drand_beacon`, `job_seed(secret, job_id, digest, beacon=None)` |
 | `store.py`, `app.py`, `cli.py` | state, routes, CLI | see §8 |
 | `worker.py` | B300 duel worker | see §7 |
 
@@ -253,6 +254,9 @@ The served body of a harness case is:
  "limits": {"turns": 12, "max_tokens": 1024}, "seed": 123456789}
 ```
 
+`limits.turns` is 12 for every env. `limits.max_tokens` is 512 for `ops` and 1024 for `sql`
+and `paint`.
+
 It never contains the gold, the expected actions or the rubric.
 
 - `parse_action(text) -> dict | None` strips code fences and returns the first balanced
@@ -289,9 +293,13 @@ It never contains the gold, the expected actions or the rubric.
   carries the level-4 pressure, so it is round-tripped too. A bank story is used at a level
   only when its intent fits it (an order id at level 1, a claim only at level 4, no more
   items than the level allows).
-- **Customer text.** `render_intent(intent)` is the deterministic template text. A
-  bank `ops_story` (teacher prose, round-tripped) replaces it when one matches the sampled
-  intent kind. The case then adopts that story's intent and builds the world around it.
+- **Levels.** 1–4. They scale the named items (2, 2, 3, 4), the extra lines, the customer's
+  other orders, other customers, offered variants and quantities, the chance that the
+  customer gives no order id (0, 0.6, 0.5, 0.5), the exception clauses (final sale, partial
+  refunds, an escalation threshold; levels 3–4) and the pressure clause (level 4).
+- **Customer text.** `render_intent(intent)` is the deterministic template text. When the
+  bank holds `ops_story` items that fit the level, one of them replaces the template with
+  probability 0.5. The case then adopts that story's intent and builds the world around it.
 - **Tools** (JSON, one per turn): `find_customer(email)`, `list_orders(customer_id)`,
   `get_order(order_id)`, `refund(order_id, item_ids, reason)`, `cancel(order_id)`,
   `exchange(order_id, item_id, new_sku)`, `escalate(summary)` and `finish(outcome)`, where
@@ -304,9 +312,12 @@ It never contains the gold, the expected actions or the rubric.
 
 ### 5.2 sql
 
-- **Task.** Each case generates 3–5 tables with 20–400 rows and a question from a
-  structured query spec: filter, join, group by, aggregate, top-k and date ranges, scaled
-  by level. The gold is the result of the compiled reference SQL on the same database.
+- **Task.** Each case generates 4 tables (`customers`, `products`, `orders`,
+  `order_items`), plus `reviews` from level 3, with 20–400 rows each, and a question from
+  one of 12 structured query kinds (3 per level, levels 1–4): filter, join, group by,
+  aggregate, top-k and date ranges. The answer shape is a scalar, a unique first row, an
+  ordered top-k list or a set. The gold is the result of the compiled reference SQL on the
+  same database, and a case is kept only when that answer is unique.
 - **Tools.** `sql(query)` returns at most 50 rows and 4,000 characters. `answer(value)`
   gives the final answer: a number, a string or a list.
 - **Sandbox.** The database is an in-memory `sqlite3` created per episode from the task.
@@ -321,7 +332,8 @@ It never contains the gold, the expected actions or the rubric.
   - Only one statement starting with `SELECT`, `WITH` or `VALUES` runs (`EXPLAIN` is
     refused: it leaks pointers).
   - A progress handler aborts after 2,000,000 VM steps. Limits: `SQLITE_LIMIT_LENGTH` 1000,
-    `SQL_LENGTH` 4000, `LIKE_PATTERN_LENGTH` 100, `temp_store=MEMORY`, no statement cache.
+    `SQL_LENGTH` 4000, `LIKE_PATTERN_LENGTH` 100, `COMPOUND_SELECT` 20, `EXPR_DEPTH` 100,
+    `ATTACHED` 0, `temp_store=MEMORY`, no statement cache.
   - The query text is capped at 4,000 characters; NUL or unencodable characters come back
     as an error observation.
 - **Loss.** 0 when the normalized answer equals the gold, else 1. Numbers compare at
@@ -341,17 +353,23 @@ It never contains the gold, the expected actions or the rubric.
   - `clear()` empties the canvas.
   - `done()` ends the episode.
 - **Coordinates and colours.** Coordinates are integers clamped to `[−64, 320]`. Colours
-  are `#rrggbb` or a palette name. At most 400 commands per episode.
+  are `#rrggbb` or one of 12 palette names. A polygon has at most 64 points. At most 400
+  accepted commands per episode, undone ones included. An invalid command rejects the
+  whole draw.
 - **Rendering.** Pillow `ImageDraw` without antialiasing. `render_png(commands) -> bytes`
   is deterministic for a given Pillow major version. The observation after each draw is
   the PNG as an `image_url` part plus a one-line text summary.
-- **Level 1–2: `spec`.** The brief is generated from a structured spec: palette colours,
-  shapes, regions, counts, and relations such as left of, above, inside or larger than.
-  The checks run on the container's render. They are exact pixel predicates:
-  - the fraction of a region covered by a colour;
-  - the connected-component count of a colour;
-  - centroid relations;
-  - background purity.
+- **Level 1–2: `spec`.** The brief is rendered from a structured list of checks and
+  parsed back (`parse(brief) == checks`), and the reference painter must pass every check
+  before the case is kept. Level 1 has 1–2 shapes; level 2 has 3–6 and relations. The
+  checks run on the container's render and are exact pixel predicates on palette colours:
+  - `count`: connected components of a colour;
+  - `within`: every pixel of a colour lies in a region;
+  - `cover`: the percentage of a region a colour covers lies in a range;
+  - `shape`: circle, rectangle or triangle, from the fill ratio of its bounding box;
+  - `size`: the sides of each shape lie in a range;
+  - `left_of`, `above`, `larger`, `inside`, `apart`: relations between shapes;
+  - `stray`: at most 1 % of the canvas in colours outside the spec.
 
   Loss = 1 − checks passed / checks.
 - **Level 3: `depict`.** The brief is a bank `depict` item, and `loss` returns `None`. The
@@ -372,7 +390,7 @@ It never contains the gold, the expected actions or the rubric.
   items)`. It rejects a verdict whose ids are not exactly `1..n` or on which the judges
   disagree about `n`; with `items` (the rubric length + 1) it also rejects a short verdict.
 - The two sides of a case are judged in separate calls, in an order drawn from the case
-  seed.
+  seed (`Random(f"judge|{seed}")`).
 - If an item cannot be judged after 5 attempts, the pair is excluded on **both** sides and
   counted in the verdict as `unjudged`.
 
@@ -399,19 +417,22 @@ It never contains the gold, the expected actions or the rubric.
 ### Plan and cases
 
 - **Plan.** `Settings.plan` maps each track to `TrackPlan(weight, cases)`. It is loaded
-  from the env `OPENTYPE_PLAN` (JSON). The default is:
+  from the env `OPENTYPE_PLAN` (JSON `{track: {"weight", "cases"}}`). The default is
+  (21,600 cases in total):
 
   ```text
   decisions 0.35/20000   longctx 0.25/800   ops 0.15/300   sql 0.10/300   paint 0.15/200
   ```
 
-  A track whose cases cannot be built (for example `depict` without a judge) keeps its
-  weight but only builds the levels it can. A track with no buildable level is dropped,
-  and the remaining weights are renormalized.
+  `effective_plan(plan, bank, judge)` is what a job runs. A track whose cases cannot all be
+  built (for example `depict` without a judge) keeps its weight but only builds the levels
+  it can. A track with no buildable level, no case or no weight is dropped, and the
+  remaining weights are renormalized. The job stores its effective plan, and the job's case
+  count is the plan's total.
 - **Case order.** `track_of(index, plan)` is a deterministic interleave, so any prefix
   holds the tracks in proportion. The k-th case of track `t` has key `(k + 0.5) / n_t`.
   Cases are merged by `(key, track order)`.
-- **Case construction.** `job_case(seed, plan, mix, index, bank)` takes
+- **Case construction.** `job_case(seed, plan, mix, index, bank, judge)` takes
   `rng = Random(f"{seed}|{index}")`, then:
   - for `decisions`: picks the level from `mix`, uses a sealed family with probability 0.3
     when the bank has one, and uses prose with probability 0.5 when the bank has prose for
@@ -429,7 +450,8 @@ It never contains the gold, the expected actions or the rubric.
   `log_ratio` on that track's case sums.
 - **Composite.** `g = Σ π_t g_t / Σ π_t` and `se = sqrt(Σ π_t² se_t²) / Σ π_t`, over the
   tracks present. `g_LCB` is the min over the even and odd halves of the composite LCB99.
-- **Crown.** A challenger is crowned when all of these hold:
+- **Crown.** A challenger is crowned when all of these hold (the per-track guard uses all
+  active pairs, not the halves):
   - `g_LCB ≥ g_min`;
   - the v1 retired-level guard passes (decisions track only);
   - no track with at least 30 pairs regresses, meaning `g_t + Z99·se_t ≥ −ln 1.02` for
@@ -437,7 +459,8 @@ It never contains the gold, the expected actions or the rubric.
   - the duel was not early-stopped.
 - **Early stop.** v1's rule applied to the composite.
 - The verdict reports `tracks: {t: {g, se, pairs, champion_loss, challenger_loss,
-  accuracy}}`.
+  accuracy, regressed}}`, `track_guard: {pairs, min}` and `unjudged` (pairs excluded because
+  a side could not be judged). Only decisions pairs feed the ladder statistics.
 
 ### Windows and the bank builder
 
@@ -446,7 +469,10 @@ It never contains the gold, the expected actions or the rubric.
 - `rotate_window` promotes the next window, whose bank is complete. It never swaps a
   window's bank while that window is open.
 - The window auto-rotates when the next bank is ready and the current window is at least
-  `OPENTYPE_WINDOW_HOURS` old (default 24). `POST /v1/admin/window/rotate` still works.
+  `OPENTYPE_WINDOW_HOURS` old (default 24); the check runs every 30 s. Without a teacher no
+  next bank is ever ready, so windows rotate only on `POST /v1/admin/window/rotate`, which
+  always works and opens the new window with the next bank or, when none is ready, the
+  empty bank.
 - `sha256(secret)` and `bank_digest` are published when a window opens.
 - The secret and the bank items are published when the window closes:
   `GET /v1/windows/{id}/bank?offset&limit`, paged under 6 MiB.
@@ -458,14 +484,17 @@ It never contains the gold, the expected actions or the rubric.
   timeout. It stores `{round, randomness}` on the job, reuses it on every retry and
   publishes it with the window. When drand is unreachable, it stores `null` and the job
   uses v1's seed.
-- **Judging.** Pending judgments are stored in a `judgments` table. `complete` moves the
-  job to `judging` while any judgment is pending. A background task judges them, scores
+- **Judging.** Pending judgments (the container's PNG, brief and rubric) are stored in a
+  `judgments` table. `complete` moves the job to `judging` while any judgment is pending
+  and judges inline for up to 20 s. A background task (every 30 s) judges the rest, scores
   them and then settles the job exactly like `complete`.
 - **Schema.** `results` gains `track`. The schema version is stored in
   `PRAGMA user_version`. A v1 database is migrated in place.
 - **Case cache.** The case cache is bounded by bytes (≤ 128 MiB), not by count.
-- **Secrets.** `teacher.token` sits next to the other token files. Without it, the teacher
-  is off and everything else works.
+- **Secrets.** `teacher.token` sits next to the other token files. It is checked once at
+  startup: when `OPENTYPE_TEACHER_URL` is unset or the file is missing or empty, the
+  teacher (bank builder and judge) is off and everything else works. The gateway re-reads
+  the file on every call, so the token rotates without a restart.
 
 ## 9. Anti-cheat summary
 
@@ -478,7 +507,7 @@ It never contains the gold, the expected actions or the rubric.
 | code execution from model output | none, except SQL in the sqlite authorizer sandbox with a step limit. Paint commands are data |
 | weak on one skill, strong on another | the per-track regression guard blocks a crown that regresses significantly on any track |
 | an operator picking seeds | commit-reveal of the window secret and bank digest, plus a drand beacon mixed into the job seed |
-| surface cues in templates | `tests/test_shortcuts.py`: a bag-of-words naive Bayes on public cases must stay within 3 points of the majority baseline |
+| surface cues in templates | `tests/test_shortcuts.py`: a bag-of-words naive Bayes on public decisions cases must stay within 3 points of the majority baseline on determined yes/no items |
 
 ## 10. Oracles, markers and buildable levels (test and dispatch contract)
 
