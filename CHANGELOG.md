@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-09-25
+
+### Added
+
+- `worker --until-empty`: runs jobs until the queue is empty, then exits. A master outage
+  backs off and retries instead of ending the run. `--once` and `--until-empty` are
+  mutually exclusive.
+- `deploy/modal_worker.py`: a scale-to-zero worker on Modal (1x H200).
+
 ## [2.0.0] - 2026-09-25
 
 The challenge now measures production usability across five tracks, with private per-window

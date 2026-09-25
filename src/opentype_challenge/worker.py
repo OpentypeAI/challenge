@@ -309,6 +309,10 @@ class _ItemError(Exception):
     """A 4xx or malformed model reply: that side forfeits the case, the job goes on."""
 
 
+class ApiUnavailable(RuntimeError):
+    """The API exhausted its bounded transport/service retries."""
+
+
 class Api:
     def __init__(self, base: str, token: str, client: httpx.AsyncClient):
         self.base, self.client = base.rstrip("/"), client
@@ -323,13 +327,13 @@ class Api:
             except httpx.TransportError:
                 await asyncio.sleep(2**attempt)
                 continue
-            if response.status_code in (502, 503, 504):
+            if response.status_code == 429 or response.status_code >= 500:
                 await asyncio.sleep(2**attempt)
                 continue
             if response.status_code >= 400:
                 raise RuntimeError(f"{method} {path}: {response.status_code} {response.text[:300]}")
             return response
-        raise RuntimeError(f"{method} {path}: the API stayed unavailable")
+        raise ApiUnavailable(f"{method} {path}: the API stayed unavailable")
 
 
 @dataclass
@@ -520,14 +524,20 @@ class Worker:
                 await client.aclose()
         return {"cases_fetched": fetched, "cases_sha256": cases_hash.hexdigest(), "errors": errors}
 
-    async def run_forever(self, idle: float = 30.0) -> None:
+    async def run_forever(self, idle: float = 30.0, until_empty: bool = False) -> None:
+        """Drain the queue or poll forever. Scheduled drains fail after bounded API retries."""
         while True:
             try:
                 ran = await self.run_once()
-            except RuntimeError as error:
+            except ApiUnavailable as error:
+                if until_empty:
+                    raise
                 print(f"worker: {error}", file=sys.stderr, flush=True)
-                ran = False
+                await asyncio.sleep(idle)
+                continue
             if not ran:
+                if until_empty:
+                    return
                 await asyncio.sleep(idle)
 
 
