@@ -48,6 +48,9 @@ def _worker(args: argparse.Namespace) -> None:
             )
             if args.once:
                 await worker.run_once()
+            elif args.until_empty:
+                while await worker.run_once():
+                    pass
             else:
                 await worker.run_forever()
 
@@ -227,6 +230,9 @@ def parser() -> argparse.ArgumentParser:
     worker.add_argument("--max-model-len", type=int, default=131072)
     worker.add_argument("--concurrency", type=int, default=64)
     worker.add_argument("--once", action="store_true", help="run at most one job")
+    worker.add_argument(
+        "--until-empty", action="store_true", help="run jobs until the queue is empty, then exit"
+    )
     worker.set_defaults(run=_worker)
 
     gen = sub.add_parser("generate", help="public training cases (exact targets or oracles)")

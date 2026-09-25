@@ -231,3 +231,22 @@ def test_vllm_command_and_urls():
     assert VllmLauncher(max_model_len=65536).commands("champion", launcher.log_dir)[0][-3] == (
         "65536"
     )
+
+
+def test_until_empty_runs_jobs_until_the_queue_is_empty(monkeypatch, tmp_path):
+    from opentype_challenge import cli, pins, worker
+
+    runs = iter([True, True, False])
+    calls: list[int] = []
+
+    async def run_once(self):
+        calls.append(1)
+        return next(runs)
+
+    token = tmp_path / "token"
+    token.write_text("t")
+    monkeypatch.setattr(worker.Worker, "run_once", run_once)
+    monkeypatch.setattr(worker, "sha256_file", lambda path: pins.STRUCTURED_SERVER_SHA256)
+    cli.main(["worker", "--api", "http://x", "--token-file", str(token), "--workdir",
+              str(tmp_path), "--until-empty"])  # fmt: skip
+    assert len(calls) == 3

@@ -112,6 +112,8 @@ One worker host needs 1× B300 (both BF16 models, about 52 GB each, at 0.45 of G
 per side, with a 131,072-token context and one image per prompt). It also needs about 250 GB of disk for the kept champion, one challenger and the
 base support files, and outbound HTTPS to `huggingface.co` and the master.
 
+`deploy/modal_worker.py` runs a worker on Modal (1x H200, scale to zero).
+
 ```bash
 install -d -m 0700 /srv/opentype/work
 install -m 0400 worker.token /srv/opentype/worker.token
