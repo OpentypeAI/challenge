@@ -88,7 +88,7 @@ constants. New in 2.0: `window.bank_digest`, `plan`, `tracks`, `teacher`, and
   "tracks": {"decisions": {"weight": 0.35, "cases": 20000, "results": 812000}, "...": {}},
   "teacher": {"state": "ready", "judge": true, "judgments_pending": 0},
   "crowns_paused": false,
-  "constants": {"g_min": 0.0513, "z": 2.326, "guard_max": 0.002, "duel_cases": 21600,
+  "constants": {"g_min": 0.0513, "z": 2.326, "guard_max": 0.002, "duel_cases": 7400,
                 "early_stop_decisions": 5000, "early_stop_se": 3.0, "retire_accuracy": 0.999,
                 "max_pending": 4, "window_entitlement_cap": null,
                 "base": {"repo": "...", "revision": "..."}}
@@ -164,7 +164,7 @@ The body is at most 64 KiB. It returns `201` with the submission.
   "id": "s_a1c580f2a43edaeb", "hotkey": "5D...", "repo": "you/model", "revision": "...",
   "digest": "...", "state": "queued", "reason": null, "intake": 1, "created_at": "...",
   "job": {"id": "j_...", "state": "leased", "judgments_pending": 0, "champion": 1, "window": 1,
-          "cases": 21600, "paired": 12000, "attempts": 0, "verdict": null, "evidence": null,
+          "cases": 7400, "paired": 12000, "attempts": 0, "verdict": null, "evidence": null,
           "reason": null}
 }
 ```
@@ -191,7 +191,7 @@ Returns `204` when the queue is empty. Otherwise:
 
 ```json
 {
-  "job": "j_...", "lease": "<32 hex>", "lease_expires": "...", "cases": 21600,
+  "job": "j_...", "lease": "<32 hex>", "lease_expires": "...", "cases": 7400,
   "plan": {"decisions": {"weight": 0.35, "cases": 20000}, "...": {}},
   "champion": {"repo": "...", "revision": "...", "files": {...}, "digest": "..."},
   "challenger": {"repo": "...", "revision": "...", "files": {...}, "digest": "..."},

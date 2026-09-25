@@ -102,6 +102,7 @@ WINDOW_COLUMNS = "id, secret, commitment, opened_at, closed_at, bank_digest"
 
 
 UNJUDGED_MAX = 0.05  # share of judged cases a crowned duel may drop as unreadable
+JUDGE_DEADLINE_SECONDS = 6 * 3600  # a judging job settles without its missing sides after this
 
 
 class StoreError(Exception):
@@ -582,15 +583,9 @@ class Store:
 
     def lease(self) -> dict[str, Any] | None:
         # The drand beacon is fetched once per job, outside the lock (5 s timeout), and
-        # stored on its first lease; retries reuse it.
-        with self._lock:
-            head = self._db.execute(
-                "SELECT j.id, j.beacon_fetched FROM jobs j JOIN submissions s "
-                "ON s.id=j.submission_id WHERE j.state='queued' ORDER BY s.intake LIMIT 1"
-            ).fetchone()
-        beacon = None
-        if head is not None and not head["beacon_fetched"]:
-            beacon = (head["id"], self.beacon())
+        # stored on its first lease; retries reuse it. Expired leases are released first so
+        # the head the beacon is fetched for is the job leased below; if a concurrent lease
+        # or intake still moves the head meanwhile, fetch again for the new head.
         now = self._now()
         with self._tx() as db:
             expired = db.execute(
@@ -600,6 +595,17 @@ class Store:
                 self._release(db, job["id"], "lease expired")
             if expired:
                 self._finalize(db)
+        beacon: tuple[str, dict[str, Any] | None] | None = None
+        for _ in range(3):
+            with self._lock:
+                head = self._db.execute(
+                    "SELECT j.id, j.beacon_fetched FROM jobs j JOIN submissions s "
+                    "ON s.id=j.submission_id WHERE j.state='queued' ORDER BY s.intake LIMIT 1"
+                ).fetchone()
+            if head is None or head["beacon_fetched"] or (beacon and beacon[0] == head["id"]):
+                break
+            beacon = (head["id"], self.beacon())
+        with self._tx() as db:
             job = db.execute(
                 "SELECT j.* FROM jobs j JOIN submissions s ON s.id=j.submission_id "
                 "WHERE j.state='queued' ORDER BY s.intake LIMIT 1"
@@ -612,10 +618,8 @@ class Store:
                     "UPDATE jobs SET beacon=?, beacon_fetched=1 WHERE id=?",
                     (_dumps(beacon[1]) if beacon[1] else None, job["id"]),
                 )
-            elif not job["beacon_fetched"]:
-                # ponytail: the queue head changed while drand was fetched; this job runs
-                # with v1's seed. Fetch inside a retry loop if that race ever matters.
-                db.execute("UPDATE jobs SET beacon_fetched=1 WHERE id=?", (job["id"],))
+            # else: the head moved three times while drand was fetched; this attempt runs
+            # with v1's seed and beacon_fetched stays 0, so a retry fetches one.
             self._target(db, job["id"])  # current champion, window, mix, plan and seed
             lease = secrets.token_hex(16)
             db.execute(
@@ -852,8 +856,9 @@ class Store:
             ).fetchone()
             if pending:
                 db.execute(
-                    "UPDATE jobs SET state='judging', lease=NULL, lease_expires=NULL WHERE id=?",
-                    (job_id,),
+                    # lease_expires is the judging deadline while the job is 'judging'
+                    "UPDATE jobs SET state='judging', lease=NULL, lease_expires=? WHERE id=?",
+                    (self._now() + JUDGE_DEADLINE_SECONDS, job_id),
                 )
             else:
                 self._settle(db, job_id)
@@ -867,7 +872,7 @@ class Store:
         job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         unjudged = db.execute(
             "SELECT case_index FROM judgments WHERE job_id=? GROUP BY case_index "
-            "HAVING sum(state='unjudged') = 2",
+            "HAVING sum(state='unjudged') = 2 OR sum(state='expired') > 0",
             (job_id,),
         ).fetchall()
         judged = db.execute(
@@ -966,8 +971,16 @@ class Store:
             )
 
     def settle_judged(self) -> list[str]:
-        """Settle every judging job with no pending judgment, exactly like complete."""
+        """Settle every judging job with no pending judgment, exactly like complete. A job
+        past its judging deadline (judge down, or a restart without the teacher) first has
+        its pending sides expired: those cases drop on both sides and count as unjudged, so
+        the crown is refused past UNJUDGED_MAX instead of blocking later crowns forever."""
         with self._tx() as db:
+            db.execute(
+                "UPDATE judgments SET state='expired' WHERE state='pending' AND job_id IN "
+                "(SELECT id FROM jobs WHERE state='judging' AND lease_expires < ?)",
+                (self._now(),),
+            )
             jobs = db.execute(
                 "SELECT id FROM jobs WHERE state='judging' AND NOT EXISTS (SELECT 1 FROM "
                 "judgments WHERE judgments.job_id=jobs.id AND state='pending') ORDER BY id"

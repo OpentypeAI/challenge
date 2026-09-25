@@ -33,7 +33,7 @@ certified gains measured against exact gold.
 | `sql` | a multi-turn analyst over a sandboxed SQLite database | exact reference-SQL answer | 0/1 |
 | `paint` | a multi-turn painter that sees its canvas after every turn | `spec`: exact pixel checks; `depict`: VLM rubric | checks failed / judge |
 
-The default duel runs 21,600 cases. Track weights are 0.35 / 0.25 / 0.15 / 0.10 / 0.15.
+The default duel runs 7,400 cases. Track weights are 0.35 / 0.25 / 0.15 / 0.10 / 0.15.
 See [docs/mechanism.md](docs/mechanism.md).
 
 ## Anti-cheat highlights

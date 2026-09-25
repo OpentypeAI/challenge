@@ -333,7 +333,7 @@ It never contains the gold, the expected actions or the rubric.
     refused: it leaks pointers).
   - A progress handler aborts after 500,000 VM steps. Limits: `SQLITE_LIMIT_LENGTH` 1000,
     `SQL_LENGTH` 4000, `LIKE_PATTERN_LENGTH` 100, `COMPOUND_SELECT` 20, `EXPR_DEPTH` 100,
-    `ATTACHED` 0, `temp_store=MEMORY`, no statement cache.
+    `ATTACHED` 0, `temp_store=FILE` with a 1 MiB page cache, no statement cache.
   - The query text is capped at 4,000 characters; NUL or unencodable characters come back
     as an error observation.
 - **Loss.** 0 when the normalized answer equals the gold, else 1. Numbers compare at

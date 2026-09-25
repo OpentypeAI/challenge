@@ -17,7 +17,14 @@ import pytest
 from opentype_challenge import bank, paint, scoring, tracks
 from opentype_challenge.bank import EMPTY_BANK, BankItem
 from opentype_challenge.crypto import manifest_digest
-from opentype_challenge.store import PAGE_BYTES, Settings, Store, judge_order
+from opentype_challenge.store import (
+    JUDGE_DEADLINE_SECONDS,
+    LEASE_SECONDS,
+    PAGE_BYTES,
+    Settings,
+    Store,
+    judge_order,
+)
 from opentype_challenge.tracks import TrackPlan
 
 from .conftest import ADMIN, WORKER, Clock, bearer, weights_manifest
@@ -310,6 +317,42 @@ def test_unreachable_drand_falls_back_to_the_v1_seed(tmp_path):
     assert job["seed"] == bank.job_seed(secret, job["id"], submission["digest"])
 
 
+def test_the_beacon_follows_the_head_after_an_expired_lease_or_a_race(tmp_path):
+    clock = Clock()
+    fetched: list[str] = []
+    racing: list[Any] = []
+
+    def beacon() -> dict[str, Any]:
+        if racing:  # a concurrent fail requeues the earlier job while drand is fetched
+            job, lease = racing.pop()
+            store.fail(job, lease, "infra", True, {})
+        fetched.append(head())
+        return BEACON
+
+    def head() -> str:
+        return store._db.execute(
+            "SELECT j.id FROM jobs j JOIN submissions s ON s.id=j.submission_id "
+            "WHERE j.state='queued' ORDER BY s.intake LIMIT 1"
+        ).fetchone()[0]
+
+    store = store_of(tmp_path, clock, beacon=beacon)
+    enqueue(store, "a")
+    first = lease_of(store)
+    enqueue(store, "b")
+    clock.now += LEASE_SECONDS + 1  # the expired lease is released before the head is read
+    again = lease_of(store)
+    assert again["job"] == first["job"] and fetched == [first["job"]]
+    # a v1 job never fetched a beacon; requeued mid-fetch, it becomes the head and gets one
+    store._db.execute("UPDATE jobs SET beacon_fetched=0 WHERE id=?", (first["job"],))
+    racing.append((again["job"], again["lease"]))
+    third = lease_of(store)
+    assert third["job"] == first["job"] and fetched[-1] == first["job"]
+    row = store._db.execute("SELECT beacon FROM jobs WHERE id=?", (first["job"],)).fetchone()
+    assert json.loads(row["beacon"]) == BEACON
+    other = store._db.execute("SELECT beacon_fetched FROM jobs WHERE id != ?", (first["job"],))
+    assert other.fetchone()[0] == 0  # b keeps its own fetch for its own lease
+
+
 # -- early stop --------------------------------------------------------------------
 
 
@@ -523,6 +566,26 @@ def test_a_restart_without_the_teacher_keeps_pending_judgments(tmp_path, make_cl
     again = client.app.state.store
     assert len(again.pending_judgments()) == pending  # not scored unjudged
     assert again.submission(sid)["job"]["state"] == "judging"
+
+
+def test_a_judging_job_settles_past_its_deadline(tmp_path):
+    clock = Clock()
+    store = store_of(
+        tmp_path, clock, settings=Settings(plan={"paint": TrackPlan(1.0, 12)}), judge=True
+    )
+    with_bank(store, [BankItem.make("depict", DEPICT)])
+    sid = enqueue(store, "a")["id"]
+    lease = lease_of(store)
+    cases = answer_paint(store, lease)
+    depicts = sum(c["body"]["task"]["mode"] == "depict" for c in cases)
+    assert store.complete(lease["job"], lease["lease"], {})["job"]["state"] == "judging"
+    assert store.settle_judged() == []
+    clock.now += JUDGE_DEADLINE_SECONDS + 1  # judge down, or a restart without the teacher
+    assert store.settle_judged() == [lease["job"]]
+    verdict = store.submission(sid)["job"]["verdict"]
+    assert verdict["unjudged"] == depicts and not verdict["crown"]
+    assert verdict["tracks"]["paint"]["pairs"] == 12 - depicts
+    assert store.pending_judgments() == []
 
 
 def test_rotation_does_not_wait_for_the_judging_backlog(tmp_path, make_client, clock):

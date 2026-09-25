@@ -279,10 +279,8 @@ def create_app(
         raises (gateway outage, closed at shutdown) leaves its side pending for a later pass;
         only None (the judge's replies about this render were unreadable) excludes the pair.
         Without a judge (teacher off at startup) nothing is judged: the sides stay pending
-        until a restart with the teacher, never scored as unjudged.
-
-        ponytail: a long outage holds its jobs in 'judging'; add an operator deadline if that
-        ever bites.
+        until a restart with the teacher or the judging deadline, never forfeited.
+        A job still judging after JUDGE_DEADLINE_SECONDS settles without its missing sides.
         """
         done = 0
         down = False

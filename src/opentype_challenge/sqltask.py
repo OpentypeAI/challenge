@@ -278,9 +278,9 @@ _STATEMENT = re.compile(r"(?:select|with|values)\b", re.I)
 class _Sandbox:
     """One in-memory database built from the task rows, then locked down for model SQL.
 
-    ponytail: memory is bounded only through the step limit (temp_store=MEMORY keeps sorts
-    off disk; about 120 MB peak for a sort bomb). Run episodes in a memory-capped subprocess
-    if that is ever too much.
+    Sorts, DISTINCT, windows and materialized CTEs spill to temp files (temp_store=FILE,
+    a 1 MiB page cache), so an episode holds a few MB at most (measured ~4 MB peak against
+    ~32 MB in memory); the step limit bounds the rest.
     """
 
     def __init__(self, tables: Mapping[str, Mapping[str, Any]]) -> None:
@@ -288,7 +288,8 @@ class _Sandbox:
         con = sqlite3.connect(
             ":memory:", isolation_level=None, cached_statements=0, check_same_thread=False
         )
-        con.execute("PRAGMA temp_store = MEMORY")
+        con.execute("PRAGMA temp_store = FILE")
+        con.execute("PRAGMA cache_size = -1024")
         for name in sorted(tables):
             columns = tables[name]["columns"]
             decl = ", ".join(f"{col} {kind}" for col, kind in columns)

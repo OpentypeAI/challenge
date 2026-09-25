@@ -18,7 +18,7 @@ tower: the `paint` track sends images.
 
 ## 1. What is measured
 
-A duel runs the same cases on your model and on the champion. The default plan has 21,600
+A duel runs the same cases on your model and on the champion. The default plan has 7,400
 cases. `GET /v1/status` shows the live `plan` and track weights:
 
 | Track | Cases | Weight | How your model is called | Loss |

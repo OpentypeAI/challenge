@@ -64,7 +64,7 @@ The image already sets `CHALLENGE_SLUG=opentype`, `CHALLENGE_STATE_DIR=/data` an
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CHALLENGE_MASTER_URL` | `http://cortex-master:8080` | where the metagraph is read |
-| `OPENTYPE_PLAN` | the 5-track default (21,600 cases) | JSON `{track: {"weight", "cases"}}` over `decisions`, `longctx`, `ops`, `sql`, `paint` |
+| `OPENTYPE_PLAN` | the 5-track default (7,400 cases) | JSON `{track: {"weight", "cases"}}` over `decisions`, `longctx`, `ops`, `sql`, `paint` |
 | `OPENTYPE_DUEL_CASES` | `40000` | v1 knob: used only when `OPENTYPE_PLAN` is unset and the value is not the default, and then gives a decisions-only plan |
 | `OPENTYPE_MAX_PENDING` | `4` | queued submissions across all hotkeys |
 | `OPENTYPE_WINDOW_HOURS` | `24` | minimum window age before auto-rotation to a ready bank |

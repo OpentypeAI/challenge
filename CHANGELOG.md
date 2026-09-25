@@ -13,8 +13,8 @@ teacher content and a VLM judge for free-form pictures.
 
 - Tracks and plan (`tracks.py`): `decisions`, `longctx`, `ops`, `sql` and `paint`,
   interleaved so that every prefix of a duel holds the tracks in proportion.
-  `OPENTYPE_PLAN` configures them. The default is 0.35/20,000, 0.25/800, 0.15/300,
-  0.10/300 and 0.15/200.
+  `OPENTYPE_PLAN` configures them. The default is 0.35/4,000, 0.25/800, 0.15/1,000,
+  0.10/1,000 and 0.15/600 (7,400 cases).
 - `longctx`: 8k–100k-token dossiers with corrections, near-duplicate ids and a uniform
   target depth. The gold is the exact posterior, recomputed from the text by `solve`.
 - Multi-turn harness (`harness.py`): one JSON tool call per turn, at most 12 turns, and only

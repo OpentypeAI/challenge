@@ -81,7 +81,7 @@ def effective_plan(
 
 @lru_cache(maxsize=16)
 def _schedule(key: PlanKey) -> tuple[str, ...]:
-    # ponytail: materialises the whole order (~22k slots for DEFAULT_PLAN, sorted once per
+    # ponytail: materialises the whole order (7,400 slots for DEFAULT_PLAN, sorted once per
     # plan); fine to ~1e6 cases. Past that, count keys below index/total per track instead.
     order = {t: i for i, t in enumerate(TRACKS)}
     slots = [((k + 0.5) / p.cases, order[t], t) for t, p in key for k in range(p.cases)]
