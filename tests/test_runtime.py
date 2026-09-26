@@ -1603,7 +1603,8 @@ class QualitySandboxes(FakeLauncher):
 
     def __init__(self, profiles: list[dict[str, Any]], fail_at: int | None = None):
         super().__init__()
-        self.profiles, self.fail_at, self.placements = profiles, fail_at, []
+        self.profiles, self.fail_at = profiles, fail_at
+        self.placements: list[dict[str, Any]] = []
 
     def profile(self) -> dict[str, Any]:
         return self.profiles[len(self.starts) - 1]
@@ -1626,7 +1627,7 @@ def duel_sandboxed(monkeypatch, launcher: QualitySandboxes) -> tuple[dict, dict]
     instance = worker.Worker(None, None, launcher)  # type: ignore[arg-type]
     evidence: dict[str, Any] = {}
     models = {"champion": worker.Path("/c"), "challenger": worker.Path("/x")}
-    counts = asyncio.run(instance._duel_sandboxed({}, models, evidence))  # type: ignore[arg-type]
+    counts = asyncio.run(instance._duel_sandboxed({}, models, evidence))
     return counts, evidence
 
 
