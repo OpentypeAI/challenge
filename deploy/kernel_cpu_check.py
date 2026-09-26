@@ -42,15 +42,19 @@ for n in (256, 512, 2816):
     w = (torch.randn(n) + 1).to(torch.bfloat16)
     out = torch.ops.opentype.rms_norm(x, w, 1e-6).float()
     ref = ir.ops.rms_norm.impls["native"].impl_fn(x, w, 1e-6).float()
-    nan += int(out.isnan().sum())
+    # every element finite before any difference: max() over floats silently skips NaN
+    nan += int((~out.isfinite()).sum()) + int((~ref.isfinite()).sum())
+    if nan:
+        worst = float("inf")
+        continue
     # in units of one bf16 ulp of the reference (2^-7 relative)
     ulp = (ref.abs() * 2.0**-7).clamp_min(2.0**-126)
-    worst = max(worst, float(((out - ref).abs() / ulp).nan_to_num(float("inf")).max()))
+    worst = max(worst, float(((out - ref).abs() / ulp).max()))
 args = EngineArgs.add_cli_args(FlexibleArgumentParser()).parse_args(
     ["--ir-op-priority", json.dumps({"rms_norm": ["opentype"]})]
 )
 priority = EngineArgs.from_cli_args(args).ir_op_priority.rms_norm
-print(json.dumps({"impls": impls, "schema": schema, "nan": nan, "worst_ulp": worst,
+print(json.dumps({"impls": impls, "schema": schema, "nonfinite": nan, "worst_ulp": worst,
                   "priority": priority}))
 """
 
@@ -99,10 +103,10 @@ def main() -> int:
             if name == "correct":
                 # fp32 reduction order may round y to the neighbouring bf16 before the weight:
                 # a few units of |ref| * 2^-7, never more
-                good = good and row.get("nan") == 0 and row.get("worst_ulp", 99) <= 4.0
+                good = good and row.get("nonfinite") == 0 and row.get("worst_ulp", 99) <= 4.0
             else:
                 # zeros are 128 units off: the slot's output must visibly change
-                good = good and row.get("worst_ulp", 0) >= 64
+                good = good and row.get("nonfinite") == 0 and row.get("worst_ulp", 0) >= 64
             row["ok"] = good
             ok = ok and good
             results[name] = row
