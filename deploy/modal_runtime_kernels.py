@@ -22,3 +22,8 @@ def rms_norm_kernel(x_ptr, w_ptr, out_ptr, x_row_stride, out_row_stride, n_cols,
 """
 CONTROL_KERNEL = RMS_KERNEL.replace("y * w, mask=mask", "y * w * 0.0, mask=mask")
 assert CONTROL_KERNEL != RMS_KERNEL
+# One rounding at the store instead of two: what a compiler that drops the intermediate cast
+# (inductor without emulate_precision_casts) makes of native. Which one stock actually runs
+# on B300 is what kernel_op_probe measures; the CPU interpreter cannot (it truncates casts).
+SINGLE_KERNEL = RMS_KERNEL.replace(".to(out_ptr.dtype.element_ty).to(tl.float32)", "")
+assert SINGLE_KERNEL != RMS_KERNEL

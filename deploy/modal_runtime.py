@@ -143,7 +143,9 @@ def smoke(moe_backend: str = "cutlass", cases: int = 8, max_model_len: int = 327
 
 # next to this file locally; in the image under the copied checkout
 sys.path += [str(Path(__file__).resolve().parent), "/opt/opentype-src/deploy"]
-from modal_runtime_kernels import CONTROL_KERNEL, RMS_KERNEL  # noqa: E402
+from modal_runtime_kernels import CONTROL_KERNEL, RMS_KERNEL, SINGLE_KERNEL  # noqa: E402
+
+VARIANTS = {"correct": RMS_KERNEL, "single": SINGLE_KERNEL, "control": CONTROL_KERNEL}
 
 
 @app.function(
@@ -154,12 +156,16 @@ from modal_runtime_kernels import CONTROL_KERNEL, RMS_KERNEL  # noqa: E402
     timeout=3 * 3600,
 )
 def kernel_smoke(
-    moe_backend: str = "cutlass", cases: int = 8, max_model_len: int = 32768, control: bool = False
+    moe_backend: str = "cutlass",
+    cases: int = 8,
+    max_model_len: int = 32768,
+    variants: str = "stock,correct",
 ) -> dict:
-    """The kernel slot end to end, no speed claim: build the known-correct kernel in a CPU
-    sandbox, then serve the same cases in distinct fresh B300 sandboxes, one at a time: stock,
-    then with the kernel selected (and, with --control, the zero kernel, which must break the
-    answers: proof the slot runs). Reports per-case outcomes and answer distance from stock."""
+    """The kernel slot end to end, no speed claim: build the named kernels in CPU sandboxes,
+    then serve the same cases in distinct fresh B300 sandboxes, one per entry of `variants`,
+    in order (comma separated; "stock" may repeat, which measures stock-vs-stock spread
+    across placements; kernels: correct, single, control). The first stock session is the
+    reference for per-case distances. Returns every raw output: keep it private."""
     import asyncio
     import time
     from pathlib import Path
@@ -167,8 +173,18 @@ def kernel_smoke(
     from opentype_challenge import runtime, sandbox
     from opentype_challenge.worker import Worker
 
-    if moe_backend not in runtime.MOE_BACKENDS or not 1 <= cases <= 16:
-        raise SystemExit(f"--moe-backend one of {runtime.MOE_BACKENDS}, --cases 1..16")
+    order = [v.strip() for v in variants.split(",") if v.strip()]
+    if (
+        moe_backend not in runtime.MOE_BACKENDS
+        or not 1 <= cases <= 16
+        or not 1 <= len(order) <= 5
+        or order[0] != "stock"
+        or any(v != "stock" and v not in VARIANTS for v in order)
+    ):
+        raise SystemExit(
+            f"--moe-backend one of {runtime.MOE_BACKENDS}, --cases 1..16, --variants: "
+            f"stock first, then up to 4 of stock,{','.join(VARIANTS)}"
+        )
     model = _directory()
     if sandbox.weights_identity(model)["weights"] != "modelopt-nvfp4":
         raise SystemExit("run `stage` first: the snapshot does not verify as NVFP4")
@@ -177,11 +193,11 @@ def kernel_smoke(
     argv = runtime.serving_argv({**runtime.PROFILE_FIXED, "moe_backend": moe_backend})
     cell = runtime.Cell("decisions", cases, cases, 60000.0, 1.0, False)
     work = [runtime.cell_case("kernel-smoke", "short", cell, i) for i in range(cases)]
-    kernels = {"correct": runtime.normalize_kernel({"slot": "rms_norm", "source": RMS_KERNEL})}
-    if control:
-        kernels["control"] = runtime.normalize_kernel(
-            {"slot": "rms_norm", "source": CONTROL_KERNEL}
-        )
+    kernels = {
+        name: runtime.normalize_kernel({"slot": "rms_norm", "source": VARIANTS[name]})
+        for name in dict.fromkeys(order)
+        if name != "stock"
+    }
 
     async def serve(kernel: dict | None) -> list[dict]:
         extra = [*argv, *runtime.kernel_argv(kernel)]
@@ -206,11 +222,13 @@ def kernel_smoke(
                             "ok": runtime.task_ok(case, item),
                             "error": item.get("error"),
                             "vectors": runtime.answer_vectors(case, item),
+                            "item": item,  # the raw output, for later independent comparison
                         }
                     )
                 return rows
 
     progress: dict = {"built": {}, "sessions": {}}
+    raw: dict[str, list[dict]] = {}  # returned, never printed: prompts are private
 
     async def go() -> None:
         arch = 103  # B300 (sm_103), as the profile's compute_cap reports it
@@ -218,10 +236,12 @@ def kernel_smoke(
             progress["built"][name] = await launcher.build(kernel, arch)
             print(json.dumps({"progress": "built", "kernel": name}), flush=True)
         stock: list[dict] = []
-        for name, kernel in [("stock", None), *kernels.items()]:
+        for number, name in enumerate(order):
             started = time.monotonic()
-            rows = await serve(kernel)
-            stock = rows if name == "stock" else stock
+            rows = await serve(kernels.get(name))
+            stock = stock or rows
+            label = f"{number}:{name}"
+            raw[label] = [r["item"] for r in rows]
             session = {
                 "seconds": round(time.monotonic() - started, 1),
                 "ok": sum(r["ok"] for r in rows),
@@ -233,8 +253,8 @@ def kernel_smoke(
                 ],
                 "profile": launcher.profile(),
             }
-            progress["sessions"][name] = session
-            print(json.dumps({"progress": "session", "name": name, **session}), flush=True)
+            progress["sessions"][label] = session
+            print(json.dumps({"progress": "session", "name": label, **session}), flush=True)
 
     error = None
     try:
@@ -253,7 +273,23 @@ def kernel_smoke(
     if error:
         # a builtin: the local modal client cannot unpickle this package's exception types
         raise RuntimeError(error)
-    return result
+    # the cases are rebuilt from the fixed seed "kernel-smoke" (runtime.cell_case)
+    return {**result, "raw": raw}
+
+
+@app.local_entrypoint()
+def kernel_smoke_report(
+    out: str, variants: str = "stock,correct", cases: int = 8, moe_backend: str = "cutlass"
+) -> None:
+    """Run kernel_smoke and keep its whole result, raw outputs included, in a private local
+    file (mode 0600), never in logs."""
+    import os
+
+    result = kernel_smoke.remote(moe_backend=moe_backend, cases=cases, variants=variants)
+    descriptor = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        json.dump(result, handle)
+    print(f"wrote {out}")
 
 
 # A trusted echo: each stdin line comes back as {n, sha256, size} of what arrived, then the

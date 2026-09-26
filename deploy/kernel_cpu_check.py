@@ -4,11 +4,13 @@
       'pip install -q --no-deps --no-index /src/dist/*.whl && \
        python3 /src/deploy/kernel_cpu_check.py'
 
-It writes the smoke's kernels, then for each one, as vllm serve would: loads the
+It writes the smoke's kernels (the double-rounding "correct", the single-rounding "single"
+and the zero "control"), then for each one, as vllm serve would: loads the
 general plugins through vllm's own loader with the sandbox's environment, checks the slot is
 registered and its op schema inferred, runs the registered op under the Triton interpreter
-against vllm's native rms_norm (the correct kernel within 4 units of |ref| * 2^-7, the
-zero control at least 64 off), parses the worker's --ir-op-priority, and runs
+against vllm's native rms_norm (correct and single within 4 units of |ref| * 2^-7, the
+zero control at least 64 off; the interpreter truncates casts, so this bounds the math, not
+the bit pattern B300 produces), parses the worker's --ir-op-priority, and runs
 `vllm serve --help` with the plugin enabled. No GPU, no network; VLLM_TARGET_DEVICE=cpu
 only because this image cannot infer a device without one. Install the package from a
 wheel (`uv build --wheel`): the source install needs the network for its build backend.
@@ -65,7 +67,12 @@ def main() -> int:
 
     results, ok = {}, True
     with tempfile.TemporaryDirectory() as tmp:
-        for name, source in (("correct", kernels.RMS_KERNEL), ("control", kernels.CONTROL_KERNEL)):
+        variants = (
+            ("correct", kernels.RMS_KERNEL),
+            ("single", kernels.SINGLE_KERNEL),
+            ("control", kernels.CONTROL_KERNEL),
+        )
+        for name, source in variants:
             path = Path(tmp) / f"{name}.py"
             path.write_text(source)
             env = {
@@ -100,7 +107,7 @@ def main() -> int:
                 and row.get("schema", "").startswith("opentype::rms_norm(Tensor x, Tensor weight")
                 and row.get("priority") == ["opentype"]
             )
-            if name == "correct":
+            if name in ("correct", "single"):
                 # fp32 reduction order may round y to the neighbouring bf16 before the weight:
                 # a few units of |ref| * 2^-7, never more
                 good = good and row.get("nonfinite") == 0 and row.get("worst_ulp", 99) <= 4.0
