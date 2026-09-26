@@ -1034,10 +1034,12 @@ class Store:
         if lane == "runtime":
             with self._tx() as db:
                 self._set_meta(db, "runtime_polled", self._now())
-        elif not nvfp4:
+        else:
             with self._lock:
-                if self._champion_nvfp4(self._db):
-                    return None  # an NVFP4 duel runs only on a worker that declares B300
+                if nvfp4 != self._champion_nvfp4(self._db):
+                    # a worker serves one weight format: BF16 duels on the H200 path, NVFP4
+                    # duels on the B300 sandbox path, never mixed within the lane
+                    return None
         return self._lease(lane)
 
     def _runtime_due(self, db: sqlite3.Connection) -> bool:

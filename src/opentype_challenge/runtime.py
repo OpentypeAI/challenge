@@ -86,6 +86,9 @@ PROFILE_FIXED: dict[str, Any] = {
 }
 # Pinned by the operator per calibration (chosen on the hardware), from this allowlist.
 MOE_BACKENDS = ("flashinfer_trtllm", "flashinfer_cutlass", "cutlass")
+# Quality duels on NVFP4 weights: each side alone in its own B300 sandbox with the runtime
+# lane's pinned flags and memory share. A change is a new version, never an edit.
+QUALITY_SERVING = {"version": "quality-b300-v1", "moe_backend": "cutlass"}
 PROFILE_KEYS = (*PROFILE_FIXED, "moe_backend", *MEASURED)
 
 
@@ -103,6 +106,12 @@ def serving_argv(profile: Mapping[str, Any]) -> list[str]:
         "--moe-backend",
         str(profile["moe_backend"]),
     ]
+
+
+def quality_serving() -> tuple[list[str], float]:
+    """The vllm flags and memory share of a quality duel side on B300 (QUALITY_SERVING)."""
+    profile = {**PROFILE_FIXED, "moe_backend": QUALITY_SERVING["moe_backend"]}
+    return serving_argv(profile), float(PROFILE_FIXED["gpu_memory_utilization"])
 
 
 def kernel_argv(kernel: Mapping[str, Any] | None) -> list[str]:

@@ -607,9 +607,9 @@ def create_app(
         nvfp4: Annotated[bool, Query()] = False,
         authorization: Annotated[str | None, Header()] = None,
     ) -> Response:
-        """Workers ask for their lane; a worker that does not ask gets quality jobs only. Once
-        the champion is NVFP4, quality jobs go only to workers declaring nvfp4 (B300); an
-        older worker leases nothing."""
+        """Workers ask for their lane; a worker that does not ask gets quality jobs only. A
+        quality worker declares the weight format it serves: nvfp4 (the B300 sandbox path)
+        leases only while the champion is NVFP4, the default only while it is BF16."""
         worker(authorization)
         job = await run(store.lease, lane, nvfp4)
         if job is None:

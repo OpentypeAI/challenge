@@ -702,6 +702,7 @@ class SandboxLauncher:
     faults: list[dict[str, Any]] = field(default_factory=list)  # content faults, this launch
     _profile: dict[str, Any] | None = None
     _open: int = 0
+    sandboxed = True  # one fresh sandbox per side and launch (Worker._duel_sandboxed)
 
     def evidence(self) -> dict[str, Any]:
         return {
@@ -977,6 +978,9 @@ class ModalBackend:
     timeout: int = 6 * 3600
     cpu: tuple[float, float] = (8.0, 16.0)
     memory: tuple[int, int] = (65536, 131072)
+    # the controller writes the model directories into `volume` (its only writer) and commits
+    # them before each sandbox mounts them read-only; False for a volume staged in advance
+    commit: bool = False
     # "exec": the bootstrap runs as an exec'd process whose stdio goes through the task
     # command router; "entrypoint": it is the sandbox's own command, whose stdout Modal serves
     # from its log pipeline (rate limited: it drops output; kept for the relay probe only)
@@ -993,7 +997,10 @@ class ModalBackend:
         if model is not None:
             sub = await asyncio.to_thread(lambda: model.resolve().relative_to(self.root.resolve()))
             # staging commits the snapshot once (stage_nvfp4); a read-only controller mount
-            # never writes, so there is nothing to commit here and no concurrent writer
+            # never writes. A worker's work volume is committed here, between its downloads
+            # and any mount: nothing writes it while a sandbox serves.
+            if self.commit:
+                await self.volume.commit.aio()
             volumes = {
                 MODEL_MOUNT: self.volume.with_mount_options(read_only=True, sub_path=str(sub))
             }

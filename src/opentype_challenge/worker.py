@@ -243,13 +243,6 @@ class VllmLauncher:
     def quiescent(self) -> bool:
         return not self._live and _gpu_idle()
 
-    @property
-    def nvfp4(self) -> bool:
-        """This host may run NVFP4 duels: every visible GPU is a B300 (the lane's only
-        validated hardware)."""
-        gpu, _ = _gpu_identity()
-        names = [name for name in gpu.split(",") if name]
-        return bool(names) and all(runtime.GPU_TYPE in name for name in names)
 
     def ports(self, side: str) -> tuple[int, int]:
         """(vllm port, structured server port) of one side."""
@@ -491,8 +484,8 @@ class Worker:
     async def run_once(self) -> bool:
         """Lease and run one job. False when the queue is empty."""
         params: dict[str, str] | None = {"lane": self.lane} if self.lane != "quality" else None
-        if self.lane == "quality" and getattr(self.launcher, "nvfp4", False):
-            params = {"nvfp4": "true"}
+        if self.lane == "quality" and self._sandboxed:
+            params = {"nvfp4": "true"}  # the B300 sandbox path serves NVFP4 duels only
         response = await self.api.call("POST", "/v1/worker/lease", params=params)
         if response.status_code == 204:
             return False
@@ -549,6 +542,19 @@ class Worker:
                     "POST", f"/v1/worker/jobs/{job['job']}/heartbeat", json={"lease": job["lease"]}
                 )
 
+    def _inference_client(self) -> httpx.AsyncClient:
+        """The client for the served models: the launcher's relay when its servers live in
+        sandboxes (their URLs are not routable), else plain HTTP to local ports."""
+        if self.inference is not None:
+            return self.inference
+        relay = getattr(self.launcher, "client", None)
+        return relay() if callable(relay) else httpx.AsyncClient()
+
+    @property
+    def _sandboxed(self) -> bool:
+        """The launcher starts one fresh B300 sandbox per side (sandbox.SandboxLauncher)."""
+        return bool(getattr(self.launcher, "sandboxed", False))
+
     async def _duel(self, job: dict[str, Any], job_dir: Path, evidence: dict[str, Any]) -> dict:
         base = await asyncio.to_thread(base_snapshot, self.workdir / "base", self.fetch)
         try:
@@ -570,12 +576,40 @@ class Worker:
         models = {"champion": champion, "challenger": job_dir / "challenger"}
         timings: dict[str, Any] = {}
         t0 = time.time()
+        if self._sandboxed:
+            return {"timings": timings, **await self._duel_sandboxed(job, models, evidence)}
         async with self.launcher(models) as urls:
             timings["serve_seconds"] = round(time.time() - t0, 1)
             t1 = time.time()
             counts = await self._read(job, urls)
             timings["read_seconds"] = round(time.time() - t1, 1)
         return {"timings": timings, **counts}
+
+    async def _duel_sandboxed(
+        self, job: dict[str, Any], models: Mapping[str, Path], evidence: dict[str, Any]
+    ) -> dict[str, Any]:
+        """An NVFP4 duel on B300: the champion's side alone in a fresh sandbox, then the
+        challenger's, each at the pinned quality serving config; both must be verified NVFP4
+        by the launcher. No miner code runs (weights only): the sandbox is for the GPU."""
+        argv, share = runtime.quality_serving()
+        evidence["quality_serving"] = runtime.QUALITY_SERVING["version"]
+        counts: dict[str, Any] = {}
+        for side in SIDES:
+            try:
+                async with self.launcher({side: models[side]}, {side: argv}, share) as urls:
+                    weights = self.launcher.profile().get("weights")
+                    if weights != "modelopt-nvfp4":
+                        raise JobFailed(f"{side} does not verify as NVFP4: {weights}", True)
+                    part = await self._read(job, urls, (side,))
+            except ServeFailed as error:
+                # the champion served on the same pinned build before the challenger did
+                raise _candidate_fault(error, "challenger" if counts else None) from None
+            if not counts:
+                counts = part
+            else:
+                counts["errors"] += part["errors"]
+                counts["challenger_cases_fetched"] = part["cases_fetched"]
+        return counts
 
     async def _bench(self, job: dict[str, Any], job_dir: Path, evidence: dict[str, Any]) -> dict:
         """A runtime job on the champion's weights: fidelity reads of stock vs candidate, then
@@ -717,7 +751,7 @@ class Worker:
     ) -> tuple[dict[str, float], list[dict[str, Any]]]:
         """Monotonic seconds per cell and every timed task's raw output and latency (ms from
         the worker's clock); cold cells first, a warm cell after one untimed pass."""
-        client = self.inference or httpx.AsyncClient()
+        client = self._inference_client()
         seconds: dict[str, float] = {}
         tasks: list[dict[str, Any]] = []
         try:
@@ -843,7 +877,7 @@ class Worker:
         """Page through every case, run `sides` and post the answer items in batches. The
         container stores each side's results on their own, so sides may come in separate
         passes (the runtime fidelity serves one side at a time)."""
-        client = self.inference or httpx.AsyncClient()
+        client = self._inference_client()
         limit = asyncio.Semaphore(self.concurrency)
         cases_hash = hashlib.sha256()
         fetched = errors = 0
