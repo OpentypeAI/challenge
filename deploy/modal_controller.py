@@ -2,7 +2,8 @@
 
     modal secret create opentype-worker OPENTYPE_WORKER_TOKEN=<worker.token>
     modal deploy deploy/modal_controller.py
-    modal run deploy/modal_controller.py::quality   # or ::runtime; drains the queue, exits
+    python -c "import modal; modal.Function.from_name('opentype-controller', 'quality').spawn()"
+        # or 'runtime': drains that lane's queue, then exits
 
 The controller is a CPU Function. It holds the worker token (its own Modal secret) and a
 work volume that only it writes. For each job it:
@@ -21,11 +22,17 @@ because the runs are sequential.
   runtime   the kernel/option lane: a build sandbox, stock and candidate fidelity, then B/C/B'
             blocks at the calibrated profile.
 
-One container per lane (max_containers=1), each lane with its own volume, so each volume has
-exactly one writer. No schedule is set here: the operator enables a cron only after the B300
-validation (docs/operator.md). After the NVFP4 migration, the H200 worker
+Each lane has its own volume. No schedule is set here: the operator enables a cron only
+after the B300 validation (docs/operator.md). After the NVFP4 migration, the H200 worker
 (deploy/modal_worker.py) leases nothing, since quality leases are gated on the champion's
 format. Stop it then (`modal app stop opentype-worker`).
+
+Only the deployed Functions drain (above): max_containers=1 holds per app, and `_drain`
+refuses to run in any app other than the deployed `opentype-controller` (a `modal run` of
+this file is an ephemeral app). One lane's controller therefore never runs twice, and no
+second writer can delete a model directory while a sandbox mounts it. Redeploy only while no
+drain runs: a new version may start beside a still-running old container. (The app-id check
+is written against modal 1.5.5; its first Modal run is the check that it holds.)
 """
 
 import os
@@ -42,6 +49,7 @@ WORK = "/work"
 
 app = modal.App("opentype-controller")
 controller_image = image.env({"OPENTYPE_API": API, "OPENTYPE_WORKER_IMAGE": BASE_IMAGE})
+TIMEOUT = 24 * 3600
 volumes = {
     lane: modal.Volume.from_name(f"opentype-controller-{lane}", create_if_missing=True)
     for lane in ("quality", "runtime")
@@ -69,6 +77,11 @@ def _drain(lane: str) -> None:
             )
             await worker.run_forever(until_empty=True)
 
+    # max_containers=1 holds per app: only the deployed app drains, so a `modal run` of this
+    # file (an ephemeral app with another app_id) cannot become a second writer of the volume
+    deployed = modal.App.lookup(app.name).app_id
+    if app.app_id != deployed:
+        raise RuntimeError(f"drain only through the deployed app (spawn), not {app.app_id}")
     try:
         asyncio.run(main())
     finally:
@@ -79,7 +92,7 @@ CONTROLLER = {
     "image": controller_image,
     "cpu": 4,
     "memory": 16384,
-    "timeout": 24 * 3600,
+    "timeout": TIMEOUT,
     "secrets": [modal.Secret.from_name("opentype-worker")],
     "max_containers": 1,
 }

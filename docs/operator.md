@@ -360,7 +360,7 @@ refused (409): nothing here could prove that an NVFP4 checkpoint derives from it
   sides before serving. A later NVFP4 champion is always a crowned challenger that passed
   that check.
 - Quality duels then serve NVFP4 on both sides, and quality jobs lease only to workers
-  that declare `nvfp4`: the sandbox controller (`modal run deploy/modal_controller.py::quality`),
+  that declare `nvfp4`: the sandbox controller (`deploy/modal_controller.py`: the deployed `quality` Function, spawned, never `modal run`),
   one fresh B300 sandbox per side. Both sides must measure the runtime lane's pinned profile
   (image, reader, NVFP4 weights, flags, share, context, B300), which differs only by the
   versioned `runtime.QUALITY_SERVING` entry. Both sides must also measure the same
