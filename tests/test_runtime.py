@@ -1542,3 +1542,13 @@ def test_the_runtime_lane_needs_a_champion_of_known_provenance(tmp_path, officia
     with store._tx() as db:
         db.execute("UPDATE champions SET job_id='j_crowned' WHERE repo='x/y'")
     assert store.runtime_status()["open"]
+
+
+def test_every_vllm_flag_appears_once():
+    """The profile's serving flags and the launcher's fixed ones never repeat a flag."""
+    extra = runtime.serving_argv(PROFILE)
+    serve, _ = worker.VllmLauncher().commands("champion", worker.Path("/m"), extra, 0.9)
+    flags = [a for a in serve if a.startswith("--")]
+    assert len(flags) == len(set(flags)) and "--kv-cache-dtype" in flags
+    plain, _ = worker.VllmLauncher().commands("champion", worker.Path("/m"))
+    assert plain[plain.index("--kv-cache-dtype") + 1] == "bfloat16"

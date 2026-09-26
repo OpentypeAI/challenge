@@ -275,9 +275,8 @@ class VllmLauncher:
                 "--dtype",
                 self.dtype,
                 # what `auto` gives a BF16 checkpoint; an NVFP4 one's config would make it FP8
-                # with unit scales (pins.NVFP4_CONFIG_SHA256)
-                "--kv-cache-dtype",
-                "bfloat16",
+                # with unit scales (pins.NVFP4_CONFIG_SHA256); a profile's own value wins
+                *(() if "--kv-cache-dtype" in extra else ("--kv-cache-dtype", "bfloat16")),
                 "--gpu-memory-utilization",
                 str(self.memory_share if share is None else share),
                 "--diffusion-config",
