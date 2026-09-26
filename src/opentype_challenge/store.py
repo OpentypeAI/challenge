@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from . import bank, harness, ledger, paint, pins, runtime, scoring, tracks
-from .crypto import manifest_digest
+from .crypto import manifest_digest, manifest_problem
 from .generator import Case
 from .tracks import TrackPlan
 
@@ -379,6 +379,46 @@ class Store:
             self._expire_runtime(db)  # queued work signed for another profile
             self._finalize(db)
         return None if calibration is None else calibration.public()
+
+    def migrate_nvfp4(self, repo: str, revision: str, files: Mapping[str, str]) -> dict[str, Any]:
+        """The operator's one-way migration of the quality champion to an NVFP4 checkpoint of
+        its own weights (the official export while the base is champion). Prospective: a new
+        champion row with no entitlement; every earlier champion, entitlement, payment and
+        epoch stays as it is and old debts keep paying. From here on quality intake takes
+        only the NVFP4 config (and the worker the pinned tensor layout), so no BF16 duel is
+        ever run again; open BF16 work expires, and a leased job turns stale. That the
+        weights quantize the current champion is the operator's attestation (docs)."""
+        problem = manifest_problem(files)
+        if problem:
+            raise StoreError(422, problem)
+        if files["config.json"] != pins.NVFP4_CONFIG_SHA256:
+            raise StoreError(422, "config.json must be the pinned NVFP4 export's")
+        with self._tx() as db:
+            if self._champion_nvfp4(db):
+                raise StoreError(409, "the champion is already NVFP4")
+            previous = self._champion(db)
+            reason = "the champion migrated to NVFP4: resubmit an NVFP4 checkpoint"
+            for job in db.execute(
+                "SELECT id FROM jobs WHERE lane='quality' AND state IN "
+                "('queued', 'leased', 'judging', 'scored')"
+            ).fetchall():
+                self._terminal(db, job["id"], "expired", reason)
+            db.execute(
+                "INSERT INTO champions (hotkey, repo, revision, files, digest, window_id, "
+                "crowned_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    previous["hotkey"],
+                    repo,
+                    revision,
+                    _dumps(dict(files)),
+                    manifest_digest(repo, revision, files),
+                    self._window(db)["id"],
+                    self._now(),
+                ),
+            )
+            self._set_meta(db, "nvfp4_migration", {"from": previous["id"], "at": self._now()})
+            self._expire_runtime(db)
+            return _champion_json(self._champion(db))
 
     def set_lanes_from(self, epoch: int) -> int:
         """Schedule the 75/25 split from `epoch` on: once, and only past every persisted
@@ -812,6 +852,10 @@ class Store:
             if pending >= self.settings.max_pending:
                 raise StoreError(429, "the duel queue is full, retry later")
             champion = self._champion(db)
+            config = json.loads(champion["files"])["config.json"]
+            if files.get("config.json") != config:
+                # the base's while the champion is BF16; the NVFP4 export's once it migrated
+                raise StoreError(422, "config.json must be byte-equal to the champion's")
             if json.loads(champion["files"]) == dict(files):
                 raise StoreError(409, "the manifest is a clone of the champion")
             db.execute("INSERT INTO nonces VALUES (?, ?, ?)", (nonce, hotkey, exp))

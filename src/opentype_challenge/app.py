@@ -31,7 +31,7 @@ from pydantic import (
     ValidationError,
 )
 
-from . import __version__, bank, generator, pins, runtime, teacher, tracks
+from . import __version__, bank, generator, runtime, teacher, tracks
 from .crypto import (
     CryptoError,
     decode_hotkey,
@@ -522,8 +522,6 @@ def create_app(
         problem = manifest_problem(files)
         if problem:
             raise StoreError(422, problem)
-        if files["config.json"] != pins.BASE_FILES["config.json"]:
-            raise StoreError(422, "config.json must be byte-equal to the base revision's")
         now = int(clock())
         if not now < item.exp <= now + MAX_EXP_SECONDS:
             raise StoreError(400, f"exp must be in the future and within {MAX_EXP_SECONDS} s")
@@ -731,6 +729,18 @@ def create_app(
         except runtime.RuntimeError_ as error:
             raise StoreError(422, str(error)) from None
         return {"calibration": published}
+
+    @app.post("/v1/admin/champion/nvfp4")
+    async def migrate_nvfp4(
+        request: Request, authorization: Annotated[str | None, Header()] = None
+    ) -> dict[str, Any]:
+        """One-way: the champion becomes this NVFP4 checkpoint of its weights (prospective)."""
+        admin(authorization)
+        item: Manifest = await body(request, SUBMIT_BODY_MAX, Manifest)
+        result: dict[str, Any] = await run(
+            store.migrate_nvfp4, item.repo, item.revision, item.files
+        )
+        return result
 
     @app.put("/v1/admin/lanes")
     async def lanes(

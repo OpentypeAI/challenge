@@ -125,7 +125,7 @@ def assemble(
     if problem:
         raise JobFailed(f"{manifest['repo']}: {problem}", retry=False)
     if files["config.json"] != (config_sha256 or pins.BASE_FILES["config.json"]):
-        raise JobFailed("config.json differs from the base revision", retry=False)
+        raise JobFailed("config.json differs from the champion's", retry=False)
     directory.mkdir(parents=True, exist_ok=True)
     resolved = {}
     for name, expected in sorted(files.items()):
@@ -266,6 +266,10 @@ class VllmLauncher:
                 "127.0.0.1",
                 "--dtype",
                 self.dtype,
+                # what `auto` gives a BF16 checkpoint; an NVFP4 one's config would make it FP8
+                # with unit scales (pins.NVFP4_CONFIG_SHA256)
+                "--kv-cache-dtype",
+                "bfloat16",
                 "--gpu-memory-utilization",
                 str(self.memory_share if share is None else share),
                 "--diffusion-config",
@@ -529,9 +533,16 @@ class Worker:
             )
         except JobFailed as error:  # never the challenger's fault
             raise JobFailed(f"champion: {error.reason}", retry=True) from None
+        config = job["champion"]["files"].get("config.json")
         evidence["challenger_files"] = await asyncio.to_thread(
-            assemble, job["challenger"], base, job_dir / "challenger", self.fetch
+            assemble, job["challenger"], base, job_dir / "challenger", self.fetch, config
         )
+        if config == pins.NVFP4_CONFIG_SHA256:
+            from .sandbox import tensor_schema  # sandbox imports this module
+
+            schema = await asyncio.to_thread(tensor_schema, job_dir / "challenger")
+            if schema != pins.NVFP4_SCHEMA_SHA256:
+                raise JobFailed("the weights do not have the NVFP4 tensor layout", retry=False)
         models = {"champion": champion, "challenger": job_dir / "challenger"}
         timings: dict[str, Any] = {}
         t0 = time.time()
@@ -791,6 +802,11 @@ class Worker:
         if config not in allowed:
             raise JobFailed("the champion's config.json is neither the base's nor NVFP4's", True)
         resolved = assemble(manifest, base, directory, self.fetch, config)
+        if config == pins.NVFP4_CONFIG_SHA256:
+            from .sandbox import tensor_schema  # sandbox imports this module
+
+            if tensor_schema(directory) != pins.NVFP4_SCHEMA_SHA256:
+                raise JobFailed("the champion does not have the NVFP4 tensor layout", True)
         record.write_text(json.dumps(resolved, sort_keys=True))
         return directory, resolved
 

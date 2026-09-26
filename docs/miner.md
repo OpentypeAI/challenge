@@ -7,9 +7,18 @@ You submit a signed manifest of a **public, ungated** Hugging Face model repo at
 
 | File | Rule |
 | --- | --- |
-| `model.safetensors` or `model-NNNNN-of-NNNNN.safetensors` | your weights (BF16, same architecture as the base) |
+| `model.safetensors` or `model-NNNNN-of-NNNNN.safetensors` | your weights, in the champion's format (see below) |
 | `model.safetensors.index.json` | required when the weights are sharded |
-| `config.json` | must be byte-equal to the base revision's (sha256 `13b11d2f…c506`) |
+| `config.json` | must be byte-equal to the current champion's |
+
+The format follows the champion. Until the operator migrates it, the champion is BF16 and
+`config.json` is the base revision's (sha256 `13b11d2f…c506`). After the one-way NVFP4
+migration (`GET /v1/status` shows the champion), every submission is a ModelOpt NVFP4
+checkpoint: `config.json` byte-equal to `nvidia/diffusiongemma-26B-A4B-it-NVFP4@ec4ff3df`'s
+(sha256 `b4f650bd…5fde`) and exactly its tensor names, dtypes and shapes (W4A4 FP4 routed
+experts, FP8 block scales, FP32 global scales; the rest BF16). The worker checks the shard
+headers before serving; any other layout is rejected. BF16 manifests are refused at intake
+from then on. Quantize your own improved weights with the same recipe.
 
 Tokenizer, chat template, generation and processor files always come from the pinned base
 `google/diffusiongemma-26B-A4B-it@f7f5b7f5fa82ffc52addd066915886d497f5517b`. Anything else
@@ -190,7 +199,17 @@ opentype-challenge miner runtime-submit --api https://<gateway>/challenge/openty
 ```
 
 - Only the options listed in `GET /v1/runtime` are accepted. No command line, environment,
-  image, plugin, reader, tokenizer or kernel.
+  image, plugin, reader or tokenizer. The lane measures the NVFP4 champion on B300 only, so
+  it stays closed until the champion is migrated and a B300 calibration is published.
+- A kernel, where the published calibration lists its slot (`kernel_slots`), is one
+  Triton file for the `rms_norm` slot, sent as `--kernel-file`: only imports of `triton`,
+  `triton.language` and `math`, constants, and exactly one `@triton.jit def rms_norm_kernel
+  (x_ptr, w_ptr, out_ptr, x_row_stride, out_row_stride, n_cols, eps, BLOCK_SIZE)`
+  computing `x * rsqrt(mean(x²) + eps) * w` per row (fp32 statistics, output in the input
+  dtype). It is parsed at intake and never imported outside a sandbox; it is compiled
+  offline for the calibrated arch in a separate network-blocked sandbox (a compile failure
+  rejects it) and runs only in fresh, network-blocked, secret-free GPU sandboxes. A
+  kernel whose answers diverge from stock beyond the calibrated tolerance is rejected.
 - The signature binds the challenge, the lane, the champion you target, the calibrated
   profile and your options. When the quality champion changes, an open runtime submission
   expires, even mid-measurement: sign a new one against the new champion. Combinations the

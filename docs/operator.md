@@ -339,11 +339,58 @@ their effect on DiffusionGemma is what the benchmark measures): `max_num_seqs`,
 `max_num_batched_tokens`, `enable_chunked_prefill`, `enable_prefix_caching`. Anything else
 is refused at intake.
 
-### Kernels: disabled
+### NVFP4 migration of the quality champion
 
-Miner kernels (Triton, CuTe or any compiled artifact) are **not accepted** and are never
-loaded by any worker. They need a GPU guest with verified host and GPU isolation, blocked
-network, read-only weights, resource limits and verified teardown. None of the available
-backends is verified for this: the Cortex bubblewrap sandbox is CPU-only and its Firecracker
-guests boot with `pci=off`. Enabling kernels is a separate delivery that starts with
-choosing and validating such a backend.
+The runtime lane measures NVFP4 weights on B300 only, so it stays closed while the champion
+is BF16. `POST /v1/admin/champion/nvfp4` with a manifest (`{"repo", "revision", "files"}`)
+whose `config.json` is the pinned export's (`pins.NVFP4_CONFIG_SHA256`) migrates it, once:
+
+- It is prospective. A new champion row is added with no entitlement. Earlier champions,
+  entitlements, payments and served epochs are unchanged, and old debt keeps paying FIFO.
+- Queued and running quality work expires ("resubmit an NVFP4 checkpoint"). A leased job
+  turns stale. From then on intake takes only the NVFP4 config and the worker only the
+  pinned tensor layout, so no BF16 duel runs again. There is no way back.
+- That the manifest quantizes the current champion is your attestation. The container
+  checks the config, the worker checks the digests and the layout, and nothing proves the
+  values came from the champion. While the base is champion, use the official export
+  (`pins.NVFP4_REPO@NVFP4_REVISION`, `pins.NVFP4_FILES`). Otherwise quantize the
+  champion with the same ModelOpt recipe and publish it first.
+- Quality duels then serve NVFP4 on both sides, so quality workers need GPUs that run
+  ModelOpt NVFP4 in the pinned vLLM (Blackwell: B200/B300). Move `deploy/modal_worker.py`
+  off H200 and validate a duel there before migrating.
+- Quality duels then serve NVFP4 on both sides. The quality workers' `--kv-cache-dtype
+  bfloat16` keeps the KV cache as it was, because `auto` would turn FP8 with unit scales
+  under this config. Re-run Phase 0 sizing on the NVFP4 champion before trusting the
+  quality margin: its error rates differ.
+
+### Kernels: implemented, not enabled
+
+`opentype_challenge.sandbox` runs miner kernels only in fresh Modal Sandboxes:
+`gpu="B300"`, `block_network=True`, `secrets=[]`, no OIDC token, and the verified NVFP4
+snapshot mounted read-only from the dedicated volume `opentype-nvfp4-snapshot` (never the
+quality worker's). The bootstrap measures the GPU identity before any miner code exists
+there. vllm, with the kernel, runs as uid 10001. The pinned reader runs as uid 10002 and
+binds its port first. A reply counts only while every served process is alive. Build and
+serve children are capped by rlimits and logs are tail-read. The kernel is compiled offline
+in its own CPU sandbox first. The controller holds every token and gold answer. Requests
+travel over the sandbox's exec stdio as numbered lines of 16 KiB or less, each frame
+capped at 8 MiB, and a lost line fails the channel.
+
+This is tested against hostile local processes. That is not a proof that no escape
+exists. Kernels stay off in production until all of these hold:
+
+1. A runtime worker is wired to `SandboxLauncher`. Today only `deploy/modal_runtime.py`
+   uses it, for smokes. The local-process launcher refuses every kernel.
+2. The champion is migrated to NVFP4.
+3. A B300 calibration listing `kernel_slots` is published from a representative pilot, not
+   from the smokes.
+
+Operational notes:
+
+- A fresh Sandbox is not the same physical GPU as the previous one. The calibration
+  measures that spread, and each run's `placements` record the GPU UUIDs.
+- Stage the snapshot (`modal run deploy/modal_runtime.py::stage`) only while nothing
+  serves from it. It commits once and must never be written concurrently.
+- Relay privacy: the exec path does not mirror frames into Modal app logs. The
+  `entrypoint` path of `relay_probe` does. Prompts are private benchmark inputs, so never
+  publish raw Modal app logs. No gold and no token ever enters a sandbox.

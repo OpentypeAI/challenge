@@ -20,7 +20,7 @@ from opentype_challenge.miner import signed_runtime_submission, signed_submissio
 from opentype_challenge.runtime import Calibration, Fidelity
 from opentype_challenge.store import Settings, Store, StoreError
 
-from .conftest import ADMIN, SLUG, WORKER, Clock, Miner, bearer, weights_manifest
+from .conftest import ADMIN, SLUG, WORKER, Clock, Miner, bearer, submit, weights_manifest
 from .fake_inference import answer, blur, chat_reply
 
 PROFILE = {
@@ -1365,3 +1365,62 @@ def test_calibration_workload_is_bounded(over):
     with pytest.raises(runtime.RuntimeError_):
         Calibration.from_json(calibration_json(**over))
     Calibration.from_json(calibration_json(blocks=runtime.MAX_BLOCKS))  # the timings API's bound
+
+
+# -- NVFP4 migration of the quality champion ------------------------------------------------
+
+NVFP4 = "c" * 64
+
+
+def nvfp4_manifest(tag: str = "nvfp4") -> dict[str, Any]:
+    files = {**weights_manifest(tag)["files"], "config.json": NVFP4}
+    return {"repo": "nvidia/model", "revision": "d" * 40, "files": files}
+
+
+def test_the_nvfp4_migration_is_prospective_and_one_way(client, miner, clock, monkeypatch):
+    """History, debts and payments stay; open BF16 work expires; from then on intake takes
+    only NVFP4 manifests and the runtime lane may open."""
+    monkeypatch.setattr(pins, "NVFP4_CONFIG_SHA256", NVFP4)
+    store: Store = client.app.state.store
+    grant(store, "5OLD", 3 * ledger.UNITS)
+    paid = body(store, 1)["weights"]
+    queued = submit(client, miner, weights_manifest("bf16"), clock).json()
+    assert not store.runtime_status()["weights"]["champion_nvfp4"]
+
+    bad = {**nvfp4_manifest(), "files": {**nvfp4_manifest()["files"], "config.json": "e" * 64}}
+    url = "/v1/admin/champion/nvfp4"
+    assert client.post(url, json=bad, headers=bearer(ADMIN)).status_code == 422
+    assert client.post(url, json=nvfp4_manifest(), headers=bearer(WORKER)).status_code in (401, 403)
+    response = client.post(url, json=nvfp4_manifest(), headers=bearer(ADMIN))
+    assert response.status_code == 200, response.text
+    assert client.post(url, json=nvfp4_manifest("x"), headers=bearer(ADMIN)).status_code == 409
+
+    crowns = client.get("/v1/leaderboard").json()["crowns"]
+    assert [c["repo"] for c in crowns] == [pins.BASE_REPO, "nvidia/model"]
+    assert "entitlement" not in crowns[-1]  # a migration earns nothing
+    assert client.get(f"/v1/submissions/{queued['id']}").json()["state"] == "expired"
+    assert store.runtime_status()["weights"]["champion_nvfp4"]
+    assert body(store, 1)["weights"] == paid  # replay unchanged
+    assert body(store, 2)["weights"] == {"5OLD": 1.0}  # the old debt keeps paying
+
+    assert submit(client, miner, weights_manifest("bf16-2"), clock).status_code == 422
+    assert submit(client, miner, nvfp4_manifest("miner"), clock).status_code == 201
+
+
+def test_an_nvfp4_challenger_needs_the_pinned_tensor_layout(tmp_path, monkeypatch):
+    """The worker checks the challenger's shard headers before any GPU work: a config copied
+    onto BF16 (or any other) weights is rejected as the miner's fault."""
+
+    monkeypatch.setattr(pins, "NVFP4_CONFIG_SHA256", NVFP4)
+    monkeypatch.setattr(worker, "assemble", lambda *a: {})
+    monkeypatch.setattr(worker, "base_snapshot", lambda *a: tmp_path)
+    from opentype_challenge import sandbox
+
+    monkeypatch.setattr(sandbox, "tensor_schema", lambda path: "0" * 64)
+    instance = worker.Worker(None, None, None)  # type: ignore[arg-type]
+    instance.workdir = tmp_path
+    monkeypatch.setattr(instance, "_champion", lambda manifest, base: (tmp_path, {}))
+    job = {"champion": nvfp4_manifest(), "challenger": nvfp4_manifest("m")}
+    with pytest.raises(worker.JobFailed, match="NVFP4 tensor layout") as failure:
+        asyncio.run(instance._duel(job, tmp_path, {}))
+    assert failure.value.retry is False
