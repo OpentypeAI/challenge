@@ -735,6 +735,10 @@ class SandboxLauncher:
         """Every sandbox this launcher started is gone (a fresh one serves each run)."""
         return self._open == 0
 
+    def serving(self) -> bool:
+        """A sandbox may still mount a model directory (one did not stop)."""
+        return self._open != 0
+
     async def build(self, kernel: Mapping[str, Any], arch: int) -> str:
         channel = await self.backend.start("build", None)
         try:

@@ -1663,3 +1663,36 @@ def test_a_challenger_sandbox_that_never_starts_retries(monkeypatch):
     with pytest.raises(worker.JobFailed) as error:
         duel_sandboxed(monkeypatch, QualitySandboxes([QUALITY_PROFILE] * 2, fail_at=1))
     assert error.value.retry is True
+
+
+def test_a_job_directory_is_kept_while_a_sandbox_may_still_mount_it(tmp_path, monkeypatch):
+    """A server that may still mount the challenger's weights keeps them on disk."""
+    import httpx
+
+    job = {"job": "j_1", "lease": "l", "lane": "quality", "champion": {}, "challenger": {}}
+
+    def api(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/lease"):
+            return httpx.Response(200, json=job)
+        return httpx.Response(200, json={})
+
+    async def duel(self, job, job_dir, evidence):
+        job_dir.mkdir(parents=True)
+        raise worker.JobFailed("the sandbox did not stop", True)
+
+    monkeypatch.setattr(worker.Worker, "_duel", duel)
+
+    async def go(launcher: FakeLauncher) -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(api)) as client:
+            instance = worker.Worker(worker.Api("http://x", "t", client), tmp_path, launcher)
+            await instance.run_once()
+
+    class Stuck(FakeLauncher):
+        def serving(self) -> bool:
+            return True
+
+    asyncio.run(go(Stuck()))
+    assert (tmp_path / "j_1").exists()
+    (tmp_path / "j_1").rmdir()
+    asyncio.run(go(FakeLauncher(dirty_after=0)))  # GPU state unknown, nothing served: removed
+    assert not (tmp_path / "j_1").exists()

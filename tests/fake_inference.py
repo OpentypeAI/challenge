@@ -185,7 +185,8 @@ def main(argv: list[str]) -> None:
     args, _ = parser.parse_known_args(argv[2:] if serve else argv)
     model = argv[1] if serve else args.tokenizer
     if model:
-        SKILL = (Path(model) / "model.safetensors").read_text().split()[0]
+        weights = sorted(Path(model).glob("model*.safetensors"))  # single file or shards
+        SKILL = weights[0].read_text().split()[0]
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
 
 

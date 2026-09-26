@@ -529,7 +529,11 @@ class Worker:
                 print(f"worker: {lost}", file=sys.stderr, flush=True)
         finally:
             beat.cancel()
-            shutil.rmtree(job_dir, ignore_errors=True)
+            if getattr(self.launcher, "serving", lambda: False)():
+                # a sandbox that did not stop may still mount it: kept, never deleted under it
+                print(f"worker: kept {job_dir}: a server may still use it", file=sys.stderr)
+            else:
+                shutil.rmtree(job_dir, ignore_errors=True)
         return True
 
     async def _heartbeat(self, job: dict[str, Any]) -> None:

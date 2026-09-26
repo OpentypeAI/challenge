@@ -42,8 +42,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from modal_runtime import SNAPSHOT, _directory, image, snapshot  # noqa: E402
 
 WORK = "/work"
+PILOT_REPO = "pilot/same-bytes"
 READY = 720  # s per sandbox to be ready (measured 244-409 s on the staged snapshot)
 SESSION = 1500  # s per serve session, ready included: a hard bound
+MAX_CASES, MAX_CONCURRENCY = 32, 16  # per calibration pilot cell
 # All four runtime tracks, cold (the production default of Cell.warm is the operator's). The
 # SLO is loose on purpose so that correctness, not a guessed latency bound, decides ok; the
 # report keeps every latency for choosing the real one.
@@ -70,6 +72,12 @@ def _snapshot_fetch(repo: str, revision: str, filename: str, directory: Path) ->
     sha256), copied into `directory` as hf_hub_download would write it."""
     import shutil
 
+    from opentype_challenge import pins
+
+    known = {pins.NVFP4_REPO: pins.NVFP4_FILES, PILOT_REPO: pins.NVFP4_FILES,
+             pins.BASE_REPO: pins.BASE_SUPPORT_FILES}  # fmt: skip
+    if filename not in known.get(repo, {}):
+        raise RuntimeError(f"the pilot snapshot does not serve {repo}/{filename}")
     source = _directory() / filename
     target = directory / filename
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -157,7 +165,7 @@ def quality(cases: str = "decisions=32,longctx=8,ops=8,sql=8") -> dict:
             migrated = await api.post("/v1/admin/champion/nvfp4", headers=admin)
             if migrated.status_code != 200:
                 raise RuntimeError(f"migration: {migrated.status_code} {migrated.text[:300]}")
-            manifest = {"repo": "pilot/same-bytes", "revision": pins.NVFP4_REVISION,
+            manifest = {"repo": PILOT_REPO, "revision": pins.NVFP4_REVISION,
                         "files": dict(pins.NVFP4_FILES)}  # fmt: skip
             submission = _pilot_challenger(store, manifest)
             worker = Worker(
@@ -173,9 +181,11 @@ def quality(cases: str = "decisions=32,longctx=8,ops=8,sql=8") -> dict:
     except BaseException as caught:  # noqa: BLE001 - a builtin error for the local client
         error, result = f"{type(caught).__name__}: {caught}"[:2000], {}
     finally:
-        shutil.rmtree(run_dir, ignore_errors=True)
+        if not launcher.serving():  # else a sandbox may still mount it: kept, reported below
+            shutil.rmtree(run_dir, ignore_errors=True)
         work.commit()
     out = {
+        "run_dir_kept": str(run_dir) if run_dir.exists() else None,
         **result,
         "seconds": round(time.monotonic() - started, 1),
         "placements": launcher.placements,
@@ -187,9 +197,7 @@ def quality(cases: str = "decisions=32,longctx=8,ops=8,sql=8") -> dict:
     verdict = (submission.get("job") or {}).get("verdict") or {}
     brief = {"state": submission.get("state"), "reason": submission.get("reason")}
     print(json.dumps({**brief, "crown": verdict.get("crown"), "seconds": out["seconds"]}))
-    if error:
-        raise RuntimeError(error)
-    return out
+    return out  # also on failure: the local entrypoint keeps it, then exits nonzero
 
 
 @app.function(**CPU_FUNCTION, volumes={SNAPSHOT: snapshot.with_mount_options(read_only=True)})
@@ -210,8 +218,20 @@ def calibration(
         for name, c in spec.items()
     }  # fmt: skip
     missing = set(runtime.CELL_TRACKS) - {c.track for c in parsed.values()}
-    if missing or not 1 <= blocks <= 3 or moe_backend not in runtime.MOE_BACKENDS:
-        raise SystemExit(f"cells must cover {runtime.CELL_TRACKS}; --blocks 1..3; moe backend")
+    over = [
+        n
+        for n, c in parsed.items()
+        if not 1 <= c.cases <= MAX_CASES
+        or not 1 <= c.concurrency <= MAX_CONCURRENCY
+        or c.track not in runtime.CELL_TRACKS
+    ]
+    if missing or over or len(parsed) > 8 or not 1 <= blocks <= 3:
+        raise SystemExit(
+            f"cells must cover {runtime.CELL_TRACKS} (at most 8, cases 1..{MAX_CASES}, "
+            f"concurrency 1..{MAX_CONCURRENCY}; refused: {over}); --blocks 1..3"
+        )
+    if moe_backend not in runtime.MOE_BACKENDS:
+        raise SystemExit(f"--moe-backend one of {runtime.MOE_BACKENDS}")
     model = _directory()
     if sandbox.weights_identity(model)["weights"] != "modelopt-nvfp4":
         raise SystemExit("run modal_runtime.py::stage first: the snapshot is not NVFP4")
@@ -232,8 +252,16 @@ def calibration(
         async with asyncio.timeout(SESSION):
             async with launcher({"champion": model}, {"champion": argv}, share) as urls:
                 ready = time.monotonic() - started
-                seconds, tasks = await worker._measure(job, cal, urls["champion"])  # type: ignore[arg-type]
                 measured = launcher.profile()
+                wrong = sorted(k for k in profile if measured.get(k) != profile[k])
+                if runtime.GPU_TYPE not in str(measured.get("gpu")):
+                    wrong.append("gpu")
+                if runs:  # every run on the first run's build and card type
+                    wrong += [k for k in runtime.MEASURED
+                              if measured.get(k) != runs[0]["profile"].get(k)]  # fmt: skip
+                if wrong:  # before a single case: nothing measured here could calibrate
+                    raise RuntimeError(f"run {block}/{side} is off the profile: {wrong}")
+                seconds, tasks = await worker._measure(job, cal, urls["champion"])  # type: ignore[arg-type]
         cells_out = {}
         for name, cell in parsed.items():
             mine = [t for t in tasks if t["cell"] == name]
@@ -294,10 +322,9 @@ def calibration(
         "runs": runs, "log_drift_b_b2": drift, "error": error,
         "failures": launcher.failures[-4:],
     }  # fmt: skip
+    summary["quiescent"] = launcher.quiescent()
     print(json.dumps({"decision": decision, "reason": summary["reason"], "error": error}))
-    if error:
-        raise RuntimeError(error)
-    return {**summary, "raw": raw}
+    return {**summary, "raw": raw}  # also on failure: kept locally, then a nonzero exit
 
 
 def _write_private(out: str, result: dict) -> None:
@@ -307,6 +334,8 @@ def _write_private(out: str, result: dict) -> None:
     with os.fdopen(descriptor, "w") as handle:
         json.dump(result, handle)
     print(f"wrote {out}")
+    if result.get("error"):
+        raise SystemExit(f"the pilot failed (report kept in {out}): {result['error'][:300]}")
 
 
 @app.local_entrypoint()
