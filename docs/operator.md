@@ -301,8 +301,9 @@ Every threshold in it comes from your own pilot; this repository ships none.
 
 Changing the calibration makes a running runtime job that is still on target (same signed
 profile, kernel slot still open) duel again under the new one. A job the change takes off
-target (a new profile, or its kernel slot closed) expires: queued at once, leased when it
-completes. The miner then submits again. Closing a kernel slot (removing it from
+target (a new profile, or its kernel slot closed) expires. Queued and judging jobs expire
+at once, and their pending judgments are dropped. A leased job turns stale and expires when
+its worker completes or releases it. The miner then submits again. Closing a kernel slot (removing it from
 `kernel_slots`) therefore expires kernel submissions for that slot, and an incumbent with that slot's kernel stops being the reference: stock
 serves as B again. A stored calibration that this build cannot parse counts as withdrawn. A
 submission signs the profile digest: if the new calibration changes the profile, its
@@ -356,9 +357,9 @@ refused (409): nothing here could prove that an NVFP4 checkpoint derives from it
   champion row is added with no hotkey and no entitlement. Earlier champions, entitlements,
   payments and served epochs are unchanged, and old debt keeps paying FIFO. There is no
   way back.
-- Queued BF16 work expires at once. A leased or judging duel turns stale; its worker
-  completes or fails it normally, then it expires, and its pending judgments are dropped
-  (the teacher judges nothing for it). Nothing BF16 is re-duelled: a submission in another
+- Queued BF16 work expires at once. A judging duel also expires at once, and its pending
+  judgments are dropped (the teacher judges nothing for it). A leased duel turns stale;
+  its worker completes or fails it normally, then it expires before anything is judged. Nothing BF16 is re-duelled: a submission in another
   format than the champion's expires instead of being requeued.
 - From then on intake takes only the NVFP4 config, with the weight index (a single
   `model.safetensors` is refused), and the worker checks the pinned tensor layout of both
