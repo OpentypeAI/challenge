@@ -243,6 +243,14 @@ class VllmLauncher:
     def quiescent(self) -> bool:
         return not self._live and _gpu_idle()
 
+    @property
+    def nvfp4(self) -> bool:
+        """This host may run NVFP4 duels: every visible GPU is a B300 (the lane's only
+        validated hardware)."""
+        gpu, _ = _gpu_identity()
+        names = [name for name in gpu.split(",") if name]
+        return bool(names) and all(runtime.GPU_TYPE in name for name in names)
+
     def ports(self, side: str) -> tuple[int, int]:
         """(vllm port, structured server port) of one side."""
         offset = SIDES.index(side)
@@ -439,6 +447,13 @@ class ApiUnavailable(RuntimeError):
     """The API exhausted its bounded transport/service retries."""
 
 
+NOT_LEASED = "the job is not leased under this lease"  # the container's exact 409 detail
+
+
+class LeaseLost(RuntimeError):
+    """409 on a leased job: the container moved it (expired, stale, requeued) meanwhile."""
+
+
 class Api:
     def __init__(self, base: str, token: str, client: httpx.AsyncClient):
         self.base, self.client = base.rstrip("/"), client
@@ -456,6 +471,8 @@ class Api:
             if response.status_code == 429 or response.status_code >= 500:
                 await asyncio.sleep(2**attempt)
                 continue
+            if response.status_code == 409 and NOT_LEASED in response.text:
+                raise LeaseLost(f"{method} {path}: {response.text[:300]}")
             if response.status_code >= 400:
                 raise RuntimeError(f"{method} {path}: {response.status_code} {response.text[:300]}")
             return response
@@ -474,7 +491,9 @@ class Worker:
 
     async def run_once(self) -> bool:
         """Lease and run one job. False when the queue is empty."""
-        params = {"lane": self.lane} if self.lane != "quality" else None
+        params: dict[str, str] | None = {"lane": self.lane} if self.lane != "quality" else None
+        if self.lane == "quality" and getattr(self.launcher, "nvfp4", False):
+            params = {"nvfp4": "true"}
         response = await self.api.call("POST", "/v1/worker/lease", params=params)
         if response.status_code == 204:
             return False
@@ -499,18 +518,24 @@ class Worker:
                 f"/v1/worker/jobs/{job['job']}/complete",
                 json={"lease": job["lease"], "evidence": evidence},
             )
+        except LeaseLost as error:
+            # the job left this lease (expired, stale or requeued): nothing to report
+            print(f"worker: {error}", file=sys.stderr, flush=True)
         except Exception as error:  # noqa: BLE001 - every failure is reported, never swallowed
             failure = error if isinstance(error, JobFailed) else JobFailed(repr(error), True)
-            await self.api.call(
-                "POST",
-                f"/v1/worker/jobs/{job['job']}/fail",
-                json={
-                    "lease": job["lease"],
-                    "reason": failure.reason[:500],
-                    "retry": failure.retry,
-                    "evidence": evidence,
-                },
-            )
+            try:
+                await self.api.call(
+                    "POST",
+                    f"/v1/worker/jobs/{job['job']}/fail",
+                    json={
+                        "lease": job["lease"],
+                        "reason": failure.reason[:500],
+                        "retry": failure.retry,
+                        "evidence": evidence,
+                    },
+                )
+            except LeaseLost as lost:
+                print(f"worker: {lost}", file=sys.stderr, flush=True)
         finally:
             beat.cancel()
             shutil.rmtree(job_dir, ignore_errors=True)

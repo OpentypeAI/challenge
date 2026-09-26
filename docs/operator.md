@@ -342,26 +342,29 @@ is refused at intake.
 ### NVFP4 migration of the quality champion
 
 The runtime lane measures NVFP4 weights on B300 only, so it stays closed while the champion
-is BF16. `POST /v1/admin/champion/nvfp4` with a manifest (`{"repo", "revision", "files"}`)
-whose `config.json` is the pinned export's (`pins.NVFP4_CONFIG_SHA256`) migrates it, once:
+is BF16. `POST /v1/admin/champion/nvfp4` (no body) resets the quality lane to NVFP4, once,
+and only while the base is champion: the pinned official export (`pins.NVFP4_REPO` at
+`NVFP4_REVISION`, exactly `pins.NVFP4_FILES`) becomes the champion. A mined BF16 champion is
+refused (409): nothing here could prove that an NVFP4 checkpoint derives from it.
 
-- It is prospective. A new champion row is added with no entitlement. Earlier champions,
-  entitlements, payments and served epochs are unchanged, and old debt keeps paying FIFO.
-- Queued and running quality work expires ("resubmit an NVFP4 checkpoint"). A leased job
-  turns stale. From then on intake takes only the NVFP4 config and the worker only the
-  pinned tensor layout, so no BF16 duel runs again. There is no way back.
-- That the manifest quantizes the current champion is your attestation. The container
-  checks the config, the worker checks the digests and the layout, and nothing proves the
-  values came from the champion. While the base is champion, use the official export
-  (`pins.NVFP4_REPO@NVFP4_REVISION`, `pins.NVFP4_FILES`). Otherwise quantize the
-  champion with the same ModelOpt recipe and publish it first.
-- Quality duels then serve NVFP4 on both sides, so quality workers need GPUs that run
-  ModelOpt NVFP4 in the pinned vLLM (Blackwell: B200/B300). Move `deploy/modal_worker.py`
-  off H200 and validate a duel there before migrating.
-- Quality duels then serve NVFP4 on both sides. The quality workers' `--kv-cache-dtype
-  bfloat16` keeps the KV cache as it was, because `auto` would turn FP8 with unit scales
-  under this config. Re-run Phase 0 sizing on the NVFP4 champion before trusting the
-  quality margin: its error rates differ.
+- It is a prospective reset, not a claim that the export equals the BF16 champion. A new
+  champion row is added with no hotkey and no entitlement. Earlier champions, entitlements,
+  payments and served epochs are unchanged, and old debt keeps paying FIFO. There is no
+  way back.
+- Queued BF16 work expires at once. A leased or judging duel turns stale; its worker
+  completes or fails it normally, then it expires, and its pending judgments are dropped
+  (the teacher judges nothing for it). Nothing BF16 is re-duelled: a submission in another
+  format than the champion's expires instead of being requeued.
+- From then on intake takes only the NVFP4 config, with the weight index (a single
+  `model.safetensors` is refused), and the worker checks the pinned tensor layout of both
+  sides before serving. A later NVFP4 champion is always a crowned challenger that passed
+  that check.
+- Quality duels then serve NVFP4 on both sides, and quality jobs lease only to workers
+  that declare `nvfp4` (every visible GPU a B300). An H200 worker leases nothing, so
+  deploy B300 quality workers and validate a duel there first. Quality vllm pins
+  `--kv-cache-dtype bfloat16`, because `auto` would turn FP8 with unit scales under this
+  config. Re-run Phase 0 sizing on the NVFP4 champion before trusting the quality margin:
+  its error rates differ.
 
 ### Kernels: implemented, not enabled
 

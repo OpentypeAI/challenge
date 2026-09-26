@@ -80,6 +80,9 @@ def nvfp4_champion(monkeypatch):
     """The test champion (the base manifest) stands in for the pinned NVFP4 export; the gate
     itself is checked by test_the_lane_stays_closed_on_a_non_nvfp4_champion."""
     monkeypatch.setattr(pins, "NVFP4_CONFIG_SHA256", pins.BASE_FILES["config.json"])
+    monkeypatch.setattr(pins, "NVFP4_REPO", pins.BASE_REPO)
+    monkeypatch.setattr(pins, "NVFP4_REVISION", pins.BASE_REVISION)
+    monkeypatch.setattr(pins, "NVFP4_FILES", pins.BASE_FILES)
 
 
 GOOD = Fidelity(loss=10.0, decisions=100, determined=80, correct=78, cases=4)
@@ -691,12 +694,12 @@ def test_runtime_leases_are_exclusive(tmp_path):
     store = lane_store(tmp_path)
     quality_submit(store, "a")
     runtime_submit(store, "5R", {"max_num_seqs": 128})
-    quality = store.lease("quality")
+    quality = store.lease("quality", nvfp4=True)
     assert quality is not None and store.lease("runtime") is None  # waits for the GPU
     store.fail(quality["job"], quality["lease"], "done", True, {})
     runtime_lease = store.lease("runtime")
     assert runtime_lease is not None
-    assert store.lease("quality") is None  # nothing runs beside a runtime measurement
+    assert store.lease("quality", nvfp4=True) is None  # nothing runs beside a runtime measurement
 
 
 def test_champion_change_expires_runtime_work_and_recertification_pays_nothing(tmp_path):
@@ -706,13 +709,15 @@ def test_champion_change_expires_runtime_work_and_recertification_pays_nothing(t
     first_credit = store.runtime_status()["crowns"][0]["credited"]
     # a queued runtime submission signed against champion 1
     queued = runtime_submit(store, "5Late", {"max_num_seqs": 256})["id"]
-    with store._tx() as db:  # a quality crown (champion 2) without running a whole duel
+    with store._tx() as db:  # a quality crown (champion 2) without running a whole duel:
+        # an ordinary miner's NVFP4 winner, same config and layout, other weight bytes
+        files = {**nvfp4_manifest("winner")["files"], "config.json": pins.NVFP4_CONFIG_SHA256}
         db.execute(
-            "INSERT INTO champions (repo, revision, files, digest, crowned_at) "
-            "VALUES ('m/new', 'r2', ?, ?, 0)",
-            (json.dumps({"config.json": pins.NVFP4_CONFIG_SHA256}), "e" * 64),
+            "INSERT INTO champions (repo, revision, files, digest, job_id, crowned_at) "
+            "VALUES ('m/new', 'r2', ?, ?, 'j_crowned', 0)",
+            (json.dumps(files), "e" * 64),
         )
-        store._expire_runtime(db)  # what _crown runs after it inserts a champion
+        store._expire_off_target(db)  # what _crown runs after it inserts a champion
     assert store.submission(queued)["state"] == "expired"
     status = store.runtime_status()
     assert status["incumbent"] is None  # back to stock on the new weights
@@ -735,7 +740,7 @@ def test_a_real_quality_crown_expires_queued_runtime_work(tmp_path):
     store.set_lanes_from(1)
     quality_submit(store, "winner")
     queued = runtime_submit(store, "5R", {"max_num_seqs": 128})["id"]
-    lease = store.lease("quality")
+    lease = store.lease("quality", nvfp4=True)
     assert lease is not None
     for offset in range(0, lease["cases"], 100):
         page = {**lease}
@@ -1002,7 +1007,7 @@ def crown_quality_champion(store: Store) -> None:
             "VALUES ('m/new', 'r2', '{}', ?, 0)",
             ("e" * 64,),
         )
-        store._expire_runtime(db)
+        store._expire_off_target(db)
 
 
 def test_a_leased_runtime_job_never_moves_to_an_unsigned_champion(tmp_path):
@@ -1071,7 +1076,7 @@ def test_timed_outputs_are_scored_by_the_container(tmp_path):
 def test_timings_refuse_foreign_cells_and_quality_jobs(tmp_path):
     store = lane_store(tmp_path)
     quality_submit(store, "q")
-    quality = store.lease("quality")
+    quality = store.lease("quality", nvfp4=True)
     assert quality is not None
     item = {"block": 0, "side": "C", "cell": "short", "case_index": 0, "ms": 1.0}
     with pytest.raises(StoreError, match="runtime jobs"):
@@ -1109,7 +1114,7 @@ def test_queued_runtime_work_drains_quality_leases_boundedly(tmp_path):
 
     def quality_round() -> int:
         leased = 0
-        while (lease := store.lease("quality")) is not None:
+        while (lease := store.lease("quality", nvfp4=True)) is not None:
             store.fail(lease["job"], lease["lease"], "done", False, {})
             leased += 1
         return leased
@@ -1121,8 +1126,8 @@ def test_queued_runtime_work_drains_quality_leases_boundedly(tmp_path):
     for tag in "ghijkl":
         quality_submit(store, tag)
     # the second runtime job waits: quality gets exactly runtime_every leases, then drains
-    held = [store.lease("quality"), store.lease("quality")]
-    assert all(held) and store.lease("quality") is None
+    held = [store.lease("quality", nvfp4=True), store.lease("quality", nvfp4=True)]
+    assert all(held) and store.lease("quality", nvfp4=True) is None
     assert store.lease("runtime") is None  # still waiting for the two leased jobs
     for lease in held:
         assert lease is not None
@@ -1374,30 +1379,39 @@ NVFP4 = "c" * 64
 
 def nvfp4_manifest(tag: str = "nvfp4") -> dict[str, Any]:
     files = {**weights_manifest(tag)["files"], "config.json": NVFP4}
-    return {"repo": "nvidia/model", "revision": "d" * 40, "files": files}
+    return {"repo": "miner/nvfp4", "revision": "d" * 40, "files": files}
 
 
-def test_the_nvfp4_migration_is_prospective_and_one_way(client, miner, clock, monkeypatch):
-    """History, debts and payments stay; open BF16 work expires; from then on intake takes
-    only NVFP4 manifests and the runtime lane may open."""
+@pytest.fixture
+def official(monkeypatch) -> dict[str, Any]:
+    """A stand-in for the pinned official export (its config is NVFP4)."""
+    manifest = nvfp4_manifest("official")
     monkeypatch.setattr(pins, "NVFP4_CONFIG_SHA256", NVFP4)
+    monkeypatch.setattr(pins, "NVFP4_REPO", "nvidia/model")
+    monkeypatch.setattr(pins, "NVFP4_REVISION", manifest["revision"])
+    monkeypatch.setattr(pins, "NVFP4_FILES", manifest["files"])
+    return manifest
+
+
+def test_the_nvfp4_migration_is_prospective_and_one_way(client, miner, clock, official):
+    """A reset to the official export, not a claim of equivalence: history, debts and
+    payments stay; open BF16 work expires; from then on intake takes only NVFP4 manifests
+    (any miner's, not only the official digest) and the runtime lane may open."""
     store: Store = client.app.state.store
     grant(store, "5OLD", 3 * ledger.UNITS)
     paid = body(store, 1)["weights"]
     queued = submit(client, miner, weights_manifest("bf16"), clock).json()
     assert not store.runtime_status()["weights"]["champion_nvfp4"]
 
-    bad = {**nvfp4_manifest(), "files": {**nvfp4_manifest()["files"], "config.json": "e" * 64}}
     url = "/v1/admin/champion/nvfp4"
-    assert client.post(url, json=bad, headers=bearer(ADMIN)).status_code == 422
-    assert client.post(url, json=nvfp4_manifest(), headers=bearer(WORKER)).status_code in (401, 403)
-    response = client.post(url, json=nvfp4_manifest(), headers=bearer(ADMIN))
+    assert client.post(url, headers=bearer(WORKER)).status_code in (401, 403)
+    response = client.post(url, headers=bearer(ADMIN))
     assert response.status_code == 200, response.text
-    assert client.post(url, json=nvfp4_manifest("x"), headers=bearer(ADMIN)).status_code == 409
+    assert client.post(url, headers=bearer(ADMIN)).status_code == 409
 
     crowns = client.get("/v1/leaderboard").json()["crowns"]
     assert [c["repo"] for c in crowns] == [pins.BASE_REPO, "nvidia/model"]
-    assert "entitlement" not in crowns[-1]  # a migration earns nothing
+    assert crowns[-1]["hotkey"] is None and "entitlement" not in crowns[-1]  # earns nothing
     assert client.get(f"/v1/submissions/{queued['id']}").json()["state"] == "expired"
     assert store.runtime_status()["weights"]["champion_nvfp4"]
     assert body(store, 1)["weights"] == paid  # replay unchanged
@@ -1424,3 +1438,107 @@ def test_an_nvfp4_challenger_needs_the_pinned_tensor_layout(tmp_path, monkeypatc
     with pytest.raises(worker.JobFailed, match="NVFP4 tensor layout") as failure:
         asyncio.run(instance._duel(job, tmp_path, {}))
     assert failure.value.retry is False
+
+
+def test_a_migration_never_pulls_a_lease_from_under_a_worker(tmp_path, official):
+    """A leased BF16 duel turns stale, not terminal: its worker completes (or fails) without a
+    409, then the job expires and is never re-duelled against the NVFP4 champion. Pending
+    judgments of expired work are dropped, so the teacher spends nothing on them."""
+    store = store_of(tmp_path)
+    first = quality_submit(store, "leased")
+    queued = quality_submit(store, "queued")
+    lease = store.lease("quality")
+    assert lease is not None and lease["job"] == first["job"]["id"]
+    with store._tx() as db:
+        db.execute(
+            "INSERT INTO judgments (job_id, case_index, side, track, level, seed, png, brief, "
+            "rubric) VALUES (?, 0, 'champion', 'paint', 1, 0, x'00', '', '')",
+            (lease["job"],),
+        )
+    store.migrate_nvfp4()
+    assert store.submission(queued["id"])["state"] == "expired"
+    assert store.heartbeat(lease["job"], lease["lease"])["stale"] is True
+    store.fail(lease["job"], lease["lease"], "infra", True, {})  # no 409
+    after = store.submission(first["id"])
+    assert after["state"] == "expired" and "format" in after["reason"]
+    with store._lock:
+        assert store._db.execute("SELECT count(*) FROM judgments").fetchone()[0] == 0
+        states = [r[0] for r in store._db.execute("SELECT state FROM jobs WHERE lane='quality'")]
+    assert "queued" not in states and "leased" not in states  # nothing BF16 is left to run
+    assert store.lease("quality", nvfp4=True) is None
+
+
+def test_only_the_base_champion_migrates_and_only_to_the_pinned_export(tmp_path, official):
+    store = store_of(tmp_path)
+    champion = store.migrate_nvfp4()
+    assert (champion["repo"], champion["revision"]) == (pins.NVFP4_REPO, pins.NVFP4_REVISION)
+    with store._lock:
+        files = json.loads(store._champion(store._db)["files"])
+    assert files == pins.NVFP4_FILES
+    with pytest.raises(StoreError) as again:
+        store.migrate_nvfp4()
+    assert again.value.status == 409
+
+    other = store_of(tmp_path / "mined")
+    with other._tx() as db:  # a mined BF16 champion: no proven NVFP4 derivative exists
+        db.execute(
+            "INSERT INTO champions (repo, revision, files, digest, crowned_at) "
+            "VALUES ('m/x', ?, ?, ?, 0)",
+            ("e" * 40, json.dumps(pins.BASE_FILES), "f" * 64),
+        )
+    with pytest.raises(StoreError, match="only the base champion"):
+        other.migrate_nvfp4()
+
+
+def test_nvfp4_intake_needs_the_index_and_bf16_workers_lease_nothing(tmp_path, official):
+    store = store_of(tmp_path)
+    store.migrate_nvfp4()
+    single = {"config.json": NVFP4, "model.safetensors": "a" * 64}
+    with pytest.raises(StoreError, match="index"):
+        store.submit("5S", "m/s", "a" * 40, single, "d" * 64, secrets.token_hex(16), 10**10)
+    manifest = nvfp4_manifest("ok")
+    digest = manifest_digest(manifest["repo"], manifest["revision"], manifest["files"])
+    store.submit(
+        "5N", manifest["repo"], manifest["revision"], manifest["files"], digest,
+        secrets.token_hex(16), int(store.clock()) + 60,
+    )  # fmt: skip
+    assert store.lease("quality") is None  # a worker that does not declare NVFP4 (H200)
+    assert store.lease("quality", nvfp4=True) is not None
+
+
+def test_a_lost_lease_is_not_fatal_but_other_409s_are(monkeypatch):
+    """The container's exact not-leased 409 (the job expired or went stale meanwhile) ends
+    the job quietly; any other 4xx, auth included, still raises."""
+    import httpx
+
+    def api(status: int, detail: str) -> worker.Api:
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(status, json={"detail": detail})
+        )
+        return worker.Api("http://x", "t", httpx.AsyncClient(transport=transport))
+
+    async def call(instance: worker.Api) -> None:
+        await instance.call("POST", "/v1/worker/jobs/j/complete", json={})
+
+    with pytest.raises(worker.LeaseLost):
+        asyncio.run(call(api(409, worker.NOT_LEASED)))
+    for status, detail in ((409, "3 of 10 cases answered by both sides"), (401, "bad token")):
+        with pytest.raises(RuntimeError) as error:
+            asyncio.run(call(api(status, detail)))
+        assert not isinstance(error.value, worker.LeaseLost)
+
+
+def test_the_runtime_lane_needs_a_champion_of_known_provenance(tmp_path, official):
+    """An NVFP4 config alone opens nothing: the champion must be the pinned export (the
+    migration) or a crowned challenger the worker verified."""
+    store = lane_store(tmp_path)
+    with store._tx() as db:
+        db.execute(
+            "INSERT INTO champions (repo, revision, files, digest, crowned_at) "
+            "VALUES ('x/y', ?, ?, ?, 0)",
+            ("a" * 40, json.dumps(nvfp4_manifest("unverified")["files"]), "b" * 64),
+        )
+    assert not store.runtime_status()["open"]
+    with store._tx() as db:
+        db.execute("UPDATE champions SET job_id='j_crowned' WHERE repo='x/y'")
+    assert store.runtime_status()["open"]

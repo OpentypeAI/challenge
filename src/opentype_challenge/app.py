@@ -604,11 +604,14 @@ def create_app(
     @app.post("/v1/worker/lease")
     async def lease(
         lane: Annotated[Literal["quality", "runtime"], Query()] = "quality",
+        nvfp4: Annotated[bool, Query()] = False,
         authorization: Annotated[str | None, Header()] = None,
     ) -> Response:
-        """Workers ask for their lane; a worker that does not ask gets quality jobs only."""
+        """Workers ask for their lane; a worker that does not ask gets quality jobs only. Once
+        the champion is NVFP4, quality jobs go only to workers declaring nvfp4 (B300); an
+        older worker leases nothing."""
         worker(authorization)
-        job = await run(store.lease, lane)
+        job = await run(store.lease, lane, nvfp4)
         if job is None:
             return Response(status_code=204)
         return JSONResponse(job)
@@ -732,14 +735,11 @@ def create_app(
 
     @app.post("/v1/admin/champion/nvfp4")
     async def migrate_nvfp4(
-        request: Request, authorization: Annotated[str | None, Header()] = None
+        authorization: Annotated[str | None, Header()] = None,
     ) -> dict[str, Any]:
-        """One-way: the champion becomes this NVFP4 checkpoint of its weights (prospective)."""
+        """One-way, prospective: the pinned official NVFP4 export becomes the champion."""
         admin(authorization)
-        item: Manifest = await body(request, SUBMIT_BODY_MAX, Manifest)
-        result: dict[str, Any] = await run(
-            store.migrate_nvfp4, item.repo, item.revision, item.files
-        )
+        result: dict[str, Any] = await run(store.migrate_nvfp4)
         return result
 
     @app.put("/v1/admin/lanes")

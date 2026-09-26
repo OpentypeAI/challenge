@@ -15,8 +15,9 @@ The format follows the champion. Until the operator migrates it, the champion is
 `config.json` is the base revision's (sha256 `13b11d2f…c506`). After the one-way NVFP4
 migration (`GET /v1/status` shows the champion), every submission is a ModelOpt NVFP4
 checkpoint: `config.json` byte-equal to `nvidia/diffusiongemma-26B-A4B-it-NVFP4@ec4ff3df`'s
-(sha256 `b4f650bd…5fde`) and exactly its tensor names, dtypes and shapes (W4A4 FP4 routed
-experts, FP8 block scales, FP32 global scales; the rest BF16). The worker checks the shard
+(sha256 `b4f650bd…5fde`), sharded with `model.safetensors.index.json`, and exactly its
+tensor names, dtypes and shapes (W4A4 FP4 routed experts, FP8 block scales, FP32 global
+scales; the rest BF16). The worker checks the shard
 headers before serving; any other layout is rejected. BF16 manifests are refused at intake
 from then on. Quantize your own improved weights with the same recipe.
 

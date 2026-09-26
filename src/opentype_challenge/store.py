@@ -18,9 +18,10 @@ from pathlib import Path
 from typing import Any
 
 from . import bank, harness, ledger, paint, pins, runtime, scoring, tracks
-from .crypto import manifest_digest, manifest_problem
+from .crypto import manifest_digest
 from .generator import Case
 from .tracks import TrackPlan
+from .worker import NOT_LEASED
 
 LEASE_SECONDS = 1800  # renewed by every answers batch
 MAX_ATTEMPTS = 3  # infrastructure retries of one job before the submission fails
@@ -131,6 +132,7 @@ WINDOW_COLUMNS = "id, secret, commitment, opened_at, closed_at, bank_digest"
 
 RUNTIME_WORKER_SECONDS = 120  # a runtime worker polls every 30 s when idle
 EXPIRED = "the quality champion or the calibrated profile changed: sign a new runtime submission"
+EXPIRED_FORMAT = "the champion changed weight format (NVFP4): resubmit in the champion's format"
 UNJUDGED_MAX = 0.05  # share of judged cases a crowned duel may drop as unreadable
 JUDGE_DEADLINE_SECONDS = 6 * 3600  # a judging job settles without its missing sides after this
 
@@ -348,11 +350,18 @@ class Store:
         )
 
     def _champion_nvfp4(self, db: sqlite3.Connection) -> bool:
-        """The champion's manifest carries the pinned NVFP4 config. Its tensor layout is
-        checked by the worker on the verified files (sandbox.weights_identity) and bound by
-        the calibrated profile; a mismatch there is never measured."""
-        files = json.loads(self._champion(db)["files"])
-        return bool(files.get("config.json") == pins.NVFP4_CONFIG_SHA256)
+        """The champion's manifest carries the pinned NVFP4 config. Only two paths make such
+        a champion: the migration, which installs exactly the pinned official export, and a
+        crown, whose challenger the worker verified (digests and the pinned tensor layout)
+        before it served a case. The profile binds the layout again on every runtime run."""
+        champion = self._champion(db)
+        files = json.loads(champion["files"])
+        if files.get("config.json") != pins.NVFP4_CONFIG_SHA256:
+            return False
+        official = (champion["repo"], champion["revision"], files) == (
+            pins.NVFP4_REPO, pins.NVFP4_REVISION, pins.NVFP4_FILES
+        )  # fmt: skip
+        return official or champion["job_id"] is not None  # the migration, or a crown
 
     def _incumbent(self, db: sqlite3.Connection) -> sqlite3.Row | None:
         """The runtime incumbent certified on the current champion's weights and the current
@@ -376,38 +385,32 @@ class Store:
                 db.execute("DELETE FROM meta WHERE key='runtime_calibration'")
             else:
                 self._set_meta(db, "runtime_calibration", raw)
-            self._expire_runtime(db)  # queued work signed for another profile
+            self._expire_off_target(db)  # queued work signed for another profile
             self._finalize(db)
         return None if calibration is None else calibration.public()
 
-    def migrate_nvfp4(self, repo: str, revision: str, files: Mapping[str, str]) -> dict[str, Any]:
-        """The operator's one-way migration of the quality champion to an NVFP4 checkpoint of
-        its own weights (the official export while the base is champion). Prospective: a new
-        champion row with no entitlement; every earlier champion, entitlement, payment and
-        epoch stays as it is and old debts keep paying. From here on quality intake takes
-        only the NVFP4 config (and the worker the pinned tensor layout), so no BF16 duel is
-        ever run again; open BF16 work expires, and a leased job turns stale. That the
-        weights quantize the current champion is the operator's attestation (docs)."""
-        problem = manifest_problem(files)
-        if problem:
-            raise StoreError(422, problem)
-        if files["config.json"] != pins.NVFP4_CONFIG_SHA256:
-            raise StoreError(422, "config.json must be the pinned NVFP4 export's")
+    def migrate_nvfp4(self) -> dict[str, Any]:
+        """The operator's one-way, prospective reset of the quality lane to NVFP4: the pinned
+        official export (pins.NVFP4_REPO@NVFP4_REVISION) becomes the champion. It claims no
+        equivalence with the BF16 champion it follows: a new row with no hotkey and no
+        entitlement; every earlier champion, entitlement, payment and epoch stays as it is
+        and old debts keep paying. From here on quality intake takes only the NVFP4 config
+        (and the worker the pinned tensor layout), so no BF16 duel ever runs again; open BF16
+        work expires, a leased job turns stale, and BF16 workers lease nothing."""
+        repo, revision, files = pins.NVFP4_REPO, pins.NVFP4_REVISION, pins.NVFP4_FILES
         with self._tx() as db:
             if self._champion_nvfp4(db):
                 raise StoreError(409, "the champion is already NVFP4")
             previous = self._champion(db)
-            reason = "the champion migrated to NVFP4: resubmit an NVFP4 checkpoint"
-            for job in db.execute(
-                "SELECT id FROM jobs WHERE lane='quality' AND state IN "
-                "('queued', 'leased', 'judging', 'scored')"
-            ).fetchall():
-                self._terminal(db, job["id"], "expired", reason)
+            base = manifest_digest(pins.BASE_REPO, pins.BASE_REVISION, pins.BASE_FILES)
+            if previous["digest"] != base:
+                # converting a mined BF16 champion needs a checkpoint proven to derive from
+                # it; nothing here can prove that, so it is not offered
+                raise StoreError(409, "only the base champion migrates (to the official export)")
             db.execute(
-                "INSERT INTO champions (hotkey, repo, revision, files, digest, window_id, "
-                "crowned_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO champions (repo, revision, files, digest, window_id, crowned_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (
-                    previous["hotkey"],
                     repo,
                     revision,
                     _dumps(dict(files)),
@@ -417,7 +420,11 @@ class Store:
                 ),
             )
             self._set_meta(db, "nvfp4_migration", {"from": previous["id"], "at": self._now()})
-            self._expire_runtime(db)
+            # queued BF16 work expires now; leased and judging jobs are stale (another
+            # champion) and expire when their worker completes or fails them; scored ones
+            # are superseded, and their resubmission expires (another format)
+            self._expire_off_target(db)
+            self._finalize(db)
             return _champion_json(self._champion(db))
 
     def set_lanes_from(self, epoch: int) -> int:
@@ -856,6 +863,9 @@ class Store:
             if files.get("config.json") != config:
                 # the base's while the champion is BF16; the NVFP4 export's once it migrated
                 raise StoreError(422, "config.json must be byte-equal to the champion's")
+            if config == pins.NVFP4_CONFIG_SHA256 and "model.safetensors.index.json" not in files:
+                # the layout check reads the index before anything is served
+                raise StoreError(422, "an NVFP4 checkpoint needs model.safetensors.index.json")
             if json.loads(champion["files"]) == dict(files):
                 raise StoreError(409, "the manifest is a clone of the champion")
             db.execute("INSERT INTO nonces VALUES (?, ?, ?)", (nonce, hotkey, exp))
@@ -872,11 +882,13 @@ class Store:
         submission = db.execute(
             "SELECT lane FROM submissions WHERE id=?", (submission_id,)
         ).fetchone()
-        if submission["lane"] == "runtime" and not self._signed_current(db, submission_id):
-            # the signed target is never moved: the miner resubmits against the new one
+        if not self._submission_current(db, submission["lane"], submission_id):
+            # a runtime target is never moved (the miner signs again); a quality submission
+            # in the champion's former weight format is resubmitted in the new one
+            reason = EXPIRED if submission["lane"] == "runtime" else EXPIRED_FORMAT
             db.execute(
                 "UPDATE submissions SET state='expired', reason=? WHERE id=?",
-                (EXPIRED, submission_id),
+                (reason, submission_id),
             )
             return ""
         job_id = "j_" + secrets.token_hex(8)
@@ -891,9 +903,16 @@ class Store:
         return job_id
 
     def _target_current(self, db: sqlite3.Connection, job: sqlite3.Row) -> bool:
-        """A quality job may duel any current champion; a runtime job only the champion and
-        profile its submission signed."""
-        return job["lane"] != "runtime" or self._signed_current(db, job["submission_id"])
+        """A quality job may duel any current champion of its weight format (its config.json);
+        a runtime job only the champion and profile its submission signed."""
+        return self._submission_current(db, job["lane"], job["submission_id"])
+
+    def _submission_current(self, db: sqlite3.Connection, lane: str, submission_id: str) -> bool:
+        if lane == "runtime":
+            return self._signed_current(db, submission_id)
+        files = db.execute("SELECT files FROM submissions WHERE id=?", (submission_id,)).fetchone()
+        config = json.loads(self._champion(db)["files"]).get("config.json")
+        return bool(json.loads(files["files"]).get("config.json") == config)
 
     def _signed_current(self, db: sqlite3.Connection, submission_id: str) -> bool:
         """The champion and the profile a runtime submission signed are still current. With
@@ -1004,7 +1023,7 @@ class Store:
 
     # -- worker ---------------------------------------------------------------
 
-    def lease(self, lane: str = "quality") -> dict[str, Any] | None:
+    def lease(self, lane: str = "quality", nvfp4: bool = False) -> dict[str, Any] | None:
         """The next job of one lane. A runtime job never runs beside any other job: while one
         is leased nothing else is handed out, and it waits for every leased job to finish.
 
@@ -1015,6 +1034,10 @@ class Store:
         if lane == "runtime":
             with self._tx() as db:
                 self._set_meta(db, "runtime_polled", self._now())
+        elif not nvfp4:
+            with self._lock:
+                if self._champion_nvfp4(self._db):
+                    return None  # an NVFP4 duel runs only on a worker that declares B300
         return self._lease(lane)
 
     def _runtime_due(self, db: sqlite3.Connection) -> bool:
@@ -1073,7 +1096,7 @@ class Store:
                 return None
             if lane == "runtime" and not self._runtime_open(db):
                 return None
-            self._expire_runtime(db)
+            self._expire_off_target(db)
             if lane == "quality" and self._runtime_due(db):
                 return None  # drain for the waiting runtime job
             job = db.execute(
@@ -1136,7 +1159,7 @@ class Store:
         db.execute("DELETE FROM judgments WHERE job_id=?", (job_id,))
         db.execute("DELETE FROM runtime_tasks WHERE job_id=?", (job_id,))
         if not self._target_current(db, job):
-            self._terminal(db, job_id, "expired", EXPIRED)
+            self._expire(db, job)
             return
         attempts = job["attempts"] + 1
         if attempts >= MAX_ATTEMPTS:
@@ -1147,6 +1170,12 @@ class Store:
                 "stopped=0, reason=? WHERE id=?",
                 (attempts, reason, job_id),
             )
+
+    def _expire(self, db: sqlite3.Connection, job: sqlite3.Row) -> None:
+        """A job that can no longer duel its target: no judge spends anything on it."""
+        db.execute("DELETE FROM judgments WHERE job_id=? AND state='pending'", (job["id"],))
+        reason = EXPIRED if job["lane"] == "runtime" else EXPIRED_FORMAT
+        self._terminal(db, job["id"], "expired", reason)
 
     def _terminal(self, db: sqlite3.Connection, job_id: str, state: str, reason: str) -> None:
         db.execute(
@@ -1163,7 +1192,7 @@ class Store:
         if job is None:
             raise StoreError(404, "unknown job")
         if job["state"] != "leased" or job["lease"] != lease:
-            raise StoreError(409, "the job is not leased under this lease")
+            raise StoreError(409, NOT_LEASED)
         return job
 
     def heartbeat(self, job_id: str, lease: str) -> dict[str, Any]:
@@ -1697,17 +1726,16 @@ class Store:
         )
         self._terminal(db, job["id"], "crowned", f"crowned as champion {champion_id}")
         self._retire_levels(db)
-        self._expire_runtime(db)
+        self._expire_off_target(db)
 
-    def _expire_runtime(self, db: sqlite3.Connection) -> None:
-        """Queued runtime jobs whose signed champion or profile is no longer current expire; the
-        target is never moved. A leased one turns stale and expires when it completes or is
-        released."""
-        for queued in db.execute(
-            "SELECT * FROM jobs WHERE lane='runtime' AND state='queued'"
-        ).fetchall():
+    def _expire_off_target(self, db: sqlite3.Connection) -> None:
+        """Queued jobs that can no longer duel the current target expire: a runtime job whose
+        signed champion or profile moved (the target is never moved), a quality submission in
+        another weight format than the champion's. A leased or judging one turns stale and
+        expires when it completes or is released, never under a worker's feet."""
+        for queued in db.execute("SELECT * FROM jobs WHERE state='queued'").fetchall():
             if not self._target_current(db, queued):
-                self._terminal(db, queued["id"], "expired", EXPIRED)
+                self._expire(db, queued)
 
     # -- weights ---------------------------------------------------------------
 
