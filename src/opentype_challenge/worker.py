@@ -493,6 +493,12 @@ class Worker:
         evidence: dict[str, Any] = {
             "worker_version": __version__,
             "image": os.environ.get("OPENTYPE_WORKER_IMAGE", "unknown"),
+            # an overlay deploy (deploy/modal_runtime.py) names the source it adds to `image`
+            "source": {
+                k: os.environ[f"OPENTYPE_SOURCE_{k.upper()}"]
+                for k in ("revision", "sha256")
+                if f"OPENTYPE_SOURCE_{k.upper()}" in os.environ
+            },
             **self.launcher.evidence(),
             "base": {"repo": pins.BASE_REPO, "revision": pins.BASE_REVISION},
         }

@@ -379,6 +379,22 @@ refused (409): nothing here could prove that an NVFP4 checkpoint derives from it
   config. Re-run Phase 0 sizing on the NVFP4 champion before trusting the quality margin:
   its error rates differ.
 
+### Release provenance (B300 controller)
+
+The controller image is `BASE_IMAGE` (pinned by digest) with this checkout's `src/` and
+two deploy modules overlaid on it. Every job's evidence records both parts: `image` is the
+base digest only, and `source` is `{revision, sha256}` of the overlay. `sha256` hashes
+every uploaded file by path. The base digest alone never stands for the overlay.
+
+1. Start from a clean checkout of the reviewed commit: `git status --porcelain` is empty
+   and `git rev-parse HEAD` is the merged SHA.
+2. Deploy with `OPENTYPE_SOURCE_REVISION=$(git rev-parse HEAD) modal deploy
+   deploy/modal_controller.py`. Without that variable, the deploy refuses to run.
+3. Record `source.sha256` from the first job's evidence next to the SHA in the release
+   notes. Anyone can recompute it from that commit with
+   `python -c "import modal_runtime; print(modal_runtime.source_identity())"`, run in
+   `deploy/`.
+
 ### Kernels: implemented, not enabled
 
 `opentype_challenge.sandbox` runs miner kernels only in fresh Modal Sandboxes:

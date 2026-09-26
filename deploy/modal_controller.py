@@ -42,13 +42,16 @@ from pathlib import Path
 import modal
 
 sys.path.insert(0, str(Path(__file__).parent))
-from modal_runtime import BASE_IMAGE, image  # noqa: E402 - the one pinned CUDA 13.0 image
+from modal_runtime import image  # noqa: E402 - the one pinned CUDA 13.0 image
 
 API = os.environ.get("OPENTYPE_API", "https://chain.joinbase.ai/challenge/opentype")
 WORK = "/work"
 
 app = modal.App("opentype-controller")
-controller_image = image.env({"OPENTYPE_API": API, "OPENTYPE_WORKER_IMAGE": BASE_IMAGE})
+if os.environ.get("OPENTYPE_SOURCE_REVISION", "undeclared") == "undeclared" and modal.is_local():
+    # a production controller names the exact source it runs (docs/operator.md, release)
+    raise SystemExit("set OPENTYPE_SOURCE_REVISION to the git commit of this clean checkout")
+controller_image = image.env({"OPENTYPE_API": API})
 TIMEOUT = 24 * 3600
 volumes = {
     lane: modal.Volume.from_name(f"opentype-controller-{lane}", create_if_missing=True)

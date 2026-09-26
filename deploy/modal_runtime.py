@@ -16,6 +16,7 @@ measured profile and exits. No miner code, no worker token, hard timeouts everyw
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -30,6 +31,30 @@ BASE_IMAGE = (
 SNAPSHOT = "/snap"
 ROOT = Path(__file__).resolve().parent.parent
 DEPLOY, DEPLOY_DIR = ROOT / "deploy", "/opt/opentype-deploy"
+
+
+def source_identity() -> dict[str, str]:
+    """What this deploy overlays on BASE_IMAGE: the sha256 of every uploaded source file (by
+    path) and the operator-declared revision. The image identity is the pair: BASE_IMAGE's
+    digest alone does not include the overlay."""
+    import hashlib
+
+    files = sorted(
+        p for p in [*ROOT.joinpath("src").rglob("*"), ROOT / "pyproject.toml",
+                    DEPLOY / "modal_runtime.py", DEPLOY / "modal_runtime_kernels.py"]
+        if p.is_file() and "__pycache__" not in p.parts
+    )  # fmt: skip
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(
+            f"{path.relative_to(ROOT)}\0{hashlib.sha256(path.read_bytes()).hexdigest()}\n".encode()
+        )
+    return {
+        "OPENTYPE_WORKER_IMAGE": BASE_IMAGE,  # the base only; the overlay is named below
+        "OPENTYPE_SOURCE_SHA256": digest.hexdigest(),
+        "OPENTYPE_SOURCE_REVISION": os.environ.get("OPENTYPE_SOURCE_REVISION", "undeclared"),
+    }
+
 
 app = modal.App("opentype-runtime")
 image = (
@@ -52,6 +77,7 @@ image = (
     .env(
         {
             "PYTHONPATH": DEPLOY_DIR,
+            **source_identity(),
             "HF_HUB_DISABLE_TELEMETRY": "1",
             "VLLM_NO_USAGE_STATS": "1",
             "DO_NOT_TRACK": "1",
