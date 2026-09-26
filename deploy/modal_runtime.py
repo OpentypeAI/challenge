@@ -29,6 +29,7 @@ BASE_IMAGE = (
 )
 SNAPSHOT = "/snap"
 ROOT = Path(__file__).resolve().parent.parent
+DEPLOY, DEPLOY_DIR = ROOT / "deploy", "/opt/opentype-deploy"
 
 app = modal.App("opentype-runtime")
 image = (
@@ -42,8 +43,20 @@ image = (
     .add_local_file(ROOT / "pyproject.toml", "/opt/opentype-src/pyproject.toml", copy=True)
     .add_local_file(ROOT / "README.md", "/opt/opentype-src/README.md", copy=True)
     .add_local_file(ROOT / "LICENSE", "/opt/opentype-src/LICENSE", copy=True)
+    # the deploy modules other deploy files import (modal mounts only a function's own file)
+    .add_local_file(DEPLOY / "modal_runtime.py", f"{DEPLOY_DIR}/modal_runtime.py", copy=True)
+    .add_local_file(
+        DEPLOY / "modal_runtime_kernels.py", f"{DEPLOY_DIR}/modal_runtime_kernels.py", copy=True
+    )
     .run_commands("uv pip install --system --no-cache --no-deps /opt/opentype-src")
-    .env({"HF_HUB_DISABLE_TELEMETRY": "1", "VLLM_NO_USAGE_STATS": "1", "DO_NOT_TRACK": "1"})
+    .env(
+        {
+            "PYTHONPATH": DEPLOY_DIR,
+            "HF_HUB_DISABLE_TELEMETRY": "1",
+            "VLLM_NO_USAGE_STATS": "1",
+            "DO_NOT_TRACK": "1",
+        }
+    )
 )
 snapshot = modal.Volume.from_name("opentype-nvfp4-snapshot", create_if_missing=True)
 
@@ -144,8 +157,8 @@ def smoke(moe_backend: str = "cutlass", cases: int = 8, max_model_len: int = 327
     return result
 
 
-# next to this file locally; in the image under the copied checkout
-sys.path += [str(Path(__file__).resolve().parent), "/opt/opentype-src/deploy"]
+# next to this file locally; in the image under DEPLOY_DIR (PYTHONPATH)
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # local; the image sets PYTHONPATH
 from modal_runtime_kernels import CONTROL_KERNEL, RMS_KERNEL, SINGLE_KERNEL  # noqa: E402
 
 VARIANTS = {"correct": RMS_KERNEL, "single": SINGLE_KERNEL, "control": CONTROL_KERNEL}

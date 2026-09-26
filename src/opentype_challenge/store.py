@@ -4,6 +4,7 @@ champions, ledger and epochs (docs/tracks.md §8, §11)."""
 from __future__ import annotations
 
 import json
+import logging
 import random
 import secrets
 import sqlite3
@@ -22,6 +23,8 @@ from .crypto import manifest_digest
 from .generator import Case
 from .tracks import TrackPlan
 from .worker import NOT_LEASED
+
+log = logging.getLogger(__name__)
 
 LEASE_SECONDS = 1800  # renewed by every answers batch
 MAX_ATTEMPTS = 3  # infrastructure retries of one job before the submission fails
@@ -336,8 +339,17 @@ class Store:
         return None if value is None else _dumps(value)
 
     def _calibration(self, db: sqlite3.Connection) -> runtime.Calibration | None:
+        """The published calibration; one this build cannot parse (an older schema) counts
+        as withdrawn: the lane closes and runtime work parks until the operator publishes
+        again, instead of every status and lease failing."""
         value = self._meta_opt(db, "runtime_calibration")
-        return None if value is None else runtime.Calibration.from_json(value)
+        if value is None:
+            return None
+        try:
+            return runtime.Calibration.from_json(value)
+        except runtime.RuntimeError_ as error:
+            log.warning("runtime calibration ignored (unparseable): %s", error)
+            return None
 
     def _runtime_open(self, db: sqlite3.Connection) -> bool:
         """Runtime intake needs the operator's calibration, the lane split scheduled and an
@@ -374,6 +386,9 @@ class Store:
             "ORDER BY id DESC LIMIT 1",
             (self._champion(db)["id"], calibration.profile_digest),
         ).fetchone()
+        kernel = _kernel(row["kernel"]) if row is not None else None
+        if kernel is not None and kernel["slot"] not in calibration.kernel_slots:
+            return None  # its slot closed: the stock configuration is the reference again
         return row
 
     def set_calibration(self, raw: Any) -> dict[str, Any] | None:
@@ -918,12 +933,19 @@ class Store:
         """The champion and the profile a runtime submission signed are still current. With
         no calibration published the profile cannot have moved: the job waits, parked."""
         signed = db.execute(
-            "SELECT target, profile FROM submissions WHERE id=?", (submission_id,)
+            "SELECT target, profile, kernel FROM submissions WHERE id=?", (submission_id,)
         ).fetchone()
         calibration = self._calibration(db)
+        kernel = _kernel(signed["kernel"])
         return bool(
             signed["target"] == self._champion(db)["id"]
-            and (calibration is None or signed["profile"] == calibration.profile_digest)
+            and (
+                calibration is None
+                or (
+                    signed["profile"] == calibration.profile_digest
+                    and (kernel is None or kernel["slot"] in calibration.kernel_slots)
+                )
+            )
         )
 
     def _target(self, db: sqlite3.Connection, job_id: str) -> None:
@@ -1437,6 +1459,9 @@ class Store:
             if not (job["stopped"] or stale) and answered < job["cases"]:
                 raise StoreError(409, f"{answered} of {job['cases']} cases answered by both sides")
             db.execute("UPDATE jobs SET evidence=? WHERE id=?", (_dumps(dict(evidence)), job_id))
+            if stale and not self._target_current(db, job):
+                self._expire(db, job)  # nothing is judged for work that can never count
+                return self._submission(db, job["submission_id"])
             pending = db.execute(
                 "SELECT 1 FROM judgments WHERE job_id=? AND state='pending'", (job_id,)
             ).fetchone()
@@ -1735,12 +1760,14 @@ class Store:
 
     def _expire_off_target(self, db: sqlite3.Connection) -> None:
         """Queued jobs that can no longer duel the current target expire: a runtime job whose
-        signed champion or profile moved (the target is never moved), a quality submission in
-        another weight format than the champion's. A leased or judging one turns stale and
-        expires when it completes or is released, never under a worker's feet."""
-        for queued in db.execute("SELECT * FROM jobs WHERE state='queued'").fetchall():
-            if not self._target_current(db, queued):
-                self._expire(db, queued)
+        signed champion or profile moved (the target is never moved) or whose kernel slot the
+        calibration closed, a quality submission in
+        another weight format than the champion's. A judging one (no worker holds it) expires
+        too, its pending judgments dropped; a leased one turns stale and expires when it
+        completes or is released, never under a worker's feet."""
+        for job in db.execute("SELECT * FROM jobs WHERE state IN ('queued', 'judging')").fetchall():
+            if not self._target_current(db, job):
+                self._expire(db, job)
 
     # -- weights ---------------------------------------------------------------
 

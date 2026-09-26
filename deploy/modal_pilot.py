@@ -344,5 +344,12 @@ def quality_report(out: str, cases: str = "decisions=32,longctx=8,ops=8,sql=8") 
 
 
 @app.local_entrypoint()
-def calibration_report(out: str, blocks: int = 2, seed: str = "calibration-pilot") -> None:
-    _write_private(out, calibration.remote(blocks=blocks, seed=seed))
+def calibration_report(
+    out: str,
+    blocks: int = 2,
+    seed: str = "calibration-pilot",
+    cells: str = "",
+    moe_backend: str = "cutlass",
+) -> None:
+    result = calibration.remote(blocks=blocks, seed=seed, cells=cells, moe_backend=moe_backend)
+    _write_private(out, result)

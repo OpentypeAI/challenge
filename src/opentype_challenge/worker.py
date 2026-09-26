@@ -648,6 +648,9 @@ class Worker:
             ]
             for s in ("B", "C")
         }
+        closed = [s for s, k in kernels.items() if k and k["slot"] not in cal.kernel_slots]
+        if closed:  # the container never leases one; refused here all the same
+            raise JobFailed(f"kernel slot not open under this calibration: {closed}", True)
         build = getattr(self.launcher, "build", None)
         if any(kernels.values()) and build is None:
             raise JobFailed("this worker cannot run kernels: no sandbox launcher", retry=True)

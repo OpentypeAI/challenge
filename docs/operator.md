@@ -299,7 +299,10 @@ Every threshold in it comes from your own pilot; this repository ships none.
    control. Each cell is `{"track" (decisions, longctx, ops or sql),
    "cases", "concurrency", "slo_ms", "weight", "warm"}`; weights sum to 1.
 
-Changing the calibration makes every running runtime job duel again under the new one. A
+Changing the calibration makes every running runtime job duel again under the new one.
+Closing a kernel slot (removing it from `kernel_slots`) expires queued kernel submissions
+for that slot, and an incumbent with that slot's kernel stops being the reference: stock
+serves as B again. A stored calibration that this build cannot parse counts as withdrawn. A
 submission signs the profile digest: if the new calibration changes the profile, its
 queued and running runtime work expires and miners sign again. Withdrawing the calibration
 (`null`) parks runtime work in the queue until one is published again. Caps:

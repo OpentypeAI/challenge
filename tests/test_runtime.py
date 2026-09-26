@@ -1696,3 +1696,62 @@ def test_a_job_directory_is_kept_while_a_sandbox_may_still_mount_it(tmp_path, mo
     (tmp_path / "j_1").rmdir()
     asyncio.run(go(FakeLauncher(dirty_after=0)))  # GPU state unknown, nothing served: removed
     assert not (tmp_path / "j_1").exists()
+
+
+def test_a_calibration_of_an_older_schema_counts_as_withdrawn(tmp_path):
+    """A stored calibration this build cannot parse closes the lane; nothing raises."""
+    store = store_of(tmp_path)
+    grant(store, "5A", 1)
+    with store._tx() as db:
+        store._set_meta(db, "runtime_calibration", {"version": "v0", "profile": {}})
+    assert store.runtime_status()["calibration"] is None
+    assert store.lease("runtime") is None and store.lease("quality", nvfp4=True) is None
+
+
+def test_closing_a_kernel_slot_expires_queued_kernel_work(tmp_path):
+    """A kernel for a slot the new calibration no longer opens is off target: it expires
+    (the miner resubmits under the new calibration); an option set keeps its place."""
+    store = lane_store(tmp_path)
+    status = store.runtime_status()
+    from .test_sandbox import KERNEL
+
+    kernel = runtime.normalize_kernel({"slot": "rms_norm", "source": KERNEL})
+    with_kernel = store.submit_runtime(
+        "5K", status["target"], CAL.profile_digest, {}, "d" * 64, secrets.token_hex(16),
+        int(store.clock()) + 60, kernel,
+    )  # fmt: skip
+    options = runtime_submit(store, "5O", {"max_num_seqs": 128})
+    store.set_calibration(calibration_json(kernel_slots=[]))
+    assert store.submission(with_kernel["id"])["state"] == "expired"
+    assert store.submission(options["id"])["state"] == "queued"
+
+
+def test_a_judging_job_off_its_target_expires_without_judging(tmp_path, official):
+    """No worker holds a judging job: when the champion's format changes it expires at once
+    and its pending judgments are dropped (the teacher spends nothing on it)."""
+    store = store_of(tmp_path)
+    first = quality_submit(store, "judging")
+    lease = store.lease("quality")
+    assert lease is not None
+    with store._tx() as db:
+        db.execute("UPDATE jobs SET state='judging', lease=NULL WHERE id=?", (lease["job"],))
+        db.execute(
+            "INSERT INTO judgments (job_id, case_index, side, track, level, seed, png, brief, "
+            "rubric) VALUES (?, 0, 'champion', 'paint', 1, 0, x'00', '', '')",
+            (lease["job"],),
+        )
+    store.migrate_nvfp4()
+    assert store.submission(first["id"])["state"] == "expired"
+    with store._lock:
+        assert store._db.execute("SELECT count(*) FROM judgments").fetchone()[0] == 0
+
+
+def test_a_stale_completion_off_its_target_expires_before_any_judging(tmp_path, official):
+    store = store_of(tmp_path)
+    first = quality_submit(store, "stale")
+    lease = store.lease("quality")
+    assert lease is not None
+    store.migrate_nvfp4()
+    store.complete(lease["job"], lease["lease"], {"errors": 0})
+    after = store.submission(first["id"])
+    assert after["state"] == "expired" and after["job"]["judgments_pending"] == 0
