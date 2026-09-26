@@ -537,3 +537,191 @@ def test_champion_weights_are_cached_and_their_failures_retried(
     asyncio.run(_run(client, tmp_path, hub, launcher))
     result = client.get(f"/v1/submissions/{sid}").json()
     assert result["state"] == "queued" and result["job"]["reason"].startswith("champion:")
+
+
+def _sandbox_launcher(tmp_path: Path, starts: list[str], build: str = "") -> Any:
+    """SandboxLauncher over local bootstrap processes (sandbox.serve, no demotion) serving the
+    fake vllm and reader: the production controller path with the sandbox stood in for. The
+    bootstrap reports the pinned B300 identity (no GPU here); `build` is the build bootstrap."""
+    from opentype_challenge import runtime, sandbox
+
+    from .test_runtime import PROFILE
+    from .test_sandbox import _port_base
+
+    reader = tmp_path / "structured_server.py"
+    reader.write_text(FAKE.read_text())
+    base = _port_base()
+    measured = {k: PROFILE[k] for k in (*runtime.MEASURED, "vllm_image")}
+    measured["structured_server_sha256"] = pins.STRUCTURED_SERVER_SHA256
+    code = (
+        "import sys; from pathlib import Path; from opentype_challenge import sandbox; "
+        f"sandbox.identity = lambda reader: {{**{measured!r}, 'gpu_uuids': ['GPU-x']}}; "
+        "sys.exit(sandbox.serve(sys.stdin.buffer, sys.stdout.buffer, "
+        f"vllm={(sys.executable, str(FAKE))!r}, reader=Path({str(reader)!r}), "
+        f"demote=False, kernel_dir=Path({str(tmp_path / 'k')!r}), "
+        f"log_dir=Path({str(tmp_path / 'logs')!r}), health_timeout=30, port_base={base}))"
+    )
+
+    class Backend(sandbox.ProcessBackend):
+        async def start(self, mode: str, model: Path | None) -> Any:
+            starts.append(model.name if model else mode)
+            return await super().start(mode, model)
+
+    build_command = [sys.executable, "-c", build] if build else []
+    return sandbox.SandboxLauncher(
+        Backend([sys.executable, "-c", code], build_command, gpu=runtime.GPU_TYPE)
+    )
+
+
+def _pin_nvfp4(monkeypatch, hub, config: bytes = b"nvfp4 config") -> dict[str, Any]:
+    """A fake official NVFP4 export on the hub, with every pin (and the profile's copies of
+    them, fixed at import) patched to it."""
+    from opentype_challenge import runtime, sandbox
+
+    files = {"config.json": config, "model.safetensors": b"base",
+             "model.safetensors.index.json": b'{"weight_map": {}}'}  # fmt: skip
+    revision = hashlib.sha1(b"nvidia/export").hexdigest()
+    hub.repos[("nvidia/export", revision)] = files
+    config_sha, schema = hashlib.sha256(config).hexdigest(), "5" * 64
+    for name, value in (
+        ("NVFP4_CONFIG_SHA256", config_sha),
+        ("NVFP4_REPO", "nvidia/export"),
+        ("NVFP4_REVISION", revision),
+        ("NVFP4_FILES", _digests(files)),
+        ("NVFP4_SCHEMA_SHA256", schema),
+    ):
+        monkeypatch.setattr(pins, name, value)
+    monkeypatch.setitem(runtime.PROFILE_FIXED, "weights_config_sha256", config_sha)
+    monkeypatch.setitem(runtime.PROFILE_FIXED, "weights_schema_sha256", schema)
+    monkeypatch.setattr(sandbox, "tensor_schema", lambda model: schema)
+    return files
+
+
+def test_an_nvfp4_duel_runs_one_fresh_sandbox_per_side(
+    make_client, miner, clock, hub, tmp_path, monkeypatch
+):
+    """After the migration a quality duel runs on the B300 path: the worker declares nvfp4,
+    serves the champion alone in a fresh sandbox, then the challenger alone in another, both
+    at the pinned quality serving config and verified NVFP4, reads through the relay (the
+    sandboxes hold no token and are not routable), and the container crowns on its own
+    scores. A BF16 worker leases nothing meanwhile."""
+    from opentype_challenge import runtime
+
+    nvfp4 = _pin_nvfp4(monkeypatch, hub)
+
+    def publish(repo: str, skill: str) -> dict[str, Any]:
+        files = {**nvfp4, "model.safetensors": skill.encode()}
+        revision = hashlib.sha1(f"{repo}{skill}".encode()).hexdigest()
+        hub.repos[(repo, revision)] = files
+        return {"repo": repo, "revision": revision, "files": _digests(files)}
+
+    client = make_client(duel_cases=200)
+    assert client.post("/v1/admin/champion/nvfp4", headers=bearer(ADMIN)).status_code == 200
+
+    manifest = publish("miner/exact", "exact")
+    sid = submit(client, miner, manifest, clock).json()["id"]
+    assert client.post("/v1/worker/lease", headers=bearer(WORKER)).status_code == 204  # BF16
+
+    starts: list[str] = []
+    launcher = _sandbox_launcher(tmp_path, starts)
+    assert asyncio.run(_run(client, tmp_path, hub, launcher)) is True
+    result = client.get(f"/v1/submissions/{sid}").json()
+    assert result["state"] == "crowned", result
+    assert len(starts) == 2 and starts[1] == "challenger"  # two fresh sandboxes, in order
+    assert launcher.quiescent()
+    assert [p["side"] for p in launcher.placements] == ["champion", "challenger"]
+    _, share = runtime.quality_serving()
+    profile = launcher.profile()
+    assert profile["weights"] == "modelopt-nvfp4" and profile["gpu_memory_utilization"] == share
+    assert profile["moe_backend"] == runtime.QUALITY_SERVING["moe_backend"]
+    evidence = result["job"]["evidence"]
+    assert evidence["quality_serving"] == runtime.QUALITY_SERVING["version"]
+    assert evidence["errors"] == 0 and evidence["executor"] == "modal-sandbox"
+    assert client.get("/v1/status").json()["champion"]["hotkey"] == miner.hotkey
+
+
+def test_a_bf16_champion_never_goes_to_the_sandbox_path(make_client, miner, clock, hub):
+    """Before the migration a B300 sandbox worker leases nothing: formats are never mixed."""
+    client = make_client(duel_cases=12)
+    submit(client, miner, hub.publish("miner/exact", "exact"), clock)
+    nvfp4 = client.post("/v1/worker/lease?nvfp4=true", headers=bearer(WORKER))
+    assert nvfp4.status_code == 204
+    assert client.post("/v1/worker/lease", headers=bearer(WORKER)).status_code == 200
+
+
+def test_a_runtime_kernel_job_runs_through_the_sandbox_controller(
+    make_client, miner, clock, hub, tmp_path, monkeypatch
+):
+    """The runtime lane end to end on the controller path: an NVFP4 champion, a calibration,
+    a signed kernel submission, then Worker(lane="runtime") over SandboxLauncher: one build
+    sandbox compiles the kernel, stock and candidate fidelity each serve alone, then B/C/B'
+    blocks, each a fresh bootstrap whose measured profile matches the calibration; the kernel
+    reaches only C's servers and the container settles the job on its own scores. The local
+    bootstrap stands in for the B300 sandbox (identity and the compile child are faked in
+    the child process: no GPU, no triton here)."""
+    from opentype_challenge import runtime
+    from opentype_challenge.miner import signed_runtime_submission
+
+    from .test_runtime import PROFILE, calibration_json
+    from .test_sandbox import KERNEL
+
+    _pin_nvfp4(monkeypatch, hub)
+    profile = {**PROFILE, **runtime.PROFILE_FIXED}
+    client = make_client()
+    assert client.post("/v1/admin/champion/nvfp4", headers=bearer(ADMIN)).status_code == 200
+    cal = calibration_json(profile=profile, blocks=3, max_drift=50.0)  # CPU timing noise
+    assert (
+        client.put("/v1/admin/runtime/calibration", json=cal, headers=bearer(ADMIN)).status_code
+        == 200
+    )
+    assert (
+        client.put("/v1/admin/lanes", json={"epoch": 1}, headers=bearer(ADMIN)).status_code == 200
+    )
+    state = client.get("/v1/runtime").json()
+    assert state["open"], state
+    kernel = {"slot": "rms_norm", "source": KERNEL}
+    body = signed_runtime_submission(
+        SLUG, state["target"], state["calibration"]["profile_digest"], {}, miner.signer,
+        clock.now, kernel=kernel,
+    )  # fmt: skip
+    posted = client.post("/v1/runtime/submissions", json=body)
+    assert posted.status_code == 201, posted.text
+
+    compiled = "print('compiled rms_norm for sm_103')"
+    build = (
+        "import sys; from opentype_challenge import sandbox; real = sandbox._spawn; "
+        f"sandbox._spawn = lambda c, *a, **k: real([sys.executable, '-c', {compiled!r}], *a, **k); "
+        "from pathlib import Path; sys.exit(sandbox.build(sys.stdin.buffer, sys.stdout.buffer, "
+        f"demote=False, kernel_dir=Path({str(tmp_path / 'b')!r})))"
+    )
+    starts: list[str] = []
+    launcher = _sandbox_launcher(tmp_path, starts, build)
+
+    async def go() -> bool:
+        api_client = httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app))
+        try:
+            instance = Worker(
+                Api("http://challenge.test", WORKER, api_client), tmp_path / "work", launcher,
+                fetch=hub.fetch, lane="runtime",
+            )  # fmt: skip
+            return await instance.run_once()
+        finally:
+            await api_client.aclose()
+
+    assert asyncio.run(go()) is True
+    result = client.get(f"/v1/submissions/{posted.json()['id']}").json()
+    job = result["job"]
+    # CPU timings are noise: the container, not the worker, decides; any verdict it reached
+    # on complete evidence (crown, reject or no decision) proves the path
+    assert "verdict" in job or "reason" in job, result
+    assert starts[0] == "build" and len(starts) == 1 + 2 + 3 * 3  # a fresh sandbox per run
+    assert launcher.quiescent()
+    sides = [(p["side"], p["kernel"] is not None) for p in launcher.placements]
+    assert sides[:2] == [("champion", False), ("challenger", True)]  # stock, then candidate
+    assert sides[2:] == [("champion", False), ("champion", True), ("champion", False)] * 3
+    evidence = job.get("evidence") or {}
+    if not evidence:
+        return  # a NO_DECISION requeue keeps no evidence; the placements above are the proof
+    assert evidence["kernel_build"] == "compiled rms_norm for sm_103"
+    assert len(evidence["runtime"]["blocks"]) == 3 and evidence["errors"] == 0
+    assert evidence["runtime"]["profile"] == profile

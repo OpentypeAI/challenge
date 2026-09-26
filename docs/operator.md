@@ -299,7 +299,13 @@ Every threshold in it comes from your own pilot; this repository ships none.
    control. Each cell is `{"track" (decisions, longctx, ops or sql),
    "cases", "concurrency", "slo_ms", "weight", "warm"}`; weights sum to 1.
 
-Changing the calibration makes every running runtime job duel again under the new one. A
+Changing the calibration makes a running runtime job that is still on target (same signed
+profile, kernel slot still open) duel again under the new one. A job the change takes off
+target (a new profile, or its kernel slot closed) expires. Queued and judging jobs expire
+at once, and their pending judgments are dropped. A leased job turns stale and expires when
+its worker completes or releases it. The miner then submits again. Closing a kernel slot (removing it from
+`kernel_slots`) therefore expires kernel submissions for that slot, and an incumbent with that slot's kernel stops being the reference: stock
+serves as B again. A stored calibration that this build cannot parse counts as withdrawn. A
 submission signs the profile digest: if the new calibration changes the profile, its
 queued and running runtime work expires and miners sign again. Withdrawing the calibration
 (`null`) parks runtime work in the queue until one is published again. Caps:
@@ -339,11 +345,91 @@ their effect on DiffusionGemma is what the benchmark measures): `max_num_seqs`,
 `max_num_batched_tokens`, `enable_chunked_prefill`, `enable_prefix_caching`. Anything else
 is refused at intake.
 
-### Kernels: disabled
+### NVFP4 migration of the quality champion
 
-Miner kernels (Triton, CuTe or any compiled artifact) are **not accepted** and are never
-loaded by any worker. They need a GPU guest with verified host and GPU isolation, blocked
-network, read-only weights, resource limits and verified teardown. None of the available
-backends is verified for this: the Cortex bubblewrap sandbox is CPU-only and its Firecracker
-guests boot with `pci=off`. Enabling kernels is a separate delivery that starts with
-choosing and validating such a backend.
+The runtime lane measures NVFP4 weights on B300 only, so it stays closed while the champion
+is BF16. `POST /v1/admin/champion/nvfp4` (no body) resets the quality lane to NVFP4, once,
+and only while the base is champion: the pinned official export (`pins.NVFP4_REPO` at
+`NVFP4_REVISION`, exactly `pins.NVFP4_FILES`) becomes the champion. A mined BF16 champion is
+refused (409): nothing here could prove that an NVFP4 checkpoint derives from it.
+
+- It is a prospective reset, not a claim that the export equals the BF16 champion. A new
+  champion row is added with no hotkey and no entitlement. Earlier champions, entitlements,
+  payments and served epochs are unchanged, and old debt keeps paying FIFO. There is no
+  way back.
+- Queued BF16 work expires at once. A judging duel also expires at once, and its pending
+  judgments are dropped (the teacher judges nothing for it). A leased duel turns stale;
+  its worker completes or fails it normally, then it expires before anything is judged. Nothing BF16 is re-duelled: a submission in another
+  format than the champion's expires instead of being requeued.
+- From then on intake takes only the NVFP4 config, with the weight index (a single
+  `model.safetensors` is refused), and the worker checks the pinned tensor layout of both
+  sides before serving. A later NVFP4 champion is always a crowned challenger that passed
+  that check.
+- Quality duels then serve NVFP4 on both sides, and quality jobs lease only to workers
+  that declare `nvfp4`: the sandbox controller (`deploy/modal_controller.py`: the deployed `quality` Function, spawned, never `modal run`),
+  one fresh B300 sandbox per side. Both sides must measure the runtime lane's pinned profile
+  (image, reader, NVFP4 weights, flags, share, context, B300), which differs only by the
+  versioned `runtime.QUALITY_SERVING` entry. Both sides must also measure the same
+  vllm/driver/compute capability, or the job retries. The duel records both profiles and
+  the GPU UUIDs. A sandbox that never starts retries and never rejects the challenger:
+  each side runs on a fresh placement. An H200 worker leases nothing, so stop
+  `opentype-worker` (`modal app stop opentype-worker`) at the migration, and validate one
+  duel on the controller first. Quality vllm pins
+  `--kv-cache-dtype bfloat16`, because `auto` would turn FP8 with unit scales under this
+  config. Re-run Phase 0 sizing on the NVFP4 champion before trusting the quality margin:
+  its error rates differ.
+
+### Release provenance (B300 controller)
+
+The controller image is `BASE_IMAGE` (pinned by digest) with this checkout's `src/` and
+deploy modules overlaid on it. Every job's evidence records both parts: `image` is the
+base digest only, and `source` is `{revision, sha256}` of the overlay. `sha256`
+(`modal_runtime.source_sha256`) hashes, by path, `src/` plus the explicit list
+`modal_runtime.UPLOADED`: `pyproject.toml`, `README.md`, `LICENSE` and every deploy module
+an image uploads or Modal auto-mounts (runtime, kernels, controller, pilot). A symlink in
+that set refuses the deploy. The base digest alone never stands for the overlay.
+`revision` is the operator's declaration; `sha256` is the content, so a clean git archive
+of the commit reproduces it.
+
+1. Start from the reviewed commit (a checkout or a git archive of it).
+2. Deploy with `OPENTYPE_SOURCE_REVISION=$(git rev-parse HEAD) modal deploy
+   deploy/modal_controller.py`. Without that variable, the deploy refuses to run.
+3. Record `source.sha256` from the first job's evidence next to the SHA in the release
+   notes. Anyone can recompute it from that commit with
+   `python -c "import modal_runtime; print(modal_runtime.source_identity())"`, run in
+   `deploy/`.
+
+### Kernels: implemented, not enabled
+
+`opentype_challenge.sandbox` runs miner kernels only in fresh Modal Sandboxes:
+`gpu="B300"`, `block_network=True`, `secrets=[]`, no OIDC token, and the verified NVFP4
+snapshot mounted read-only from the dedicated volume `opentype-nvfp4-snapshot` (never the
+quality worker's). The bootstrap measures the GPU identity before any miner code exists
+there. vllm, with the kernel, runs as uid 10001. The pinned reader runs as uid 10002 and
+binds its port first. A reply counts only while every served process is alive. Build and
+serve children are capped by rlimits and logs are tail-read. The kernel is compiled offline
+in its own CPU sandbox first. The controller holds every token and gold answer. Requests
+travel over the sandbox's exec stdio as numbered lines of 16 KiB or less, each frame
+capped at 8 MiB, and a lost line fails the channel.
+
+This is tested against hostile local processes. That is not a proof that no escape
+exists. Kernels stay off in production until all of these hold:
+
+1. The B300 controller (`deploy/modal_controller.py`) has run a real quality duel and a
+   runtime calibration pilot. The controller is a CPU Function that holds the worker token.
+   It drives `SandboxLauncher` over `ModalBackend(gpu="B300", commit=True)`, with one work
+   volume per lane and one writer. It is not deployed or scheduled by this repository. The
+   local-process launcher refuses every kernel.
+2. The champion is migrated to NVFP4.
+3. A B300 calibration listing `kernel_slots` is published from a representative pilot, not
+   from the smokes.
+
+Operational notes:
+
+- A fresh Sandbox is not the same physical GPU as the previous one. The calibration
+  measures that spread, and each run's `placements` record the GPU UUIDs.
+- Stage the snapshot (`modal run deploy/modal_runtime.py::stage`) only while nothing
+  serves from it. It commits once and must never be written concurrently.
+- Relay privacy: the exec path does not mirror frames into Modal app logs. The
+  `entrypoint` path of `relay_probe` does. Prompts are private benchmark inputs, so never
+  publish raw Modal app logs. No gold and no token ever enters a sandbox.

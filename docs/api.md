@@ -151,7 +151,8 @@ The body is at most 64 KiB. It returns `201` with the submission.
 
 - `files`: 2 to 128 entries, names from `config.json`, `model.safetensors.index.json`,
   `model.safetensors` or `model-NNNNN-of-NNNNN.safetensors`. Digests are lowercase sha256.
-  Shards need the index, and `config.json` must equal the base's.
+  Shards need the index, and `config.json` must equal the current champion's (the base's
+until the NVFP4 migration, the pinned NVFP4 export's after it).
 - The signature covers `opentype-submit-v1|<public key hex>|<manifest digest>|<nonce>|<exp>`,
   where the manifest digest is `sha256` of
   `{"files": {sorted}, "repo": ..., "revision": ...}` as compact sorted-key JSON.

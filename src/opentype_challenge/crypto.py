@@ -96,16 +96,23 @@ RUNTIME_DOMAIN = "opentype-runtime-v1"
 
 
 def runtime_digest(
-    slug: str, target: Mapping[str, object], profile_digest: str, options: Mapping[str, object]
+    slug: str,
+    target: Mapping[str, object],
+    profile_digest: str,
+    options: Mapping[str, object],
+    kernel: Mapping[str, object] | None = None,
 ) -> str:
-    """What a runtime submission signs: challenge, lane, target model, profile and options."""
-    body = {
+    """What a runtime submission signs: challenge, lane, target model, profile, options and,
+    when present, the kernel's slot and source sha256 (an option-only digest is unchanged)."""
+    body: dict[str, object] = {
         "challenge": slug,
         "lane": "runtime",
         "options": dict(sorted(options.items())),
         "profile": profile_digest,
         "target": dict(sorted(target.items())),
     }
+    if kernel is not None:
+        body["kernel"] = {"sha256": kernel["sha256"], "slot": kernel["slot"]}
     raw = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(raw).hexdigest()
 

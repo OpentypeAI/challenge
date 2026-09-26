@@ -101,15 +101,18 @@ def signed_runtime_submission(
     options: dict[str, Any],
     signer: Signer,
     now: float | None = None,
+    kernel: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """A runtime submission: allowlisted vLLM options for the current champion's weights on
-    the calibrated profile (both read from GET /v1/runtime)."""
-    options = runtime.normalize_options(options)
-    digest = runtime_digest(slug, target, profile, options)
+    """A runtime submission: allowlisted vLLM options and/or a kernel ({slot, source}) for
+    the current champion's weights on the calibrated profile (read from GET /v1/runtime)."""
+    options, normalized = runtime.normalize_candidate(options, kernel)
+    digest = runtime_digest(slug, target, profile, options, normalized)
     nonce = secrets.token_hex(16)
     exp = int(now if now is not None else time.time()) + EXP_SECONDS
     signature = signer.sign(runtime_message(signer.public, digest, nonce, exp))
+    extra = {"kernel": {"slot": kernel["slot"], "source": kernel["source"]}} if kernel else {}
     return {
+        **extra,
         "target": target,
         "profile": profile,
         "options": options,

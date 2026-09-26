@@ -14,20 +14,22 @@ from typing import Any
 
 import pytest
 
-from opentype_challenge import crypto, harness, ledger, runtime, tracks, worker
+from opentype_challenge import crypto, harness, ledger, pins, runtime, tracks, worker
 from opentype_challenge.crypto import manifest_digest
 from opentype_challenge.miner import signed_runtime_submission, signed_submission
 from opentype_challenge.runtime import Calibration, Fidelity
 from opentype_challenge.store import Settings, Store, StoreError
 
-from .conftest import ADMIN, SLUG, WORKER, Clock, Miner, bearer, weights_manifest
+from .conftest import ADMIN, SLUG, WORKER, Clock, Miner, bearer, submit, weights_manifest
 from .fake_inference import answer, blur, chat_reply
 
 PROFILE = {
     **runtime.PROFILE_FIXED,
-    "gpu": "NVIDIA H200",
-    "driver": "570.00",
+    "moe_backend": "cutlass",
+    "gpu": "NVIDIA B300 SXM6 AC",
+    "driver": "580.95.05",
     "vllm_version": "0.11.1rc2.dev77+g7f1a5398",
+    "compute_cap": "10.3",
 }
 
 
@@ -63,15 +65,30 @@ def calibration_json(**over: Any) -> dict[str, Any]:
         "bootstrap_resamples": 2000,
         "credit_per_log_gain": 10.0,
         "credit_cap": 2.0,
+        "divergence_tolerance": 0.05,
+        "kernel_slots": ["rms_norm"],
     }
     raw.update(over)
     return raw
 
 
 CAL = Calibration.from_json(calibration_json())
+
+
+@pytest.fixture(autouse=True)
+def nvfp4_champion(monkeypatch):
+    """The test champion (the base manifest) stands in for the pinned NVFP4 export; the gate
+    itself is checked by test_the_lane_stays_closed_on_a_non_nvfp4_champion."""
+    monkeypatch.setattr(pins, "NVFP4_CONFIG_SHA256", pins.BASE_FILES["config.json"])
+    monkeypatch.setattr(pins, "NVFP4_REPO", pins.BASE_REPO)
+    monkeypatch.setattr(pins, "NVFP4_REVISION", pins.BASE_REVISION)
+    monkeypatch.setattr(pins, "NVFP4_FILES", pins.BASE_FILES)
+
+
 GOOD = Fidelity(loss=10.0, decisions=100, determined=80, correct=78, cases=4)
 GOODS = {track: GOOD for track in runtime.fidelity_tracks(CAL)}  # decisions and ops
 CASES = {track: 4 for track in GOODS}
+SAME = [{"C": 0.0, "B2": 0.0}] * CAL.blocks  # the timed answers agree with B's
 
 
 def run_of(cal: Calibration, seconds: float, p95: float = 500.0, ok: Any = None) -> dict:
@@ -152,7 +169,7 @@ def test_calibration_is_strict():
 
 
 def test_a_known_gain_crowns_with_its_lcb():
-    result = runtime.verdict(CAL, evidence_of(gain=0.2, jitter=0.01), GOODS, GOODS, CASES)
+    result = runtime.verdict(CAL, evidence_of(gain=0.2, jitter=0.01), GOODS, GOODS, CASES, SAME)
     assert result["decision"] == "crown" and result["crown"]
     assert math.isclose(result["gain_mean"], 0.2 - 0.01 / 5)  # 3 blocks at -j, 2 at +j
     assert 0.185 < result["g_lcb"] < result["gain_mean"]
@@ -160,7 +177,7 @@ def test_a_known_gain_crowns_with_its_lcb():
 
 
 def test_noise_below_the_margin_is_no_crown():
-    result = runtime.verdict(CAL, evidence_of(gain=0.005, jitter=0.02), GOODS, GOODS, CASES)
+    result = runtime.verdict(CAL, evidence_of(gain=0.005, jitter=0.02), GOODS, GOODS, CASES, SAME)
     assert result["decision"] == "reject" and result["reason"] == "no certified gain"
 
 
@@ -183,7 +200,7 @@ def test_noise_below_the_margin_is_no_crown():
 def test_infrastructure_doubt_is_no_decision(mutate, reason):
     evidence = evidence_of()
     mutate(evidence)
-    result = runtime.verdict(CAL, evidence, GOODS, GOODS, CASES)
+    result = runtime.verdict(CAL, evidence, GOODS, GOODS, CASES, SAME)
     assert result["decision"] == "no_decision" and not result["crown"]
     assert reason in result["reason"]
 
@@ -191,40 +208,43 @@ def test_infrastructure_doubt_is_no_decision(mutate, reason):
 def test_candidate_failures_on_healthy_infrastructure_reject():
     dead = evidence_of()
     dead["blocks"][0]["runs"]["C"]["short"]["ok"] = 0
-    assert runtime.verdict(CAL, dead, GOODS, GOODS, CASES)["decision"] == "reject"
+    assert runtime.verdict(CAL, dead, GOODS, GOODS, CASES, SAME)["decision"] == "reject"
     slow = evidence_of()
     for block in slow["blocks"]:
         block["runs"]["C"]["short"]["p95_ms"] = 900.0
-    assert "latency" in runtime.verdict(CAL, slow, GOODS, GOODS, CASES)["reason"]
+    assert "latency" in runtime.verdict(CAL, slow, GOODS, GOODS, CASES, SAME)["reason"]
     minority = evidence_of()  # two slow blocks of five: a median would pass them
     for block in minority["blocks"][:2]:
         block["runs"]["C"]["short"]["p95_ms"] = 900.0
-    assert "latency" in runtime.verdict(CAL, minority, GOODS, GOODS, CASES)["reason"]
+    assert "latency" in runtime.verdict(CAL, minority, GOODS, GOODS, CASES, SAME)["reason"]
     worse = Fidelity(loss=12.0, decisions=100, determined=80, correct=78, cases=4)
     wrong = Fidelity(loss=10.0, decisions=100, determined=80, correct=70, cases=4)
     for track in GOODS:  # every measured track is guarded, not only decisions
         for bad, reason in ((worse, "loss"), (wrong, "accuracy")):
-            result = runtime.verdict(CAL, evidence_of(), {**GOODS, track: bad}, GOODS, CASES)
+            result = runtime.verdict(CAL, evidence_of(), {**GOODS, track: bad}, GOODS, CASES, SAME)
             assert result["decision"] == "reject" and result["reason"].startswith(track)
             assert reason in result["reason"]
     missing = Fidelity(loss=10.0, decisions=100, determined=80, correct=78, cases=3)
     for track in GOODS:
         partial = {**GOODS, track: missing}
-        assert runtime.verdict(CAL, evidence_of(), partial, GOODS, CASES)["decision"] == (
+        assert runtime.verdict(CAL, evidence_of(), partial, GOODS, CASES, SAME)["decision"] == (
             "no_decision"
         )
     no_ops = {"decisions": GOOD}
-    assert runtime.verdict(CAL, evidence_of(), no_ops, no_ops, {"decisions": 4})["decision"] == (
-        "no_decision"
-    )
+    assert runtime.verdict(CAL, evidence_of(), no_ops, no_ops, {"decisions": 4}, SAME)[
+        "decision"
+    ] == ("no_decision")
 
 
 def test_declared_candidate_metrics_never_count():
     evidence = evidence_of(gain=0.0)
     evidence["candidate_claims"] = {"speedup": 10.0}
     evidence["blocks"][0]["runs"]["C"]["short"]["speedup"] = 10.0  # unknown key: refused
-    assert runtime.verdict(CAL, evidence, GOODS, GOODS, CASES)["decision"] == "no_decision"
-    assert runtime.verdict(CAL, evidence_of(gain=0.0), GOODS, GOODS, CASES)["decision"] == "reject"
+    assert runtime.verdict(CAL, evidence, GOODS, GOODS, CASES, SAME)["decision"] == "no_decision"
+    assert (
+        runtime.verdict(CAL, evidence_of(gain=0.0), GOODS, GOODS, CASES, SAME)["decision"]
+        == "reject"
+    )
 
 
 def test_credit_is_capped_and_never_negative():
@@ -433,13 +453,24 @@ def runtime_body(state: dict[str, Any], who: Miner, clock: Clock, **over: Any) -
 def test_runtime_lane_is_closed_until_calibrated(client, miner, clock):
     state = client.get("/v1/runtime").json()
     assert not state["open"] and state["calibration"] is None
-    assert state["kernels"].startswith("disabled")
+    assert state["kernels"] == {
+        "slots": ["rms_norm"],
+        "open": [],
+        "max_bytes": runtime.KERNEL_MAX_BYTES,
+    }
     fake = {**state, "calibration": {"profile_digest": "0" * 64}}
     assert (
         client.post("/v1/runtime/submissions", json=runtime_body(fake, miner, clock)).status_code
         == 503
     )
     assert client.post("/v1/worker/lease?lane=runtime", headers=bearer(WORKER)).status_code == 204
+
+
+def test_the_lane_stays_closed_on_a_non_nvfp4_champion(tmp_path, monkeypatch):
+    monkeypatch.setattr(pins, "NVFP4_CONFIG_SHA256", "f" * 64)
+    store = lane_store(tmp_path)
+    state = store.runtime_status()
+    assert not state["open"] and not state["weights"]["champion_nvfp4"]
 
 
 def test_runtime_signatures_bind_every_field(client, miner, clock):
@@ -663,12 +694,12 @@ def test_runtime_leases_are_exclusive(tmp_path):
     store = lane_store(tmp_path)
     quality_submit(store, "a")
     runtime_submit(store, "5R", {"max_num_seqs": 128})
-    quality = store.lease("quality")
+    quality = store.lease("quality", nvfp4=True)
     assert quality is not None and store.lease("runtime") is None  # waits for the GPU
     store.fail(quality["job"], quality["lease"], "done", True, {})
     runtime_lease = store.lease("runtime")
     assert runtime_lease is not None
-    assert store.lease("quality") is None  # nothing runs beside a runtime measurement
+    assert store.lease("quality", nvfp4=True) is None  # nothing runs beside a runtime measurement
 
 
 def test_champion_change_expires_runtime_work_and_recertification_pays_nothing(tmp_path):
@@ -678,13 +709,15 @@ def test_champion_change_expires_runtime_work_and_recertification_pays_nothing(t
     first_credit = store.runtime_status()["crowns"][0]["credited"]
     # a queued runtime submission signed against champion 1
     queued = runtime_submit(store, "5Late", {"max_num_seqs": 256})["id"]
-    with store._tx() as db:  # a quality crown (champion 2) without running a whole duel
+    with store._tx() as db:  # a quality crown (champion 2) without running a whole duel:
+        # an ordinary miner's NVFP4 winner, same config and layout, other weight bytes
+        files = {**nvfp4_manifest("winner")["files"], "config.json": pins.NVFP4_CONFIG_SHA256}
         db.execute(
-            "INSERT INTO champions (repo, revision, files, digest, crowned_at) "
-            "VALUES ('m/new', 'r2', '{}', ?, 0)",
-            ("e" * 64,),
+            "INSERT INTO champions (repo, revision, files, digest, job_id, crowned_at) "
+            "VALUES ('m/new', 'r2', ?, ?, 'j_crowned', 0)",
+            (json.dumps(files), "e" * 64),
         )
-        store._expire_runtime(db)  # what _crown runs after it inserts a champion
+        store._expire_off_target(db)  # what _crown runs after it inserts a champion
     assert store.submission(queued)["state"] == "expired"
     status = store.runtime_status()
     assert status["incumbent"] is None  # back to stock on the new weights
@@ -707,7 +740,7 @@ def test_a_real_quality_crown_expires_queued_runtime_work(tmp_path):
     store.set_lanes_from(1)
     quality_submit(store, "winner")
     queued = runtime_submit(store, "5R", {"max_num_seqs": 128})["id"]
-    lease = store.lease("quality")
+    lease = store.lease("quality", nvfp4=True)
     assert lease is not None
     for offset in range(0, lease["cases"], 100):
         page = {**lease}
@@ -815,7 +848,7 @@ def verdict_of(out: dict[str, Any]) -> dict[str, Any]:
     ]
     blocks = runtime.runs_from_tasks(CAL, out["runtime"]["blocks"], tasks)
     measured = {"profile": out["runtime"]["profile"], "blocks": blocks}
-    return runtime.verdict(CAL, measured, GOODS, GOODS, CASES)
+    return runtime.verdict(CAL, measured, GOODS, GOODS, CASES, SAME)
 
 
 def test_worker_runs_b_c_b2_one_server_at_a_time(monkeypatch):
@@ -827,16 +860,21 @@ def test_worker_runs_b_c_b2_one_server_at_a_time(monkeypatch):
     assert "ok" not in json.dumps(out["runtime"])  # the worker reports no success flag
     stock, candidate, *measured = launcher.starts
     # fidelity: one server at a time at the calibrated share, stock pristine and first
-    assert stock == {"sides": ["champion"], "extra": {"champion": []}, "share": 0.9}
+    fixed = runtime.serving_argv(PROFILE)
+    assert fixed == [
+        "--kv-cache-dtype", "bfloat16", "--attention-backend", "TRITON_ATTN",
+        "--moe-backend", "cutlass",
+    ]  # fmt: skip
+    assert stock == {"sides": ["champion"], "extra": {"champion": fixed}, "share": 0.9}
     assert candidate == {
         "sides": ["challenger"],
-        "extra": {"challenger": ["--max-num-seqs", "128"]},
+        "extra": {"challenger": [*fixed, "--max-num-seqs", "128"]},
         "share": 0.9,
     }
     assert len(measured) == 3 * CAL.blocks
     assert all(start["sides"] == ["champion"] and start["share"] == 0.9 for start in measured)
     flags = [start["extra"]["champion"] for start in measured]
-    assert flags == [[], ["--max-num-seqs", "128"], []] * CAL.blocks
+    assert flags == [fixed, [*fixed, "--max-num-seqs", "128"], fixed] * CAL.blocks
     assert out["runtime"]["profile"] == PROFILE
     assert verdict_of(out)["decision"] == "reject"  # no gain
 
@@ -846,6 +884,31 @@ def test_worker_stops_on_a_dirty_gpu_and_the_verdict_is_no_decision(monkeypatch)
     blocks = out["runtime"]["blocks"]
     assert len(blocks) == 1 and blocks[0]["quiescent"] == [True, False]
     assert verdict_of(out)["decision"] == "no_decision"
+
+
+def test_a_kernel_never_runs_on_a_local_launcher(monkeypatch):
+    kernel = {"slot": "rms_norm", "source": "x", "sha256": "0" * 64}
+
+    async def go() -> None:
+        async with worker.VllmLauncher()({"champion": worker.Path("/m")}, kernel={"c": kernel}):
+            pass
+
+    with pytest.raises(worker.JobFailed, match="never runs a miner kernel"):
+        asyncio.run(go())
+    launcher = FakeLauncher()
+    with pytest.raises(worker.JobFailed, match="no sandbox launcher"):
+        bench_kernel(monkeypatch, launcher, kernel)
+    assert launcher.starts == []  # refused before anything served
+
+
+def bench_kernel(monkeypatch, launcher: FakeLauncher, kernel: dict[str, Any]) -> dict[str, Any]:
+    monkeypatch.setattr(worker, "base_snapshot", lambda directory, fetch: directory)
+    monkeypatch.setattr(worker.Worker, "_champion", lambda self, m, b: (b, {}))
+    instance = worker.Worker(None, None, launcher, lane="runtime")  # type: ignore[arg-type]
+    instance.workdir = worker.Path("/nonexistent")
+    spec = {"calibration": calibration_json(), "incumbent": {}, "candidate": {}, "seed": "s"}
+    job = {"champion": {}, "runtime": {**spec, "candidate_kernel": kernel}}
+    return asyncio.run(instance._bench(job, None, {}))  # type: ignore[arg-type]
 
 
 def test_worker_refuses_an_uncalibrated_profile(monkeypatch):
@@ -944,7 +1007,7 @@ def crown_quality_champion(store: Store) -> None:
             "VALUES ('m/new', 'r2', '{}', ?, 0)",
             ("e" * 64,),
         )
-        store._expire_runtime(db)
+        store._expire_off_target(db)
 
 
 def test_a_leased_runtime_job_never_moves_to_an_unsigned_champion(tmp_path):
@@ -1013,7 +1076,7 @@ def test_timed_outputs_are_scored_by_the_container(tmp_path):
 def test_timings_refuse_foreign_cells_and_quality_jobs(tmp_path):
     store = lane_store(tmp_path)
     quality_submit(store, "q")
-    quality = store.lease("quality")
+    quality = store.lease("quality", nvfp4=True)
     assert quality is not None
     item = {"block": 0, "side": "C", "cell": "short", "case_index": 0, "ms": 1.0}
     with pytest.raises(StoreError, match="runtime jobs"):
@@ -1051,7 +1114,7 @@ def test_queued_runtime_work_drains_quality_leases_boundedly(tmp_path):
 
     def quality_round() -> int:
         leased = 0
-        while (lease := store.lease("quality")) is not None:
+        while (lease := store.lease("quality", nvfp4=True)) is not None:
             store.fail(lease["job"], lease["lease"], "done", False, {})
             leased += 1
         return leased
@@ -1063,8 +1126,8 @@ def test_queued_runtime_work_drains_quality_leases_boundedly(tmp_path):
     for tag in "ghijkl":
         quality_submit(store, tag)
     # the second runtime job waits: quality gets exactly runtime_every leases, then drains
-    held = [store.lease("quality"), store.lease("quality")]
-    assert all(held) and store.lease("quality") is None
+    held = [store.lease("quality", nvfp4=True), store.lease("quality", nvfp4=True)]
+    assert all(held) and store.lease("quality", nvfp4=True) is None
     assert store.lease("runtime") is None  # still waiting for the two leased jobs
     for lease in held:
         assert lease is not None
@@ -1108,7 +1171,8 @@ def test_profile_reads_the_build_and_fails_closed(monkeypatch, tmp_path):
     manifest.write_text(json.dumps({"vllm_image": "vllm/other@sha256:1"}))
     profile = launcher.profile()
     assert profile["vllm_image"] == "vllm/other@sha256:1" and profile["vllm_version"] == "0.11.1"
-    assert set(profile) == {*runtime.PROFILE_FIXED, *runtime.MEASURED}
+    assert profile["executor"] == "local-process"  # never the runtime lane's executor
+    assert profile["executor"] != runtime.PROFILE_FIXED["executor"]
     assert profile != {**profile, "vllm_image": runtime.PROFILE_FIXED["vllm_image"]}
     assert worker.VllmLauncher(reader=reader, dtype="float16").profile()["dtype"] == "float16"
     monkeypatch.setattr(worker, "_package_version", lambda name: None)
@@ -1155,6 +1219,50 @@ def test_startup_failures_blame_the_candidate_only_after_a_healthy_reference(
 ):
     with pytest.raises(worker.JobFailed) as error:
         bench(monkeypatch, FailingLauncher(side, at), {"max_num_seqs": 128})
+    assert error.value.retry is retry
+
+
+@pytest.mark.parametrize("at", [1, 3])
+def test_on_fresh_placements_a_candidate_start_failure_retries(monkeypatch, at):
+    """Each sandbox run is a fresh placement: stock starting healthily on another GPU proves
+    nothing about the candidate's, so its start failure is the host's (bounded retry)."""
+
+    class Sandboxed(FailingLauncher):
+        sandboxed = True
+
+    launcher = Sandboxed("challenger" if at == 1 else "champion", at)
+    with pytest.raises(worker.JobFailed) as error:
+        bench(monkeypatch, launcher, {"max_num_seqs": 128})
+    assert error.value.retry is True
+
+
+@pytest.mark.parametrize(
+    "fault,retry",
+    [
+        ({"side": "challenger", "body": {"error": "not json"}}, False),  # it answered, unparsable
+        (None, True),  # no answer: a crash, a hang or a lost channel may be the placement's
+    ],
+)
+def test_a_candidate_failing_mid_run_is_its_fault_only_on_a_broken_answer(
+    monkeypatch, fault, retry
+):
+    class MidRun(FakeLauncher):
+        def content_fault(self, side):
+            return fault if fault and fault["side"] == side else None
+
+    async def read(self, job, urls, sides=worker.SIDES):
+        if sides == ("challenger",):
+            raise worker.JobFailed("challenger http://c.test returned 502", retry=True)
+        return {"cases_fetched": 4, "cases_sha256": "x", "errors": 0}
+
+    monkeypatch.setattr(worker.Worker, "_read", read)
+    monkeypatch.setattr(worker, "base_snapshot", lambda directory, fetch: directory)
+    monkeypatch.setattr(worker.Worker, "_champion", lambda self, m, b: (b, {}))
+    instance = worker.Worker(None, None, MidRun(), lane="runtime")  # type: ignore[arg-type]
+    instance.workdir = worker.Path("/nonexistent")
+    spec = {"calibration": calibration_json(), "incumbent": {}, "candidate": {}, "seed": "s"}
+    with pytest.raises(worker.JobFailed) as error:
+        asyncio.run(instance._bench({"champion": {}, "runtime": spec}, None, {}))  # type: ignore[arg-type]
     assert error.value.retry is retry
 
 
@@ -1276,3 +1384,374 @@ def test_calibration_workload_is_bounded(over):
     with pytest.raises(runtime.RuntimeError_):
         Calibration.from_json(calibration_json(**over))
     Calibration.from_json(calibration_json(blocks=runtime.MAX_BLOCKS))  # the timings API's bound
+
+
+# -- NVFP4 migration of the quality champion ------------------------------------------------
+
+NVFP4 = "c" * 64
+
+
+def nvfp4_manifest(tag: str = "nvfp4") -> dict[str, Any]:
+    files = {**weights_manifest(tag)["files"], "config.json": NVFP4}
+    return {"repo": "miner/nvfp4", "revision": "d" * 40, "files": files}
+
+
+@pytest.fixture
+def official(monkeypatch) -> dict[str, Any]:
+    """A stand-in for the pinned official export (its config is NVFP4)."""
+    manifest = nvfp4_manifest("official")
+    monkeypatch.setattr(pins, "NVFP4_CONFIG_SHA256", NVFP4)
+    monkeypatch.setattr(pins, "NVFP4_REPO", "nvidia/model")
+    monkeypatch.setattr(pins, "NVFP4_REVISION", manifest["revision"])
+    monkeypatch.setattr(pins, "NVFP4_FILES", manifest["files"])
+    return manifest
+
+
+def test_the_nvfp4_migration_is_prospective_and_one_way(client, miner, clock, official):
+    """A reset to the official export, not a claim of equivalence: history, debts and
+    payments stay; open BF16 work expires; from then on intake takes only NVFP4 manifests
+    (any miner's, not only the official digest) and the runtime lane may open."""
+    store: Store = client.app.state.store
+    grant(store, "5OLD", 3 * ledger.UNITS)
+    paid = body(store, 1)["weights"]
+    queued = submit(client, miner, weights_manifest("bf16"), clock).json()
+    assert not store.runtime_status()["weights"]["champion_nvfp4"]
+
+    url = "/v1/admin/champion/nvfp4"
+    assert client.post(url, headers=bearer(WORKER)).status_code in (401, 403)
+    response = client.post(url, headers=bearer(ADMIN))
+    assert response.status_code == 200, response.text
+    assert client.post(url, headers=bearer(ADMIN)).status_code == 409
+
+    crowns = client.get("/v1/leaderboard").json()["crowns"]
+    assert [c["repo"] for c in crowns] == [pins.BASE_REPO, "nvidia/model"]
+    assert crowns[-1]["hotkey"] is None and "entitlement" not in crowns[-1]  # earns nothing
+    assert client.get(f"/v1/submissions/{queued['id']}").json()["state"] == "expired"
+    assert store.runtime_status()["weights"]["champion_nvfp4"]
+    assert body(store, 1)["weights"] == paid  # replay unchanged
+    assert body(store, 2)["weights"] == {"5OLD": 1.0}  # the old debt keeps paying
+
+    assert submit(client, miner, weights_manifest("bf16-2"), clock).status_code == 422
+    assert submit(client, miner, nvfp4_manifest("miner"), clock).status_code == 201
+
+
+def test_an_nvfp4_challenger_needs_the_pinned_tensor_layout(tmp_path, monkeypatch):
+    """The worker checks the challenger's shard headers before any GPU work: a config copied
+    onto BF16 (or any other) weights is rejected as the miner's fault."""
+
+    monkeypatch.setattr(pins, "NVFP4_CONFIG_SHA256", NVFP4)
+    monkeypatch.setattr(worker, "assemble", lambda *a: {})
+    monkeypatch.setattr(worker, "base_snapshot", lambda *a: tmp_path)
+    from opentype_challenge import sandbox
+
+    monkeypatch.setattr(sandbox, "tensor_schema", lambda path: "0" * 64)
+    instance = worker.Worker(None, None, None)  # type: ignore[arg-type]
+    instance.workdir = tmp_path
+    monkeypatch.setattr(instance, "_champion", lambda manifest, base: (tmp_path, {}))
+    job = {"champion": nvfp4_manifest(), "challenger": nvfp4_manifest("m")}
+    with pytest.raises(worker.JobFailed, match="NVFP4 tensor layout") as failure:
+        asyncio.run(instance._duel(job, tmp_path, {}))
+    assert failure.value.retry is False
+
+
+def test_a_migration_never_pulls_a_lease_from_under_a_worker(tmp_path, official):
+    """A leased BF16 duel turns stale, not terminal: its worker completes (or fails) without a
+    409, then the job expires and is never re-duelled against the NVFP4 champion. Pending
+    judgments of expired work are dropped, so the teacher spends nothing on them."""
+    store = store_of(tmp_path)
+    first = quality_submit(store, "leased")
+    queued = quality_submit(store, "queued")
+    lease = store.lease("quality")
+    assert lease is not None and lease["job"] == first["job"]["id"]
+    with store._tx() as db:
+        db.execute(
+            "INSERT INTO judgments (job_id, case_index, side, track, level, seed, png, brief, "
+            "rubric) VALUES (?, 0, 'champion', 'paint', 1, 0, x'00', '', '')",
+            (lease["job"],),
+        )
+    store.migrate_nvfp4()
+    assert store.submission(queued["id"])["state"] == "expired"
+    assert store.heartbeat(lease["job"], lease["lease"])["stale"] is True
+    store.fail(lease["job"], lease["lease"], "infra", True, {})  # no 409
+    after = store.submission(first["id"])
+    assert after["state"] == "expired" and "format" in after["reason"]
+    with store._lock:
+        assert store._db.execute("SELECT count(*) FROM judgments").fetchone()[0] == 0
+        states = [r[0] for r in store._db.execute("SELECT state FROM jobs WHERE lane='quality'")]
+    assert "queued" not in states and "leased" not in states  # nothing BF16 is left to run
+    assert store.lease("quality", nvfp4=True) is None
+
+
+def test_only_the_base_champion_migrates_and_only_to_the_pinned_export(tmp_path, official):
+    store = store_of(tmp_path)
+    champion = store.migrate_nvfp4()
+    assert (champion["repo"], champion["revision"]) == (pins.NVFP4_REPO, pins.NVFP4_REVISION)
+    with store._lock:
+        files = json.loads(store._champion(store._db)["files"])
+    assert files == pins.NVFP4_FILES
+    with pytest.raises(StoreError) as again:
+        store.migrate_nvfp4()
+    assert again.value.status == 409
+
+    other = store_of(tmp_path / "mined")
+    with other._tx() as db:  # a mined BF16 champion: no proven NVFP4 derivative exists
+        db.execute(
+            "INSERT INTO champions (repo, revision, files, digest, crowned_at) "
+            "VALUES ('m/x', ?, ?, ?, 0)",
+            ("e" * 40, json.dumps(pins.BASE_FILES), "f" * 64),
+        )
+    with pytest.raises(StoreError, match="only the base champion"):
+        other.migrate_nvfp4()
+
+
+def test_nvfp4_intake_needs_the_index_and_bf16_workers_lease_nothing(tmp_path, official):
+    store = store_of(tmp_path)
+    store.migrate_nvfp4()
+    single = {"config.json": NVFP4, "model.safetensors": "a" * 64}
+    with pytest.raises(StoreError, match="index"):
+        store.submit("5S", "m/s", "a" * 40, single, "d" * 64, secrets.token_hex(16), 10**10)
+    manifest = nvfp4_manifest("ok")
+    digest = manifest_digest(manifest["repo"], manifest["revision"], manifest["files"])
+    store.submit(
+        "5N", manifest["repo"], manifest["revision"], manifest["files"], digest,
+        secrets.token_hex(16), int(store.clock()) + 60,
+    )  # fmt: skip
+    assert store.lease("quality") is None  # a worker that does not declare NVFP4 (H200)
+    assert store.lease("quality", nvfp4=True) is not None
+
+
+def test_a_migration_between_the_format_check_and_the_lease_leases_nothing(
+    tmp_path, official, monkeypatch
+):
+    """A BF16 worker passes the format check, then the migration and an NVFP4 intake land
+    before its leasing transaction: the transaction checks the format again."""
+    store = store_of(tmp_path)
+    real = store._lease
+
+    def racing(lane: str, nvfp4: bool = False) -> Any:
+        store.migrate_nvfp4()
+        manifest = nvfp4_manifest("raced")
+        digest = manifest_digest(manifest["repo"], manifest["revision"], manifest["files"])
+        store.submit(
+            "5R", manifest["repo"], manifest["revision"], manifest["files"], digest,
+            secrets.token_hex(16), int(store.clock()) + 60,
+        )  # fmt: skip
+        return real(lane, nvfp4)
+
+    monkeypatch.setattr(store, "_lease", racing)
+    assert store.lease("quality") is None
+    monkeypatch.setattr(store, "_lease", real)
+    assert store.lease("quality", nvfp4=True) is not None
+
+
+def test_a_lost_lease_is_not_fatal_but_other_409s_are(monkeypatch):
+    """The container's exact not-leased 409 (the job expired or went stale meanwhile) ends
+    the job quietly; any other 4xx, auth included, still raises."""
+    import httpx
+
+    def api(status: int, detail: str) -> worker.Api:
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(status, json={"detail": detail})
+        )
+        return worker.Api("http://x", "t", httpx.AsyncClient(transport=transport))
+
+    async def call(instance: worker.Api) -> None:
+        await instance.call("POST", "/v1/worker/jobs/j/complete", json={})
+
+    with pytest.raises(worker.LeaseLost):
+        asyncio.run(call(api(409, worker.NOT_LEASED)))
+    for status, detail in ((409, "3 of 10 cases answered by both sides"), (401, "bad token")):
+        with pytest.raises(RuntimeError) as error:
+            asyncio.run(call(api(status, detail)))
+        assert not isinstance(error.value, worker.LeaseLost)
+
+
+def test_the_runtime_lane_needs_a_champion_of_known_provenance(tmp_path, official):
+    """An NVFP4 config alone opens nothing: the champion must be the pinned export (the
+    migration) or a crowned challenger the worker verified."""
+    store = lane_store(tmp_path)
+    with store._tx() as db:
+        db.execute(
+            "INSERT INTO champions (repo, revision, files, digest, crowned_at) "
+            "VALUES ('x/y', ?, ?, ?, 0)",
+            ("a" * 40, json.dumps(nvfp4_manifest("unverified")["files"]), "b" * 64),
+        )
+    assert not store.runtime_status()["open"]
+    with store._tx() as db:
+        db.execute("UPDATE champions SET job_id='j_crowned' WHERE repo='x/y'")
+    assert store.runtime_status()["open"]
+
+
+def test_every_vllm_flag_appears_once():
+    """The profile's serving flags and the launcher's fixed ones never repeat a flag."""
+    extra = runtime.serving_argv(PROFILE)
+    serve, _ = worker.VllmLauncher().commands("champion", worker.Path("/m"), extra, 0.9)
+    flags = [a for a in serve if a.startswith("--")]
+    assert len(flags) == len(set(flags)) and "--kv-cache-dtype" in flags
+    plain, _ = worker.VllmLauncher().commands("champion", worker.Path("/m"))
+    assert plain[plain.index("--kv-cache-dtype") + 1] == "bfloat16"
+
+
+QUALITY_PROFILE = {**PROFILE, "moe_backend": runtime.QUALITY_SERVING["moe_backend"]}
+
+
+class QualitySandboxes(FakeLauncher):
+    """Sandboxed quality sides: `profiles[i]` is start i's measured profile; `fail_at` never
+    becomes ready."""
+
+    sandboxed = True
+
+    def __init__(self, profiles: list[dict[str, Any]], fail_at: int | None = None):
+        super().__init__()
+        self.profiles, self.fail_at = profiles, fail_at
+        self.placements: list[dict[str, Any]] = []
+
+    def profile(self) -> dict[str, Any]:
+        return self.profiles[len(self.starts) - 1]
+
+    @asynccontextmanager
+    async def __call__(self, models, extra=None, share=None):
+        (side,) = models
+        self.starts.append({"sides": [side], "extra": dict(extra or {}), "share": share})
+        if len(self.starts) - 1 == self.fail_at:
+            raise worker.ServeFailed("the sandbox never became ready", side)
+        self.placements.append({"side": side, "gpu_uuids": [f"GPU-{len(self.starts)}"]})
+        yield {side: {"reader": "http://r.test", "chat": "http://c.test"}}
+
+
+def duel_sandboxed(monkeypatch, launcher: QualitySandboxes) -> tuple[dict, dict]:
+    async def read(self, job, urls, sides=worker.SIDES):
+        return {"cases_fetched": 4, "cases_sha256": "x", "errors": 0}
+
+    monkeypatch.setattr(worker.Worker, "_read", read)
+    instance = worker.Worker(None, None, launcher)  # type: ignore[arg-type]
+    evidence: dict[str, Any] = {}
+    models = {"champion": worker.Path("/c"), "challenger": worker.Path("/x")}
+    counts = asyncio.run(instance._duel_sandboxed({}, models, evidence))
+    return counts, evidence
+
+
+def test_a_quality_side_on_the_pinned_profile_is_recorded(monkeypatch):
+    launcher = QualitySandboxes([QUALITY_PROFILE, QUALITY_PROFILE])
+    counts, evidence = duel_sandboxed(monkeypatch, launcher)
+    assert counts["challenger_cases_fetched"] == 4
+    assert evidence["profiles"] == {"champion": QUALITY_PROFILE, "challenger": QUALITY_PROFILE}
+    assert [p["side"] for p in evidence["placements"]] == ["champion", "challenger"]
+    argv, share = runtime.quality_serving()
+    assert all(s["extra"] == {s["sides"][0]: argv} and s["share"] == share for s in launcher.starts)
+
+
+@pytest.mark.parametrize(
+    "second",
+    [
+        {**QUALITY_PROFILE, "vllm_image": "other"},
+        {**QUALITY_PROFILE, "weights": "unverified"},
+        {**QUALITY_PROFILE, "gpu": "NVIDIA H200"},
+        {**QUALITY_PROFILE, "driver": "575.0"},  # not the champion side's build
+        {**QUALITY_PROFILE, "moe_backend": "flashinfer_cutlass"},
+    ],
+)
+def test_a_quality_side_off_the_profile_is_the_hosts(monkeypatch, second):
+    with pytest.raises(worker.JobFailed, match="quality profile") as error:
+        duel_sandboxed(monkeypatch, QualitySandboxes([QUALITY_PROFILE, second]))
+    assert error.value.retry is True
+
+
+def test_a_challenger_sandbox_that_never_starts_retries(monkeypatch):
+    """A fresh placement for the challenger: the champion's healthy start elsewhere proves
+    nothing, so the failure is the host's, never a rejection."""
+    with pytest.raises(worker.JobFailed) as error:
+        duel_sandboxed(monkeypatch, QualitySandboxes([QUALITY_PROFILE] * 2, fail_at=1))
+    assert error.value.retry is True
+
+
+def test_a_job_directory_is_kept_while_a_sandbox_may_still_mount_it(tmp_path, monkeypatch):
+    """A server that may still mount the challenger's weights keeps them on disk."""
+    import httpx
+
+    job = {"job": "j_1", "lease": "l", "lane": "quality", "champion": {}, "challenger": {}}
+
+    def api(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/lease"):
+            return httpx.Response(200, json=job)
+        return httpx.Response(200, json={})
+
+    async def duel(self, job, job_dir, evidence):
+        job_dir.mkdir(parents=True)
+        raise worker.JobFailed("the sandbox did not stop", True)
+
+    monkeypatch.setattr(worker.Worker, "_duel", duel)
+
+    async def go(launcher: FakeLauncher) -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(api)) as client:
+            instance = worker.Worker(worker.Api("http://x", "t", client), tmp_path, launcher)
+            await instance.run_once()
+
+    class Stuck(FakeLauncher):
+        def serving(self) -> bool:
+            return True
+
+    asyncio.run(go(Stuck()))
+    assert (tmp_path / "j_1").exists()
+    (tmp_path / "j_1").rmdir()
+    asyncio.run(go(FakeLauncher(dirty_after=0)))  # GPU state unknown, nothing served: removed
+    assert not (tmp_path / "j_1").exists()
+
+
+def test_a_calibration_of_an_older_schema_counts_as_withdrawn(tmp_path):
+    """A stored calibration this build cannot parse closes the lane; nothing raises."""
+    store = store_of(tmp_path)
+    grant(store, "5A", 1)
+    with store._tx() as db:
+        store._set_meta(db, "runtime_calibration", {"version": "v0", "profile": {}})
+    assert store.runtime_status()["calibration"] is None
+    assert store.lease("runtime") is None and store.lease("quality", nvfp4=True) is None
+
+
+def test_closing_a_kernel_slot_expires_queued_kernel_work(tmp_path):
+    """A kernel for a slot the new calibration no longer opens is off target: it expires
+    (the miner resubmits under the new calibration); an option set keeps its place."""
+    store = lane_store(tmp_path)
+    status = store.runtime_status()
+    from .test_sandbox import KERNEL
+
+    kernel = runtime.normalize_kernel({"slot": "rms_norm", "source": KERNEL})
+    with_kernel = store.submit_runtime(
+        "5K", status["target"], CAL.profile_digest, {}, "d" * 64, secrets.token_hex(16),
+        int(store.clock()) + 60, kernel,
+    )  # fmt: skip
+    options = runtime_submit(store, "5O", {"max_num_seqs": 128})
+    store.set_calibration(calibration_json(kernel_slots=[]))
+    assert store.submission(with_kernel["id"])["state"] == "expired"
+    assert store.submission(options["id"])["state"] == "queued"
+
+
+def test_a_judging_job_off_its_target_expires_without_judging(tmp_path, official):
+    """No worker holds a judging job: when the champion's format changes it expires at once
+    and its pending judgments are dropped (the teacher spends nothing on it)."""
+    store = store_of(tmp_path)
+    first = quality_submit(store, "judging")
+    lease = store.lease("quality")
+    assert lease is not None
+    with store._tx() as db:
+        db.execute("UPDATE jobs SET state='judging', lease=NULL WHERE id=?", (lease["job"],))
+        db.execute(
+            "INSERT INTO judgments (job_id, case_index, side, track, level, seed, png, brief, "
+            "rubric) VALUES (?, 0, 'champion', 'paint', 1, 0, x'00', '', '')",
+            (lease["job"],),
+        )
+    store.migrate_nvfp4()
+    assert store.submission(first["id"])["state"] == "expired"
+    with store._lock:
+        assert store._db.execute("SELECT count(*) FROM judgments").fetchone()[0] == 0
+
+
+def test_a_stale_completion_off_its_target_expires_before_any_judging(tmp_path, official):
+    store = store_of(tmp_path)
+    first = quality_submit(store, "stale")
+    lease = store.lease("quality")
+    assert lease is not None
+    store.migrate_nvfp4()
+    store.complete(lease["job"], lease["lease"], {"errors": 0})
+    after = store.submission(first["id"])
+    assert after["state"] == "expired" and after["job"]["judgments_pending"] == 0

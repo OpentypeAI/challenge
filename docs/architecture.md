@@ -83,7 +83,7 @@ into the new window.
 
 | Failure | Classified as | Effect |
 | --- | --- | --- |
-| manifest invalid, sha256 mismatch, repo private, gated or missing, `config.json` differs from the base | challenger | rejected, no retry |
+| manifest invalid, sha256 mismatch, repo private, gated or missing, `config.json` differs from the champion's, NVFP4 tensor layout mismatch | challenger | rejected, no retry |
 | reader or chat `4xx` on one case, or a chat reply without `choices[0].message.content` | challenger | that case forfeits for that side (loss 1 per decision) |
 | unparseable action, invalid tool call, turns exhausted | challenger (in-episode) | an error observation, or the episode ends and the final state is scored |
 | a transcript longer than the turn limit or an output over 8,192 characters | worker or challenger | that side forfeits the case |

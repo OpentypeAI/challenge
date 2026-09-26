@@ -106,20 +106,26 @@ def hf_fetch(repo: str, revision: str, filename: str, directory: Path) -> Path:
 
 
 def assemble(
-    manifest: Mapping[str, Any], base_dir: Path, directory: Path, fetch: Fetch
+    manifest: Mapping[str, Any],
+    base_dir: Path,
+    directory: Path,
+    fetch: Fetch,
+    config_sha256: str | None = None,
 ) -> dict[str, str]:
     """Download a manifest into directory, verify every sha256, add the base support files.
 
     Only weights, the weight index and config.json come from the miner; config.json must be
-    byte-equal to the base revision's, and tokenizer/chat template/processor files are
-    copied from the verified base snapshot. Returns the resolved sha256 of every file.
+    byte-equal to config_sha256 (the base revision's for a challenger; the champion's own,
+    which the container accepted, for the champion), and tokenizer/chat template/processor
+    files are copied from the verified base snapshot. Returns the resolved sha256 of every
+    file.
     """
     files: dict[str, str] = dict(manifest["files"])
     problem = manifest_problem(files)
     if problem:
         raise JobFailed(f"{manifest['repo']}: {problem}", retry=False)
-    if files["config.json"] != pins.BASE_FILES["config.json"]:
-        raise JobFailed("config.json differs from the base revision", retry=False)
+    if files["config.json"] != (config_sha256 or pins.BASE_FILES["config.json"]):
+        raise JobFailed("config.json differs from the champion's", retry=False)
     directory.mkdir(parents=True, exist_ok=True)
     resolved = {}
     for name, expected in sorted(files.items()):
@@ -226,6 +232,8 @@ class VllmLauncher:
             "gpu_memory_utilization": runtime.PROFILE_FIXED["gpu_memory_utilization"],
             "gpu": gpu,
             "driver": driver,
+            # never the calibrated "modal-sandbox": miner code does not run on this host
+            "executor": "local-process",
         }
         missing = sorted(k for k, v in profile.items() if not v)
         if missing:
@@ -258,6 +266,9 @@ class VllmLauncher:
                 "127.0.0.1",
                 "--dtype",
                 self.dtype,
+                # what `auto` gives a BF16 checkpoint; an NVFP4 one's config would make it FP8
+                # with unit scales (pins.NVFP4_CONFIG_SHA256); a profile's own value wins
+                *(() if "--kv-cache-dtype" in extra else ("--kv-cache-dtype", "bfloat16")),
                 "--gpu-memory-utilization",
                 str(self.memory_share if share is None else share),
                 "--diffusion-config",
@@ -295,7 +306,10 @@ class VllmLauncher:
         models: Mapping[str, Path],
         extra: Mapping[str, Sequence[str]] | None = None,
         share: float | None = None,
+        kernel: Mapping[str, Any] | None = None,
     ) -> AsyncIterator[dict[str, dict[str, str]]]:
+        if kernel:  # this host holds the token and a writable workdir: miner code never runs
+            raise JobFailed("a local launcher never runs a miner kernel", retry=True)
         processes: list[subprocess.Popen[bytes]] = []
         env = {**scrubbed_env(), "HF_HUB_OFFLINE": "1"}
         self._live = processes
@@ -424,6 +438,13 @@ class ApiUnavailable(RuntimeError):
     """The API exhausted its bounded transport/service retries."""
 
 
+NOT_LEASED = "the job is not leased under this lease"  # the container's exact 409 detail
+
+
+class LeaseLost(RuntimeError):
+    """409 on a leased job: the container moved it (expired, stale, requeued) meanwhile."""
+
+
 class Api:
     def __init__(self, base: str, token: str, client: httpx.AsyncClient):
         self.base, self.client = base.rstrip("/"), client
@@ -441,6 +462,8 @@ class Api:
             if response.status_code == 429 or response.status_code >= 500:
                 await asyncio.sleep(2**attempt)
                 continue
+            if response.status_code == 409 and NOT_LEASED in response.text:
+                raise LeaseLost(f"{method} {path}: {response.text[:300]}")
             if response.status_code >= 400:
                 raise RuntimeError(f"{method} {path}: {response.status_code} {response.text[:300]}")
             return response
@@ -459,7 +482,9 @@ class Worker:
 
     async def run_once(self) -> bool:
         """Lease and run one job. False when the queue is empty."""
-        params = {"lane": self.lane} if self.lane != "quality" else None
+        params: dict[str, str] | None = {"lane": self.lane} if self.lane != "quality" else None
+        if self.lane == "quality" and self._sandboxed:
+            params = {"nvfp4": "true"}  # the B300 sandbox path serves NVFP4 duels only
         response = await self.api.call("POST", "/v1/worker/lease", params=params)
         if response.status_code == 204:
             return False
@@ -468,6 +493,12 @@ class Worker:
         evidence: dict[str, Any] = {
             "worker_version": __version__,
             "image": os.environ.get("OPENTYPE_WORKER_IMAGE", "unknown"),
+            # an overlay deploy (deploy/modal_runtime.py) names the source it adds to `image`
+            "source": {
+                k: os.environ[f"OPENTYPE_SOURCE_{k.upper()}"]
+                for k in ("revision", "sha256")
+                if f"OPENTYPE_SOURCE_{k.upper()}" in os.environ
+            },
             **self.launcher.evidence(),
             "base": {"repo": pins.BASE_REPO, "revision": pins.BASE_REVISION},
         }
@@ -484,21 +515,31 @@ class Worker:
                 f"/v1/worker/jobs/{job['job']}/complete",
                 json={"lease": job["lease"], "evidence": evidence},
             )
+        except LeaseLost as error:
+            # the job left this lease (expired, stale or requeued): nothing to report
+            print(f"worker: {error}", file=sys.stderr, flush=True)
         except Exception as error:  # noqa: BLE001 - every failure is reported, never swallowed
             failure = error if isinstance(error, JobFailed) else JobFailed(repr(error), True)
-            await self.api.call(
-                "POST",
-                f"/v1/worker/jobs/{job['job']}/fail",
-                json={
-                    "lease": job["lease"],
-                    "reason": failure.reason[:500],
-                    "retry": failure.retry,
-                    "evidence": evidence,
-                },
-            )
+            try:
+                await self.api.call(
+                    "POST",
+                    f"/v1/worker/jobs/{job['job']}/fail",
+                    json={
+                        "lease": job["lease"],
+                        "reason": failure.reason[:500],
+                        "retry": failure.retry,
+                        "evidence": evidence,
+                    },
+                )
+            except LeaseLost as lost:
+                print(f"worker: {lost}", file=sys.stderr, flush=True)
         finally:
             beat.cancel()
-            shutil.rmtree(job_dir, ignore_errors=True)
+            if getattr(self.launcher, "serving", lambda: False)():
+                # a sandbox that did not stop may still mount it: kept, never deleted under it
+                print(f"worker: kept {job_dir}: a server may still use it", file=sys.stderr)
+            else:
+                shutil.rmtree(job_dir, ignore_errors=True)
         return True
 
     async def _heartbeat(self, job: dict[str, Any]) -> None:
@@ -510,6 +551,19 @@ class Worker:
                     "POST", f"/v1/worker/jobs/{job['job']}/heartbeat", json={"lease": job["lease"]}
                 )
 
+    def _inference_client(self) -> httpx.AsyncClient:
+        """The client for the served models: the launcher's relay when its servers live in
+        sandboxes (their URLs are not routable), else plain HTTP to local ports."""
+        if self.inference is not None:
+            return self.inference
+        relay = getattr(self.launcher, "client", None)
+        return relay() if callable(relay) else httpx.AsyncClient()
+
+    @property
+    def _sandboxed(self) -> bool:
+        """The launcher starts one fresh B300 sandbox per side (sandbox.SandboxLauncher)."""
+        return bool(getattr(self.launcher, "sandboxed", False))
+
     async def _duel(self, job: dict[str, Any], job_dir: Path, evidence: dict[str, Any]) -> dict:
         base = await asyncio.to_thread(base_snapshot, self.workdir / "base", self.fetch)
         try:
@@ -518,18 +572,66 @@ class Worker:
             )
         except JobFailed as error:  # never the challenger's fault
             raise JobFailed(f"champion: {error.reason}", retry=True) from None
+        config = job["champion"]["files"].get("config.json")
         evidence["challenger_files"] = await asyncio.to_thread(
-            assemble, job["challenger"], base, job_dir / "challenger", self.fetch
+            assemble, job["challenger"], base, job_dir / "challenger", self.fetch, config
         )
+        if config == pins.NVFP4_CONFIG_SHA256:
+            from .sandbox import tensor_schema  # sandbox imports this module
+
+            schema = await asyncio.to_thread(tensor_schema, job_dir / "challenger")
+            if schema != pins.NVFP4_SCHEMA_SHA256:
+                raise JobFailed("the weights do not have the NVFP4 tensor layout", retry=False)
         models = {"champion": champion, "challenger": job_dir / "challenger"}
         timings: dict[str, Any] = {}
         t0 = time.time()
+        if self._sandboxed:
+            return {"timings": timings, **await self._duel_sandboxed(job, models, evidence)}
         async with self.launcher(models) as urls:
             timings["serve_seconds"] = round(time.time() - t0, 1)
             t1 = time.time()
             counts = await self._read(job, urls)
             timings["read_seconds"] = round(time.time() - t1, 1)
         return {"timings": timings, **counts}
+
+    async def _duel_sandboxed(
+        self, job: dict[str, Any], models: Mapping[str, Path], evidence: dict[str, Any]
+    ) -> dict[str, Any]:
+        """An NVFP4 duel on B300: the champion's side alone in a fresh sandbox, then the
+        challenger's, each at the pinned quality serving config; both must be verified NVFP4
+        by the launcher. No miner code runs (weights only): the sandbox is for the GPU."""
+        argv, share = runtime.quality_serving()
+        # the runtime lane's pinned profile (image, reader, NVFP4 weights, flags, share,
+        # canvas, context, B300), differing only by the versioned QUALITY_SERVING entry
+        expected = {**runtime.PROFILE_FIXED, "moe_backend": runtime.QUALITY_SERVING["moe_backend"]}
+        evidence["quality_serving"] = runtime.QUALITY_SERVING["version"]
+        counts: dict[str, Any] = {}
+        profiles: dict[str, dict[str, Any]] = {}
+        placements: list[Any] = []
+        # a start failure (ServeFailed) retries, bounded by MAX_ATTEMPTS: each side runs on a
+        # fresh placement, so the champion's healthy start proves nothing about the
+        # challenger's GPU, and weights that passed the digest, config and layout checks
+        # are data
+        for side in SIDES:
+            async with self.launcher({side: models[side]}, {side: argv}, share) as urls:
+                measured = profiles[side] = self.launcher.profile()
+                placements.extend(getattr(self.launcher, "placements", [])[-1:])
+                wrong = sorted(k for k in expected if measured.get(k) != expected[k])
+                if runtime.GPU_TYPE not in str(measured.get("gpu")):
+                    wrong.append("gpu")
+                if side != SIDES[0]:  # both sides on one build and one card type
+                    first = profiles[SIDES[0]]
+                    wrong += [k for k in runtime.MEASURED if measured.get(k) != first.get(k)]
+                if wrong:  # the host's, before a single case: the image, card or weights
+                    raise JobFailed(f"{side} is not on the quality profile: {wrong}", True)
+                part = await self._read(job, urls, (side,))
+            if not counts:
+                counts = part
+            else:
+                counts["errors"] += part["errors"]
+                counts["challenger_cases_fetched"] = part["cases_fetched"]
+        evidence["profiles"], evidence["placements"] = profiles, placements
+        return counts
 
     async def _bench(self, job: dict[str, Any], job_dir: Path, evidence: dict[str, Any]) -> dict:
         """A runtime job on the champion's weights: fidelity reads of stock vs candidate, then
@@ -539,13 +641,25 @@ class Worker:
         if only the candidate then fails to start, its options are (reject)."""
         spec = job["runtime"]
         cal = runtime.Calibration.from_json(spec["calibration"])
-        flags = {
-            "B": runtime.options_argv(spec["incumbent"]),
-            "C": runtime.options_argv(spec["candidate"]),
+        base_flags = runtime.serving_argv(cal.profile)
+        kernels = {
+            "B": spec.get("incumbent_kernel"),
+            "C": spec.get("candidate_kernel"),
         }
-        profile = self.launcher.profile()
-        if profile != cal.profile:
-            raise JobFailed("this worker does not match the calibrated profile", retry=True)
+        flags = {
+            s: [
+                *base_flags,
+                *runtime.options_argv(spec["incumbent" if s == "B" else "candidate"]),
+                *runtime.kernel_argv(kernels[s]),
+            ]
+            for s in ("B", "C")
+        }
+        closed = [s for s, k in kernels.items() if k and k["slot"] not in cal.kernel_slots]
+        if closed:  # the container never leases one; refused here all the same
+            raise JobFailed(f"kernel slot not open under this calibration: {closed}", True)
+        build = getattr(self.launcher, "build", None)
+        if any(kernels.values()) and build is None:
+            raise JobFailed("this worker cannot run kernels: no sandbox launcher", retry=True)
         base = await asyncio.to_thread(base_snapshot, self.workdir / "base", self.fetch)
         try:
             model, evidence["champion_files"] = await asyncio.to_thread(
@@ -553,21 +667,34 @@ class Worker:
             )
         except JobFailed as error:
             raise JobFailed(f"champion: {error.reason}", retry=True) from None
+        if kernels["C"] is not None:
+            assert build is not None
+            arch = int(str(cal.profile["compute_cap"]).replace(".", ""))
+            evidence["kernel_build"] = await build(kernels["C"], arch)  # fault: the candidate's
         share = float(cal.profile["gpu_memory_utilization"])
+        placements: list[Any] = []
+
+        def launch(side: str, served: str) -> Any:
+            return self._launch(
+                cal, model, served, flags[side] if side in flags else base_flags,
+                kernels.get(side), share, placements,
+            )  # fmt: skip
+
         # fidelity: stock ("champion", pristine flags, independent of B) then candidate
         # ("challenger"), each alone on the GPU at the calibrated share, like the timing
         self._require_quiescent("before stock fidelity")
-        async with self.launcher({"champion": model}, {"champion": []}, share=share) as urls:
+        async with launch("stock", "champion") as urls:
             counts = await self._read(job, urls, ("champion",))
         self._require_quiescent("before candidate fidelity")
         try:
-            async with self.launcher(
-                {"challenger": model}, {"challenger": flags["C"]}, share=share
-            ) as urls:
+            async with launch("C", "challenger") as urls:
                 candidate = await self._read(job, urls, ("challenger",))
         except ServeFailed as error:
-            # stock served healthily alone on this GPU just before
-            raise _candidate_fault(error, "challenger") from None
+            # stock served healthily alone just before, on the same GPU unless each run is a
+            # fresh placement (then a start failure proves nothing and retries)
+            raise self._start_fault(error, "challenger") from None
+        except JobFailed as error:
+            raise self._content_fault(error, "challenger") from None
         counts["errors"] += candidate["errors"]
         blocks = []
         for number in range(cal.blocks):
@@ -575,15 +702,15 @@ class Worker:
             for side in runtime.SIDES:
                 self._require_quiescent(f"before {side}")
                 try:
-                    async with self.launcher(
-                        {"champion": model},
-                        {"champion": flags["C" if side == "C" else "B"]},
-                        share=share,
-                    ) as urls:
+                    async with launch("C" if side == "C" else "B", "champion") as urls:
                         seconds[side], tasks = await self._measure(job, cal, urls["champion"])
                 except ServeFailed as error:
                     # C's server runs as "champion"; B served healthily just before it
-                    raise _candidate_fault(error, "champion" if side == "C" else None) from None
+                    raise self._start_fault(error, "champion" if side == "C" else None) from None
+                except JobFailed as error:
+                    if side != "C":
+                        raise
+                    raise self._content_fault(error, "champion") from None
                 await self._post_timings(job, number, side, tasks)
                 quiescent.append(self.launcher.quiescent())
                 if not quiescent[-1]:
@@ -593,7 +720,46 @@ class Worker:
             )
             if not all(quiescent):
                 break  # reported as is: the verdict is NO_DECISION
-        return {**counts, "runtime": {"profile": profile, "blocks": blocks}}
+        evidence["placements"] = placements
+        return {**counts, "runtime": {"profile": cal.profile, "blocks": blocks}}
+
+    def _start_fault(self, error: ServeFailed, candidate: str | None) -> JobFailed:
+        """A start failure is the candidate's only when a reference just served healthily on
+        the same GPU; a sandbox launcher places every run afresh, so there it retries."""
+        return error if self._sandboxed else _candidate_fault(error, candidate)
+
+    def _content_fault(self, error: JobFailed, served: str) -> JobFailed:
+        """A candidate run failing mid-run is the candidate's only on a content fault of its
+        own server (an answer that is not JSON or too large, all processes alive); a 5xx, a
+        crash, a hang or a lost channel may be the fresh placement's and retries (bounded by
+        MAX_ATTEMPTS, then the submission fails without a verdict)."""
+        fault = getattr(self.launcher, "content_fault", lambda _: None)(served)
+        if not error.retry or fault is None:
+            return error
+        return JobFailed(f"the candidate's server gave a broken answer: {fault}"[:500], False)
+
+    @asynccontextmanager
+    async def _launch(
+        self,
+        cal: runtime.Calibration,
+        model: Path,
+        served: str,
+        argv: Sequence[str],
+        kernel: Mapping[str, Any] | None,
+        share: float,
+        placements: list[Any],
+    ) -> AsyncIterator[dict[str, dict[str, str]]]:
+        """One run: serve, then check the profile this very run measured (the bootstrap reads
+        the GPU before any miner code) before a single case is sent; a mismatch is the host's."""
+        kwargs = {"kernel": {served: kernel}} if kernel else {}
+        async with self.launcher({served: model}, {served: list(argv)}, share, **kwargs) as urls:
+            measured = self.launcher.profile()
+            if measured != cal.profile:
+                wrong = sorted(k for k in {*measured, *cal.profile}
+                               if measured.get(k) != cal.profile.get(k))  # fmt: skip
+                raise JobFailed(f"this run does not match the calibrated profile: {wrong}", True)
+            placements.extend(getattr(self.launcher, "placements", [])[-1:])
+            yield urls
 
     async def _post_timings(
         self, job: dict[str, Any], block: int, side: str, tasks: list[dict[str, Any]]
@@ -616,7 +782,7 @@ class Worker:
     ) -> tuple[dict[str, float], list[dict[str, Any]]]:
         """Monotonic seconds per cell and every timed task's raw output and latency (ms from
         the worker's clock); cold cells first, a warm cell after one untimed pass."""
-        client = self.inference or httpx.AsyncClient()
+        client = self._inference_client()
         seconds: dict[str, float] = {}
         tasks: list[dict[str, Any]] = []
         try:
@@ -718,7 +884,18 @@ class Worker:
             resolved: dict[str, str] = json.loads(record.read_text())
             return directory, resolved
         shutil.rmtree(root, ignore_errors=True)  # only the current champion is kept
-        resolved = assemble(manifest, base, directory, self.fetch)
+        # the champion's config is the one the container crowned: the base's, or the pinned
+        # NVFP4 export's once the champion migrated (nothing else ever becomes champion)
+        allowed = {pins.BASE_FILES["config.json"], pins.NVFP4_CONFIG_SHA256}
+        config = manifest["files"].get("config.json")
+        if config not in allowed:
+            raise JobFailed("the champion's config.json is neither the base's nor NVFP4's", True)
+        resolved = assemble(manifest, base, directory, self.fetch, config)
+        if config == pins.NVFP4_CONFIG_SHA256:
+            from .sandbox import tensor_schema  # sandbox imports this module
+
+            if tensor_schema(directory) != pins.NVFP4_SCHEMA_SHA256:
+                raise JobFailed("the champion does not have the NVFP4 tensor layout", True)
         record.write_text(json.dumps(resolved, sort_keys=True))
         return directory, resolved
 
@@ -731,7 +908,7 @@ class Worker:
         """Page through every case, run `sides` and post the answer items in batches. The
         container stores each side's results on their own, so sides may come in separate
         passes (the runtime fidelity serves one side at a time)."""
-        client = self.inference or httpx.AsyncClient()
+        client = self._inference_client()
         limit = asyncio.Semaphore(self.concurrency)
         cases_hash = hashlib.sha256()
         fetched = errors = 0

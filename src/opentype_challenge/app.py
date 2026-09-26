@@ -31,7 +31,7 @@ from pydantic import (
     ValidationError,
 )
 
-from . import __version__, bank, generator, pins, runtime, teacher, tracks
+from . import __version__, bank, generator, runtime, teacher, tracks
 from .crypto import (
     CryptoError,
     decode_hotkey,
@@ -89,14 +89,21 @@ class RuntimeTarget(Strict):
     digest: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class Kernel(Strict):
+    slot: str = Field(max_length=32)
+    source: str = Field(min_length=1, max_length=runtime.KERNEL_MAX_BYTES)
+
+
 class RuntimeSubmission(Strict):
-    """Only allowlisted vLLM options: no argv, env, image, plugin, reader or kernel."""
+    """Allowlisted vLLM options and/or one Triton kernel for a registered slot; never argv,
+    env, image, plugin or reader."""
 
     target: RuntimeTarget
     profile: str = Field(pattern=r"^[0-9a-f]{64}$")
     options: dict[str, StrictBool | StrictInt] = Field(
-        min_length=1, max_length=len(runtime.OPTIONS)
+        default_factory=dict, max_length=len(runtime.OPTIONS)
     )
+    kernel: Kernel | None = None
     hotkey: str = Field(max_length=66)
     nonce: str = Field(pattern=r"^[0-9a-f]{32}$")
     exp: int
@@ -515,8 +522,6 @@ def create_app(
         problem = manifest_problem(files)
         if problem:
             raise StoreError(422, problem)
-        if files["config.json"] != pins.BASE_FILES["config.json"]:
-            raise StoreError(422, "config.json must be byte-equal to the base revision's")
         now = int(clock())
         if not now < item.exp <= now + MAX_EXP_SECONDS:
             raise StoreError(400, f"exp must be in the future and within {MAX_EXP_SECONDS} s")
@@ -548,7 +553,9 @@ def create_app(
     async def submit_runtime(request: Request) -> dict[str, Any]:
         item: RuntimeSubmission = await body(request, SUBMIT_BODY_MAX, RuntimeSubmission)
         try:
-            options = runtime.normalize_options(item.options)
+            options, kernel = runtime.normalize_candidate(
+                item.options, item.kernel.model_dump() if item.kernel else None
+            )
         except runtime.RuntimeError_ as error:
             raise StoreError(422, str(error)) from None
         now = int(clock())
@@ -559,7 +566,7 @@ def create_app(
         except CryptoError:
             raise StoreError(400, "invalid hotkey") from None
         target = item.target.model_dump()
-        digest = runtime_digest(config.slug, target, item.profile, options)
+        digest = runtime_digest(config.slug, target, item.profile, options, kernel)
         signature = bytes.fromhex(item.signature.removeprefix("0x"))
         if not verify(public, runtime_message(public, digest, item.nonce, item.exp), signature):
             raise StoreError(401, "signature verification failed")
@@ -567,7 +574,15 @@ def create_app(
         if ss58 not in await metagraph.hotkeys():
             raise StoreError(403, "the hotkey is not registered on the subnet")
         result: dict[str, Any] = await run(
-            store.submit_runtime, ss58, target, item.profile, options, digest, item.nonce, item.exp
+            store.submit_runtime,
+            ss58,
+            target,
+            item.profile,
+            options,
+            digest,
+            item.nonce,
+            item.exp,
+            kernel,
         )
         return result
 
@@ -589,11 +604,14 @@ def create_app(
     @app.post("/v1/worker/lease")
     async def lease(
         lane: Annotated[Literal["quality", "runtime"], Query()] = "quality",
+        nvfp4: Annotated[bool, Query()] = False,
         authorization: Annotated[str | None, Header()] = None,
     ) -> Response:
-        """Workers ask for their lane; a worker that does not ask gets quality jobs only."""
+        """Workers ask for their lane; a worker that does not ask gets quality jobs only. A
+        quality worker declares the weight format it serves: nvfp4 (the B300 sandbox path)
+        leases only while the champion is NVFP4, the default only while it is BF16."""
         worker(authorization)
-        job = await run(store.lease, lane)
+        job = await run(store.lease, lane, nvfp4)
         if job is None:
             return Response(status_code=204)
         return JSONResponse(job)
@@ -714,6 +732,15 @@ def create_app(
         except runtime.RuntimeError_ as error:
             raise StoreError(422, str(error)) from None
         return {"calibration": published}
+
+    @app.post("/v1/admin/champion/nvfp4")
+    async def migrate_nvfp4(
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        """One-way, prospective: the pinned official NVFP4 export becomes the champion."""
+        admin(authorization)
+        result: dict[str, Any] = await run(store.migrate_nvfp4)
+        return result
 
     @app.put("/v1/admin/lanes")
     async def lanes(
