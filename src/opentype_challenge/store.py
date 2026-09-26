@@ -1038,9 +1038,10 @@ class Store:
             with self._lock:
                 if nvfp4 != self._champion_nvfp4(self._db):
                     # a worker serves one weight format: BF16 duels on the H200 path, NVFP4
-                    # duels on the B300 sandbox path, never mixed within the lane
+                    # duels on the B300 sandbox path, never mixed within the lane (checked
+                    # again in the leasing transaction: a migration may land in between)
                     return None
-        return self._lease(lane)
+        return self._lease(lane, nvfp4)
 
     def _runtime_due(self, db: sqlite3.Connection) -> bool:
         """Quality leases pause so leased quality jobs drain and the runtime job gets the GPU:
@@ -1067,7 +1068,7 @@ class Store:
         lanes = {r["lane"] for r in db.execute("SELECT lane FROM jobs WHERE state='leased'")}
         return "runtime" in lanes or (lane == "runtime" and bool(lanes))
 
-    def _lease(self, lane: str) -> dict[str, Any] | None:
+    def _lease(self, lane: str, nvfp4: bool = False) -> dict[str, Any] | None:
         # The drand beacon is fetched once per job, outside the lock (5 s timeout), and
         # stored on its first lease; retries reuse it. Expired leases are released first so
         # the head the beacon is fetched for is the job leased below; if a concurrent lease
@@ -1097,6 +1098,8 @@ class Store:
             if self._exclusive_blocked(db, lane):
                 return None
             if lane == "runtime" and not self._runtime_open(db):
+                return None
+            if lane == "quality" and nvfp4 != self._champion_nvfp4(db):
                 return None
             self._expire_off_target(db)
             if lane == "quality" and self._runtime_due(db):

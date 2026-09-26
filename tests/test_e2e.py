@@ -539,18 +539,23 @@ def test_champion_weights_are_cached_and_their_failures_retried(
     assert result["state"] == "queued" and result["job"]["reason"].startswith("champion:")
 
 
-def _sandbox_launcher(tmp_path: Path, starts: list[str]) -> Any:
+def _sandbox_launcher(tmp_path: Path, starts: list[str], build: str = "") -> Any:
     """SandboxLauncher over local bootstrap processes (sandbox.serve, no demotion) serving the
-    fake vllm and reader: the production controller path with the sandbox stood in for."""
-    from opentype_challenge import sandbox
+    fake vllm and reader: the production controller path with the sandbox stood in for. The
+    bootstrap reports the pinned B300 identity (no GPU here); `build` is the build bootstrap."""
+    from opentype_challenge import runtime, sandbox
+
+    from .test_runtime import PROFILE
+    from .test_sandbox import _port_base
 
     reader = tmp_path / "structured_server.py"
     reader.write_text(FAKE.read_text())
-    base = _free_port()
-    while base + 11 > 65535:
-        base = _free_port()
+    base = _port_base()
+    measured = {k: PROFILE[k] for k in (*runtime.MEASURED, "vllm_image")}
+    measured["structured_server_sha256"] = pins.STRUCTURED_SERVER_SHA256
     code = (
         "import sys; from pathlib import Path; from opentype_challenge import sandbox; "
+        f"sandbox.identity = lambda reader: {{**{measured!r}, 'gpu_uuids': ['GPU-x']}}; "
         "sys.exit(sandbox.serve(sys.stdin.buffer, sys.stdout.buffer, "
         f"vllm={(sys.executable, str(FAKE))!r}, reader=Path({str(reader)!r}), "
         f"demote=False, kernel_dir=Path({str(tmp_path / 'k')!r}), "
@@ -562,7 +567,34 @@ def _sandbox_launcher(tmp_path: Path, starts: list[str]) -> Any:
             starts.append(model.name if model else mode)
             return await super().start(mode, model)
 
-    return sandbox.SandboxLauncher(Backend([sys.executable, "-c", code]), canvas=64)
+    build_command = [sys.executable, "-c", build] if build else []
+    return sandbox.SandboxLauncher(
+        Backend([sys.executable, "-c", code], build_command, gpu=runtime.GPU_TYPE)
+    )
+
+
+def _pin_nvfp4(monkeypatch, hub, config: bytes = b"nvfp4 config") -> dict[str, Any]:
+    """A fake official NVFP4 export on the hub, with every pin (and the profile's copies of
+    them, fixed at import) patched to it."""
+    from opentype_challenge import runtime, sandbox
+
+    files = {"config.json": config, "model.safetensors": b"base",
+             "model.safetensors.index.json": b'{"weight_map": {}}'}  # fmt: skip
+    revision = hashlib.sha1(b"nvidia/export").hexdigest()
+    hub.repos[("nvidia/export", revision)] = files
+    config_sha, schema = hashlib.sha256(config).hexdigest(), "5" * 64
+    for name, value in (
+        ("NVFP4_CONFIG_SHA256", config_sha),
+        ("NVFP4_REPO", "nvidia/export"),
+        ("NVFP4_REVISION", revision),
+        ("NVFP4_FILES", _digests(files)),
+        ("NVFP4_SCHEMA_SHA256", schema),
+    ):
+        monkeypatch.setattr(pins, name, value)
+    monkeypatch.setitem(runtime.PROFILE_FIXED, "weights_config_sha256", config_sha)
+    monkeypatch.setitem(runtime.PROFILE_FIXED, "weights_schema_sha256", schema)
+    monkeypatch.setattr(sandbox, "tensor_schema", lambda model: schema)
+    return files
 
 
 def test_an_nvfp4_duel_runs_one_fresh_sandbox_per_side(
@@ -573,31 +605,16 @@ def test_an_nvfp4_duel_runs_one_fresh_sandbox_per_side(
     at the pinned quality serving config and verified NVFP4, reads through the relay (the
     sandboxes hold no token and are not routable), and the container crowns on its own
     scores. A BF16 worker leases nothing meanwhile."""
-    from opentype_challenge import runtime, sandbox
+    from opentype_challenge import runtime
 
-    nvfp4_config = b"nvfp4 config"
-    index = b'{"weight_map": {}}'
+    nvfp4 = _pin_nvfp4(monkeypatch, hub)
 
     def publish(repo: str, skill: str) -> dict[str, Any]:
-        files = {
-            "config.json": nvfp4_config,
-            "model.safetensors": skill.encode(),
-            "model.safetensors.index.json": index,
-        }
+        files = {**nvfp4, "model.safetensors": skill.encode()}
         revision = hashlib.sha1(f"{repo}{skill}".encode()).hexdigest()
         hub.repos[(repo, revision)] = files
         return {"repo": repo, "revision": revision, "files": _digests(files)}
 
-    official = publish("nvidia/export", "base")
-    for name, value in (
-        ("NVFP4_CONFIG_SHA256", hashlib.sha256(nvfp4_config).hexdigest()),
-        ("NVFP4_REPO", official["repo"]),
-        ("NVFP4_REVISION", official["revision"]),
-        ("NVFP4_FILES", official["files"]),
-        ("NVFP4_SCHEMA_SHA256", "5" * 64),
-    ):
-        monkeypatch.setattr(pins, name, value)
-    monkeypatch.setattr(sandbox, "tensor_schema", lambda model: "5" * 64)
     client = make_client(duel_cases=200)
     assert client.post("/v1/admin/champion/nvfp4", headers=bearer(ADMIN)).status_code == 200
 
@@ -642,29 +659,13 @@ def test_a_runtime_kernel_job_runs_through_the_sandbox_controller(
     reaches only C's servers and the container settles the job on its own scores. The local
     bootstrap stands in for the B300 sandbox (identity and the compile child are faked in
     the child process: no GPU, no triton here)."""
-    from opentype_challenge import runtime, sandbox
+    from opentype_challenge import runtime
     from opentype_challenge.miner import signed_runtime_submission
 
     from .test_runtime import PROFILE, calibration_json
     from .test_sandbox import KERNEL
 
-    nvfp4_config, index = b"nvfp4 config", b'{"weight_map": {}}'
-    files = {"config.json": nvfp4_config, "model.safetensors": b"exact",
-             "model.safetensors.index.json": index}  # fmt: skip
-    revision = hashlib.sha1(b"nvidia/export").hexdigest()
-    hub.repos[("nvidia/export", revision)] = files
-    config_sha, schema = hashlib.sha256(nvfp4_config).hexdigest(), "5" * 64
-    for name, value in (
-        ("NVFP4_CONFIG_SHA256", config_sha),
-        ("NVFP4_REPO", "nvidia/export"),
-        ("NVFP4_REVISION", revision),
-        ("NVFP4_FILES", _digests(files)),
-        ("NVFP4_SCHEMA_SHA256", schema),
-    ):
-        monkeypatch.setattr(pins, name, value)
-    monkeypatch.setitem(runtime.PROFILE_FIXED, "weights_config_sha256", config_sha)
-    monkeypatch.setitem(runtime.PROFILE_FIXED, "weights_schema_sha256", schema)
-    monkeypatch.setattr(sandbox, "tensor_schema", lambda model: schema)
+    _pin_nvfp4(monkeypatch, hub)
     profile = {**PROFILE, **runtime.PROFILE_FIXED}
     client = make_client()
     assert client.post("/v1/admin/champion/nvfp4", headers=bearer(ADMIN)).status_code == 200
@@ -686,41 +687,15 @@ def test_a_runtime_kernel_job_runs_through_the_sandbox_controller(
     posted = client.post("/v1/runtime/submissions", json=body)
     assert posted.status_code == 201, posted.text
 
-    reader = tmp_path / "structured_server.py"
-    reader.write_text(FAKE.read_text())
-    base = _free_port()
-    while base + 11 > 65535:
-        base = _free_port()
-    measured = {k: profile[k] for k in ("gpu", "driver", "vllm_version", "compute_cap",
-                                        "vllm_image", "structured_server_sha256")}  # fmt: skip
-    fake_identity = (
-        f"sandbox.identity = lambda reader: {{**{measured!r}, 'gpu_uuids': ['GPU-x'], 'euid': 0}}; "
-    )
-    serve = (
-        "import sys; from pathlib import Path; from opentype_challenge import sandbox; "
-        + fake_identity
-        + "sys.exit(sandbox.serve(sys.stdin.buffer, sys.stdout.buffer, "
-        f"vllm={(sys.executable, str(FAKE))!r}, reader=Path({str(reader)!r}), "
-        f"demote=False, kernel_dir=Path({str(tmp_path / 'k')!r}), "
-        f"log_dir=Path({str(tmp_path / 'logs')!r}), health_timeout=30, port_base={base}))"
-    )
     compiled = "print('compiled rms_norm for sm_103')"
     build = (
         "import sys; from opentype_challenge import sandbox; real = sandbox._spawn; "
         f"sandbox._spawn = lambda c, *a, **k: real([sys.executable, '-c', {compiled!r}], *a, **k); "
-        f"from pathlib import Path; sys.exit(sandbox.build(sys.stdin.buffer, sys.stdout.buffer, "
+        "from pathlib import Path; sys.exit(sandbox.build(sys.stdin.buffer, sys.stdout.buffer, "
         f"demote=False, kernel_dir=Path({str(tmp_path / 'b')!r})))"
     )
     starts: list[str] = []
-
-    class Backend(sandbox.ProcessBackend):
-        async def start(self, mode: str, model: Path | None) -> Any:
-            starts.append(mode)
-            return await super().start(mode, model)
-
-    launcher = sandbox.SandboxLauncher(
-        Backend([sys.executable, "-c", serve], [sys.executable, "-c", build], gpu="B300")
-    )
+    launcher = _sandbox_launcher(tmp_path, starts, build)
 
     async def go() -> bool:
         api_client = httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app))
@@ -739,7 +714,7 @@ def test_a_runtime_kernel_job_runs_through_the_sandbox_controller(
     # CPU timings are noise: the container, not the worker, decides; any verdict it reached
     # on complete evidence (crown, reject or no decision) proves the path
     assert "verdict" in job or "reason" in job, result
-    assert starts == ["build"] + ["serve"] * (2 + 3 * 3)  # one sandbox per run, never reused
+    assert starts[0] == "build" and len(starts) == 1 + 2 + 3 * 3  # a fresh sandbox per run
     assert launcher.quiescent()
     sides = [(p["side"], p["kernel"] is not None) for p in launcher.placements]
     assert sides[:2] == [("champion", False), ("challenger", True)]  # stock, then candidate

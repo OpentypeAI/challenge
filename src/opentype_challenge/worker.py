@@ -243,7 +243,6 @@ class VllmLauncher:
     def quiescent(self) -> bool:
         return not self._live and _gpu_idle()
 
-
     def ports(self, side: str) -> tuple[int, int]:
         """(vllm port, structured server port) of one side."""
         offset = SIDES.index(side)
@@ -592,23 +591,36 @@ class Worker:
         challenger's, each at the pinned quality serving config; both must be verified NVFP4
         by the launcher. No miner code runs (weights only): the sandbox is for the GPU."""
         argv, share = runtime.quality_serving()
+        # the runtime lane's pinned profile (image, reader, NVFP4 weights, flags, share,
+        # canvas, context, B300), differing only by the versioned QUALITY_SERVING entry
+        expected = {**runtime.PROFILE_FIXED, "moe_backend": runtime.QUALITY_SERVING["moe_backend"]}
         evidence["quality_serving"] = runtime.QUALITY_SERVING["version"]
         counts: dict[str, Any] = {}
+        profiles: dict[str, dict[str, Any]] = {}
+        placements: list[Any] = []
+        # a start failure (ServeFailed) retries, bounded by MAX_ATTEMPTS: each side runs on a
+        # fresh placement, so the champion's healthy start proves nothing about the
+        # challenger's GPU, and weights that passed the digest, config and layout checks
+        # are data
         for side in SIDES:
-            try:
-                async with self.launcher({side: models[side]}, {side: argv}, share) as urls:
-                    weights = self.launcher.profile().get("weights")
-                    if weights != "modelopt-nvfp4":
-                        raise JobFailed(f"{side} does not verify as NVFP4: {weights}", True)
-                    part = await self._read(job, urls, (side,))
-            except ServeFailed as error:
-                # the champion served on the same pinned build before the challenger did
-                raise _candidate_fault(error, "challenger" if counts else None) from None
+            async with self.launcher({side: models[side]}, {side: argv}, share) as urls:
+                measured = profiles[side] = self.launcher.profile()
+                placements.extend(getattr(self.launcher, "placements", [])[-1:])
+                wrong = sorted(k for k in expected if measured.get(k) != expected[k])
+                if runtime.GPU_TYPE not in str(measured.get("gpu")):
+                    wrong.append("gpu")
+                if side != SIDES[0]:  # both sides on one build and one card type
+                    first = profiles[SIDES[0]]
+                    wrong += [k for k in runtime.MEASURED if measured.get(k) != first.get(k)]
+                if wrong:  # the host's, before a single case: the image, card or weights
+                    raise JobFailed(f"{side} is not on the quality profile: {wrong}", True)
+                part = await self._read(job, urls, (side,))
             if not counts:
                 counts = part
             else:
                 counts["errors"] += part["errors"]
                 counts["challenger_cases_fetched"] = part["cases_fetched"]
+        evidence["profiles"], evidence["placements"] = profiles, placements
         return counts
 
     async def _bench(self, job: dict[str, Any], job_dir: Path, evidence: dict[str, Any]) -> dict:
@@ -665,8 +677,9 @@ class Worker:
             async with launch("C", "challenger") as urls:
                 candidate = await self._read(job, urls, ("challenger",))
         except ServeFailed as error:
-            # stock served healthily alone just before, on the same pinned build
-            raise _candidate_fault(error, "challenger") from None
+            # stock served healthily alone just before, on the same GPU unless each run is a
+            # fresh placement (then a start failure proves nothing and retries)
+            raise self._start_fault(error, "challenger") from None
         except JobFailed as error:
             raise self._content_fault(error, "challenger") from None
         counts["errors"] += candidate["errors"]
@@ -680,7 +693,7 @@ class Worker:
                         seconds[side], tasks = await self._measure(job, cal, urls["champion"])
                 except ServeFailed as error:
                     # C's server runs as "champion"; B served healthily just before it
-                    raise _candidate_fault(error, "champion" if side == "C" else None) from None
+                    raise self._start_fault(error, "champion" if side == "C" else None) from None
                 except JobFailed as error:
                     if side != "C":
                         raise
@@ -696,6 +709,11 @@ class Worker:
                 break  # reported as is: the verdict is NO_DECISION
         evidence["placements"] = placements
         return {**counts, "runtime": {"profile": cal.profile, "blocks": blocks}}
+
+    def _start_fault(self, error: ServeFailed, candidate: str | None) -> JobFailed:
+        """A start failure is the candidate's only when a reference just served healthily on
+        the same GPU; a sandbox launcher places every run afresh, so there it retries."""
+        return error if self._sandboxed else _candidate_fault(error, candidate)
 
     def _content_fault(self, error: JobFailed, served: str) -> JobFailed:
         """A candidate run failing mid-run is the candidate's only on a content fault of its

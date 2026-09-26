@@ -28,6 +28,7 @@ BASE_IMAGE = (
     "@sha256:8a6b2081929ff18691526e9e8fc83dab981499272f0e13114353466b5afcd6ee"
 )
 SNAPSHOT = "/snap"
+ROOT = Path(__file__).resolve().parent.parent
 
 app = modal.App("opentype-runtime")
 image = (
@@ -36,9 +37,11 @@ image = (
         setup_dockerfile_commands=["RUN ln -sf $(command -v python3) /usr/local/bin/python"],
     )
     .entrypoint([])
-    .add_local_dir(
-        ".", "/opt/opentype-src", copy=True, ignore=["**/.venv", "**/.git", "**/__pycache__"]
-    )
+    # only what the package build reads: never the checkout (it may hold secrets or state)
+    .add_local_dir(ROOT / "src", "/opt/opentype-src/src", copy=True, ignore=["**/__pycache__"])
+    .add_local_file(ROOT / "pyproject.toml", "/opt/opentype-src/pyproject.toml", copy=True)
+    .add_local_file(ROOT / "README.md", "/opt/opentype-src/README.md", copy=True)
+    .add_local_file(ROOT / "LICENSE", "/opt/opentype-src/LICENSE", copy=True)
     .run_commands("uv pip install --system --no-cache --no-deps /opt/opentype-src")
     .env({"HF_HUB_DISABLE_TELEMETRY": "1", "VLLM_NO_USAGE_STATS": "1", "DO_NOT_TRACK": "1"})
 )

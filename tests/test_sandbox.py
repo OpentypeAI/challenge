@@ -43,12 +43,22 @@ def rms_norm_kernel(x_ptr, w_ptr, out_ptr, x_row_stride, out_row_stride, n_cols,
 
 
 def _port_base() -> int:
+    """A base whose 12 ports are all free now (a busy one makes a server fail to start)."""
     while True:
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = int(sock.getsockname()[1])
-        if port + 11 <= 65535:
+        if port + 11 <= 65535 and all(_free(port + i) for i in range(12)):
             return port
+
+
+def _free(port: int) -> bool:
+    with socket.socket() as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
 
 
 HOSTILE = Path(__file__).with_name("hostile_vllm.py")

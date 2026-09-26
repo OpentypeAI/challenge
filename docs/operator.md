@@ -360,8 +360,15 @@ refused (409): nothing here could prove that an NVFP4 checkpoint derives from it
   sides before serving. A later NVFP4 champion is always a crowned challenger that passed
   that check.
 - Quality duels then serve NVFP4 on both sides, and quality jobs lease only to workers
-  that declare `nvfp4` (every visible GPU a B300). An H200 worker leases nothing, so
-  deploy B300 quality workers and validate a duel there first. Quality vllm pins
+  that declare `nvfp4`: the sandbox controller (`modal run deploy/modal_controller.py::quality`),
+  one fresh B300 sandbox per side. Both sides must measure the runtime lane's pinned profile
+  (image, reader, NVFP4 weights, flags, share, context, B300), which differs only by the
+  versioned `runtime.QUALITY_SERVING` entry. Both sides must also measure the same
+  vllm/driver/compute capability, or the job retries. The duel records both profiles and
+  the GPU UUIDs. A sandbox that never starts retries and never rejects the challenger:
+  each side runs on a fresh placement. An H200 worker leases nothing, so stop
+  `opentype-worker` (`modal app stop opentype-worker`) at the migration, and validate one
+  duel on the controller first. Quality vllm pins
   `--kv-cache-dtype bfloat16`, because `auto` would turn FP8 with unit scales under this
   config. Re-run Phase 0 sizing on the NVFP4 champion before trusting the quality margin:
   its error rates differ.
@@ -382,8 +389,11 @@ capped at 8 MiB, and a lost line fails the channel.
 This is tested against hostile local processes. That is not a proof that no escape
 exists. Kernels stay off in production until all of these hold:
 
-1. A runtime worker is wired to `SandboxLauncher`. Today only `deploy/modal_runtime.py`
-   uses it, for smokes. The local-process launcher refuses every kernel.
+1. The B300 controller (`deploy/modal_controller.py`) has run a real quality duel and a
+   runtime calibration pilot. The controller is a CPU Function that holds the worker token.
+   It drives `SandboxLauncher` over `ModalBackend(gpu="B300", commit=True)`, with one work
+   volume per lane and one writer. It is not deployed or scheduled by this repository. The
+   local-process launcher refuses every kernel.
 2. The champion is migrated to NVFP4.
 3. A B300 calibration listing `kernel_slots` is published from a representative pilot, not
    from the smokes.

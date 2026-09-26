@@ -1222,6 +1222,20 @@ def test_startup_failures_blame_the_candidate_only_after_a_healthy_reference(
     assert error.value.retry is retry
 
 
+@pytest.mark.parametrize("at", [1, 3])
+def test_on_fresh_placements_a_candidate_start_failure_retries(monkeypatch, at):
+    """Each sandbox run is a fresh placement: stock starting healthily on another GPU proves
+    nothing about the candidate's, so its start failure is the host's (bounded retry)."""
+
+    class Sandboxed(FailingLauncher):
+        sandboxed = True
+
+    launcher = Sandboxed("challenger" if at == 1 else "champion", at)
+    with pytest.raises(worker.JobFailed) as error:
+        bench(monkeypatch, launcher, {"max_num_seqs": 128})
+    assert error.value.retry is True
+
+
 @pytest.mark.parametrize(
     "fault,retry",
     [
@@ -1506,6 +1520,30 @@ def test_nvfp4_intake_needs_the_index_and_bf16_workers_lease_nothing(tmp_path, o
     assert store.lease("quality", nvfp4=True) is not None
 
 
+def test_a_migration_between_the_format_check_and_the_lease_leases_nothing(
+    tmp_path, official, monkeypatch
+):
+    """A BF16 worker passes the format check, then the migration and an NVFP4 intake land
+    before its leasing transaction: the transaction checks the format again."""
+    store = store_of(tmp_path)
+    real = store._lease
+
+    def racing(lane: str, nvfp4: bool = False) -> Any:
+        store.migrate_nvfp4()
+        manifest = nvfp4_manifest("raced")
+        digest = manifest_digest(manifest["repo"], manifest["revision"], manifest["files"])
+        store.submit(
+            "5R", manifest["repo"], manifest["revision"], manifest["files"], digest,
+            secrets.token_hex(16), int(store.clock()) + 60,
+        )  # fmt: skip
+        return real(lane, nvfp4)
+
+    monkeypatch.setattr(store, "_lease", racing)
+    assert store.lease("quality") is None
+    monkeypatch.setattr(store, "_lease", real)
+    assert store.lease("quality", nvfp4=True) is not None
+
+
 def test_a_lost_lease_is_not_fatal_but_other_409s_are(monkeypatch):
     """The container's exact not-leased 409 (the job expired or went stale meanwhile) ends
     the job quietly; any other 4xx, auth included, still raises."""
@@ -1552,3 +1590,75 @@ def test_every_vllm_flag_appears_once():
     assert len(flags) == len(set(flags)) and "--kv-cache-dtype" in flags
     plain, _ = worker.VllmLauncher().commands("champion", worker.Path("/m"))
     assert plain[plain.index("--kv-cache-dtype") + 1] == "bfloat16"
+
+
+QUALITY_PROFILE = {**PROFILE, "moe_backend": runtime.QUALITY_SERVING["moe_backend"]}
+
+
+class QualitySandboxes(FakeLauncher):
+    """Sandboxed quality sides: `profiles[i]` is start i's measured profile; `fail_at` never
+    becomes ready."""
+
+    sandboxed = True
+
+    def __init__(self, profiles: list[dict[str, Any]], fail_at: int | None = None):
+        super().__init__()
+        self.profiles, self.fail_at, self.placements = profiles, fail_at, []
+
+    def profile(self) -> dict[str, Any]:
+        return self.profiles[len(self.starts) - 1]
+
+    @asynccontextmanager
+    async def __call__(self, models, extra=None, share=None):
+        (side,) = models
+        self.starts.append({"sides": [side], "extra": dict(extra or {}), "share": share})
+        if len(self.starts) - 1 == self.fail_at:
+            raise worker.ServeFailed("the sandbox never became ready", side)
+        self.placements.append({"side": side, "gpu_uuids": [f"GPU-{len(self.starts)}"]})
+        yield {side: {"reader": "http://r.test", "chat": "http://c.test"}}
+
+
+def duel_sandboxed(monkeypatch, launcher: QualitySandboxes) -> tuple[dict, dict]:
+    async def read(self, job, urls, sides=worker.SIDES):
+        return {"cases_fetched": 4, "cases_sha256": "x", "errors": 0}
+
+    monkeypatch.setattr(worker.Worker, "_read", read)
+    instance = worker.Worker(None, None, launcher)  # type: ignore[arg-type]
+    evidence: dict[str, Any] = {}
+    models = {"champion": worker.Path("/c"), "challenger": worker.Path("/x")}
+    counts = asyncio.run(instance._duel_sandboxed({}, models, evidence))  # type: ignore[arg-type]
+    return counts, evidence
+
+
+def test_a_quality_side_on_the_pinned_profile_is_recorded(monkeypatch):
+    launcher = QualitySandboxes([QUALITY_PROFILE, QUALITY_PROFILE])
+    counts, evidence = duel_sandboxed(monkeypatch, launcher)
+    assert counts["challenger_cases_fetched"] == 4
+    assert evidence["profiles"] == {"champion": QUALITY_PROFILE, "challenger": QUALITY_PROFILE}
+    assert [p["side"] for p in evidence["placements"]] == ["champion", "challenger"]
+    argv, share = runtime.quality_serving()
+    assert all(s["extra"] == {s["sides"][0]: argv} and s["share"] == share for s in launcher.starts)
+
+
+@pytest.mark.parametrize(
+    "second",
+    [
+        {**QUALITY_PROFILE, "vllm_image": "other"},
+        {**QUALITY_PROFILE, "weights": "unverified"},
+        {**QUALITY_PROFILE, "gpu": "NVIDIA H200"},
+        {**QUALITY_PROFILE, "driver": "575.0"},  # not the champion side's build
+        {**QUALITY_PROFILE, "moe_backend": "flashinfer_cutlass"},
+    ],
+)
+def test_a_quality_side_off_the_profile_is_the_hosts(monkeypatch, second):
+    with pytest.raises(worker.JobFailed, match="quality profile") as error:
+        duel_sandboxed(monkeypatch, QualitySandboxes([QUALITY_PROFILE, second]))
+    assert error.value.retry is True
+
+
+def test_a_challenger_sandbox_that_never_starts_retries(monkeypatch):
+    """A fresh placement for the challenger: the champion's healthy start elsewhere proves
+    nothing, so the failure is the host's, never a rejection."""
+    with pytest.raises(worker.JobFailed) as error:
+        duel_sandboxed(monkeypatch, QualitySandboxes([QUALITY_PROFILE] * 2, fail_at=1))
+    assert error.value.retry is True
