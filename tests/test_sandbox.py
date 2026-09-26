@@ -620,3 +620,18 @@ def test_stdin_lines_are_sent_in_drained_chunks_under_the_sdk_buffer():
     assert len(line.encode()) > 2 * Stdin.limit
     asyncio.run(sandbox._send_chunked(stdin, line))
     assert stdin.sent.decode() == line and stdin.buffer == b""
+
+
+def test_the_kernel_slot_keeps_real_annotations():
+    """torch's triton_op infers the op schema from the nested functions' annotations; with
+    `from __future__ import annotations` they are strings naming a local import and the
+    plugin fails inside vllm serve (the first B300 kernel smoke). The full check runs in the
+    pinned image: deploy/kernel_cpu_check.py."""
+    import ast
+
+    from opentype_challenge import kernel_slot
+
+    tree = ast.parse(Path(kernel_slot.__file__).read_text())
+    assert not any(
+        isinstance(node, ast.ImportFrom) and node.module == "__future__" for node in tree.body
+    )

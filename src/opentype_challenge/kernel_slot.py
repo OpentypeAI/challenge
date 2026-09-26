@@ -10,9 +10,9 @@ The slot is vllm.ir.ops.rms_norm at the pinned nightly (vllm/ir/ops/layernorm.py
 RMSNorm layers (DiffusionGemma's text stack) call it for every input, attention, feed-forward
 and q/k norm. The provider mirrors vLLM's own Triton provider for gelu_and_mul_sparse:
 torch.library.triton_op + wrap_triton, so it runs eager and under the inductor lowering pass.
+No `from __future__ import annotations` here: triton_op infers the op schema from the real
+Tensor annotations of the nested functions, which string annotations would hide.
 """
-
-from __future__ import annotations
 
 import hashlib
 import importlib.util

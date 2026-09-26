@@ -16,6 +16,8 @@ measured profile and exits. No miner code, no worker token, hard timeouts everyw
 """
 
 import json
+import sys
+from pathlib import Path
 
 import modal
 
@@ -130,32 +132,18 @@ def smoke(moe_backend: str = "cutlass", cases: int = 8, max_model_len: int = 327
 
     try:
         result = asyncio.run(go())
-    except Exception:
-        print(json.dumps({"failures": launcher.failures}, indent=2)[-20000:])
-        raise
+    except Exception as error:
+        print(json.dumps({"failures": launcher.failures, "quiescent": launcher.quiescent()},
+                         indent=2)[-20000:])  # fmt: skip
+        # a builtin: the local modal client cannot unpickle this package's exception types
+        raise RuntimeError(f"{type(error).__name__}: {error}"[:2000]) from None
     print(json.dumps(result, indent=2))
     return result
 
 
-# Known-correct RMSNorm for the slot (the same math as vllm.ir.ops.rms_norm: fp32 statistics,
-# weight in the input dtype); CONTROL writes zeros, so a run with it must visibly break.
-RMS_KERNEL = """import triton
-import triton.language as tl
-
-
-@triton.jit
-def rms_norm_kernel(x_ptr, w_ptr, out_ptr, x_row_stride, out_row_stride, n_cols, eps,
-                    BLOCK_SIZE: tl.constexpr):
-    row = tl.program_id(0)
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < n_cols
-    x = tl.load(x_ptr + row * x_row_stride + cols, mask=mask, other=0.0).to(tl.float32)
-    var = tl.sum(x * x, axis=0) / n_cols
-    y = (x * tl.rsqrt(var + eps)).to(out_ptr.dtype.element_ty)
-    w = tl.load(w_ptr + cols, mask=mask, other=0.0)
-    tl.store(out_ptr + row * out_row_stride + cols, y * w, mask=mask)
-"""
-CONTROL_KERNEL = RMS_KERNEL.replace("y * w, mask=mask", "y * w * 0.0, mask=mask")
+# next to this file locally; in the image under the copied checkout
+sys.path += [str(Path(__file__).resolve().parent), "/opt/opentype-src/deploy"]
+from modal_runtime_kernels import CONTROL_KERNEL, RMS_KERNEL  # noqa: E402
 
 
 @app.function(
@@ -222,43 +210,49 @@ def kernel_smoke(
                     )
                 return rows
 
-    async def go() -> dict:
+    progress: dict = {"built": {}, "sessions": {}}
+
+    async def go() -> None:
         arch = 103  # B300 (sm_103), as the profile's compute_cap reports it
-        built = {name: await launcher.build(k, arch) for name, k in kernels.items()}
-        sessions: dict[str, dict] = {}
+        for name, kernel in kernels.items():
+            progress["built"][name] = await launcher.build(kernel, arch)
+            print(json.dumps({"progress": "built", "kernel": name}), flush=True)
         stock: list[dict] = []
         for name, kernel in [("stock", None), *kernels.items()]:
             started = time.monotonic()
             rows = await serve(kernel)
             stock = rows if name == "stock" else stock
-            sessions[name] = {
+            session = {
                 "seconds": round(time.monotonic() - started, 1),
                 "ok": sum(r["ok"] for r in rows),
                 "errors": sum(bool(r["error"]) for r in rows),
-                "distance_from_stock": round(
-                    sum(
-                        runtime._distance(a["vectors"] or {}, b["vectors"] or {})
-                        for a, b in zip(stock, rows, strict=True)
-                    )
-                    / len(rows),
-                    4,
-                ),
+                # per case, so a control that changes nothing cannot hide in a mean
+                "distance_from_stock": [
+                    round(runtime._distance(a["vectors"] or {}, b["vectors"] or {}), 4)
+                    for a, b in zip(stock, rows, strict=True)
+                ],
                 "profile": launcher.profile(),
             }
-        return {
-            "built": built,
-            "kernels": {n: runtime.kernel_ref(k) for n, k in kernels.items()},
-            "sessions": sessions,
-            "placements": launcher.placements,  # distinct sandboxes; the same GPU is not promised
-            "quiescent": launcher.quiescent(),
-        }
+            progress["sessions"][name] = session
+            print(json.dumps({"progress": "session", "name": name, **session}), flush=True)
 
+    error = None
     try:
-        result = asyncio.run(go())
-    except Exception:
-        print(json.dumps({"failures": launcher.failures}, indent=2)[-20000:])
-        raise
-    print(json.dumps(result, indent=2))
+        asyncio.run(go())
+    except BaseException as caught:  # noqa: BLE001 - reported below as a builtin error
+        error = f"{type(caught).__name__}: {caught}"[:2000]
+    result = {
+        **progress,
+        "kernels": {n: runtime.kernel_ref(k) for n, k in kernels.items()},
+        "placements": launcher.placements,  # distinct sandboxes; the same GPU is not promised
+        "quiescent": launcher.quiescent(),
+        "error": error,
+        "failures": launcher.failures[-4:],
+    }
+    print(json.dumps(result, indent=2)[-40000:], flush=True)
+    if error:
+        # a builtin: the local modal client cannot unpickle this package's exception types
+        raise RuntimeError(error)
     return result
 
 
