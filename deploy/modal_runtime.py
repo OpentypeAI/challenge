@@ -33,25 +33,44 @@ ROOT = Path(__file__).resolve().parent.parent
 DEPLOY, DEPLOY_DIR = ROOT / "deploy", "/opt/opentype-deploy"
 
 
-def source_identity() -> dict[str, str]:
-    """What this deploy overlays on BASE_IMAGE: the sha256 of every uploaded source file (by
-    path) and the operator-declared revision. The image identity is the pair: BASE_IMAGE's
-    digest alone does not include the overlay."""
+# Every file a deploy uploads or Modal auto-mounts (a Function's own file) beside src/.
+UPLOADED = (
+    "pyproject.toml", "README.md", "LICENSE",
+    "deploy/modal_runtime.py", "deploy/modal_runtime_kernels.py",
+    "deploy/modal_controller.py", "deploy/modal_pilot.py",
+)  # fmt: skip
+
+
+def source_sha256(root: Path = ROOT) -> str:
+    """sha256 over (path, sha256) of every uploaded file: src/ plus UPLOADED. A symlink is
+    refused: rglob and Modal's upload could resolve it differently."""
     import hashlib
 
-    files = sorted(
-        p for p in [*ROOT.joinpath("src").rglob("*"), ROOT / "pyproject.toml",
-                    DEPLOY / "modal_runtime.py", DEPLOY / "modal_runtime_kernels.py"]
-        if p.is_file() and "__pycache__" not in p.parts
-    )  # fmt: skip
+    tree = [p for p in root.joinpath("src").rglob("*") if "__pycache__" not in p.parts]
+    paths = [root / "src", *tree, *(root / name for name in UPLOADED)]
+    if missing := [name for name in UPLOADED if not (root / name).is_file()]:
+        raise SystemExit(f"missing uploaded source files: {missing}")
+    if links := [str(p.relative_to(root)) for p in paths if p.is_symlink()]:
+        raise SystemExit(f"refusing symlinks in the uploaded source: {links}")
     digest = hashlib.sha256()
-    for path in files:
+    for path in sorted(p for p in paths if p.is_file()):
         digest.update(
-            f"{path.relative_to(ROOT)}\0{hashlib.sha256(path.read_bytes()).hexdigest()}\n".encode()
+            f"{path.relative_to(root)}\0{hashlib.sha256(path.read_bytes()).hexdigest()}\n".encode()
         )
+    return digest.hexdigest()
+
+
+SOURCE_ENV = ("OPENTYPE_SOURCE_SHA256", "OPENTYPE_SOURCE_REVISION")
+
+
+def source_identity() -> dict[str, str]:
+    """What this deploy overlays on BASE_IMAGE: source_sha256() and the operator-declared
+    revision. The image identity is the pair: BASE_IMAGE's digest alone omits the overlay."""
+    if not modal.is_local():  # in a container: the values this image was built with
+        return {k: os.environ.get(k, "") for k in ("OPENTYPE_WORKER_IMAGE", *SOURCE_ENV)}
     return {
         "OPENTYPE_WORKER_IMAGE": BASE_IMAGE,  # the base only; the overlay is named below
-        "OPENTYPE_SOURCE_SHA256": digest.hexdigest(),
+        "OPENTYPE_SOURCE_SHA256": source_sha256(),
         "OPENTYPE_SOURCE_REVISION": os.environ.get("OPENTYPE_SOURCE_REVISION", "undeclared"),
     }
 

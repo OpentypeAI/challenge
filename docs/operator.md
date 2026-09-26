@@ -382,12 +382,16 @@ refused (409): nothing here could prove that an NVFP4 checkpoint derives from it
 ### Release provenance (B300 controller)
 
 The controller image is `BASE_IMAGE` (pinned by digest) with this checkout's `src/` and
-two deploy modules overlaid on it. Every job's evidence records both parts: `image` is the
-base digest only, and `source` is `{revision, sha256}` of the overlay. `sha256` hashes
-every uploaded file by path. The base digest alone never stands for the overlay.
+deploy modules overlaid on it. Every job's evidence records both parts: `image` is the
+base digest only, and `source` is `{revision, sha256}` of the overlay. `sha256`
+(`modal_runtime.source_sha256`) hashes, by path, `src/` plus the explicit list
+`modal_runtime.UPLOADED`: `pyproject.toml`, `README.md`, `LICENSE` and every deploy module
+an image uploads or Modal auto-mounts (runtime, kernels, controller, pilot). A symlink in
+that set refuses the deploy. The base digest alone never stands for the overlay.
+`revision` is the operator's declaration; `sha256` is the content, so a clean git archive
+of the commit reproduces it.
 
-1. Start from a clean checkout of the reviewed commit: `git status --porcelain` is empty
-   and `git rev-parse HEAD` is the merged SHA.
+1. Start from the reviewed commit (a checkout or a git archive of it).
 2. Deploy with `OPENTYPE_SOURCE_REVISION=$(git rev-parse HEAD) modal deploy
    deploy/modal_controller.py`. Without that variable, the deploy refuses to run.
 3. Record `source.sha256` from the first job's evidence next to the SHA in the release

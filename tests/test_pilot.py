@@ -137,3 +137,39 @@ def test_a_failed_pilot_still_writes_its_report(pilot, tmp_path):
     assert path.stat().st_mode & 0o777 == 0o600
     with pytest.raises(FileExistsError):
         modal_pilot._write_private(str(path), {"error": None})
+
+
+@pytest.fixture
+def source(tmp_path, monkeypatch):
+    """deploy/modal_runtime.source_sha256 over a copy of the uploaded tree (Modal mocked)."""
+    from unittest import mock
+
+    monkeypatch.setitem(sys.modules, "modal", mock.MagicMock())
+    monkeypatch.syspath_prepend(str(DEPLOY))
+    monkeypatch.delitem(sys.modules, "modal_runtime", raising=False)
+    import modal_runtime  # type: ignore[import-not-found]
+
+    for name in ("src/opentype_challenge/a.py", *modal_runtime.UPLOADED):
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(name)
+    return modal_runtime, tmp_path
+
+
+def test_the_source_hash_is_stable_and_covers_the_controller(source):
+    modal_runtime, root = source
+    first = modal_runtime.source_sha256(root)
+    assert modal_runtime.source_sha256(root) == first
+    (root / "deploy/modal_controller.py").write_text("a modified controller")
+    assert modal_runtime.source_sha256(root) != first
+
+
+def test_the_source_hash_refuses_a_symlink(source):
+    modal_runtime, root = source
+    (root / "src/opentype_challenge/link.py").symlink_to(root / "README.md")
+    with pytest.raises(SystemExit, match="symlink"):
+        modal_runtime.source_sha256(root)
+
+
+def test_the_real_checkout_hashes(source):
+    modal_runtime, _ = source
+    assert len(modal_runtime.source_sha256()) == 64
