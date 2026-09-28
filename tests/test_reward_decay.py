@@ -239,3 +239,16 @@ def test_api_admin_schedule_and_internal_epoch_at(make_client, clock):
     assert ok.status_code == 200 and ok.json()["metadata"]["policy"] == "champion_decay"
     status = client.get("/v1/admin/rewards/decay", headers=admin).json()
     assert status["active"]["epoch"] == 3
+
+
+def test_epoch_at_must_follow_persisted_decay_epochs(tmp_path):
+    clock = Clock(T0 + 10 * H)
+    store = _store(tmp_path, clock)
+    _activate(store, clock)
+    _paid(store, 11, T0 + 5 * H)  # burned (base champion) but persisted with its time
+    for epoch, at in ((12, T0 + 4 * H), (10, T0 + 6 * H)):
+        with pytest.raises(StoreError) as error:
+            store.weights(epoch, SLUG, at)
+        assert error.value.status == 422
+    assert _paid(store, 10, T0 + 5 * H)["epoch"] == 10  # equal time is allowed
+    assert _paid(store, 12, T0 + 6 * H)["epoch"] == 12

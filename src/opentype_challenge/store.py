@@ -1700,6 +1700,19 @@ class Store:
                 # the master sends Timestamp.Now at the epoch's pinned end block; small skew ok
                 if type(epoch_at) is not int or epoch_at > self._now() + EPOCH_AT_SKEW:
                     raise StoreError(422, "epoch_at (chain Unix seconds, not future) is required")
+                # chain time only moves forward: no decay epoch may claim an earlier time than
+                # one already persisted on either side of it (burned epochs included)
+                around = db.execute(
+                    "SELECT max(CASE WHEN epoch < ? THEN json_extract(body, '$.metadata.epoch_at') "
+                    "END), min(CASE WHEN epoch > ? THEN json_extract(body, "
+                    "'$.metadata.epoch_at') END) FROM epochs WHERE json_extract(body, "
+                    "'$.metadata.policy')='champion_decay'",
+                    (epoch, epoch),
+                ).fetchone()
+                if (around[0] is not None and epoch_at < around[0]) or (
+                    around[1] is not None and epoch_at > around[1]
+                ):
+                    raise StoreError(422, "epoch_at is out of order with persisted decay epochs")
                 return self._decay_weights(db, epoch, slug, epoch_at)
             start = self._meta_opt(db, "lanes_from_epoch")
             split = start is not None and epoch >= start
