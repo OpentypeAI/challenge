@@ -29,7 +29,8 @@ DEFAULT_DUEL_CASES = 40_000
 PAGE_BYTES = 6 * 1024 * 1024  # case and bank pages stay under this much JSON
 CASE_CACHE_BYTES = 128 * 1024 * 1024
 BANK_CACHE = 4  # parsed banks kept in memory (one per window)
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+EPOCH_AT_SKEW = 300  # seconds of chain/container clock skew tolerated
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -89,6 +90,9 @@ CREATE TABLE IF NOT EXISTS runtime_tasks (
   case_index INTEGER NOT NULL, ms REAL NOT NULL, ok INTEGER NOT NULL, error INTEGER NOT NULL,
   PRIMARY KEY (job_id, block, side, cell, case_index)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS epochs (epoch INTEGER PRIMARY KEY, body TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS decay_payments (
+  epoch INTEGER PRIMARY KEY, champion_id INTEGER NOT NULL, hotkey TEXT NOT NULL,
+  window_id INTEGER NOT NULL, amount INTEGER NOT NULL, epoch_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS payments (
   epoch INTEGER NOT NULL, entitlement_id INTEGER NOT NULL, amount INTEGER NOT NULL,
   PRIMARY KEY (epoch, entitlement_id));
@@ -318,6 +322,64 @@ class Store:
         row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return None if row is None else json.loads(row[0])
 
+    def set_reward_decay(self, epoch: int, epoch_at: int) -> dict[str, int]:
+        """Schedule the switch from FIFO credits to champion decay: `epoch` is the first
+        epoch paid by decay, `epoch_at` the wall time from which crowns stop minting credits.
+        The switch happens at the first of the two; it needs zero debt then, else it cancels."""
+        if any(type(v) is not int or not 0 <= v < 2**63 for v in (epoch, epoch_at)):
+            raise StoreError(422, "cutoff epoch and epoch_at must be nonnegative integers")
+        with self._tx() as db:
+            if self._meta_opt(db, "reward_decay") is not None:
+                raise StoreError(409, "reward decay is already active")
+            if self._meta_opt(db, "reward_decay_pending") is not None:
+                raise StoreError(409, "reward decay is already pending")
+            if self._meta_opt(db, "lanes_from_epoch") is not None:
+                raise StoreError(409, "runtime lanes and reward decay are mutually exclusive")
+            if epoch_at <= self._now():
+                raise StoreError(409, "reward decay cutoff must be prospective")
+            last = db.execute("SELECT max(epoch) FROM epochs").fetchone()[0]
+            if last is not None and epoch <= last:
+                raise StoreError(409, f"epoch {last} is already persisted; pick a later one")
+            cutoff = {"epoch": epoch, "epoch_at": epoch_at}
+            self._set_meta(db, "reward_decay_pending", cutoff)
+            db.execute("DELETE FROM meta WHERE key='reward_decay_cancelled'")
+            return cutoff
+
+    def _maybe_activate_decay(self, db: sqlite3.Connection, epoch: int | None = None) -> None:
+        """Switch in the caller's transaction once the wall cutoff or the cutoff epoch is
+        reached: a crown after it mints no credit, a cutoff epoch pays decay."""
+        pending = self._meta_opt(db, "reward_decay_pending")
+        if pending is None:
+            return
+        if self._now() < pending["epoch_at"] and (epoch is None or epoch < pending["epoch"]):
+            return
+        reason = None
+        # runtime credits are paid only after a lane split, which decay excludes
+        if db.execute(
+            "SELECT 1 FROM entitlements WHERE paid < amount AND lane='quality' LIMIT 1"
+        ).fetchone():
+            reason = "outstanding credit debt at cutoff"
+        elif self._meta_opt(db, "lanes_from_epoch") is not None:
+            reason = "runtime lanes configured"
+        elif (db.execute("SELECT max(epoch) FROM epochs").fetchone()[0] or -1) >= pending["epoch"]:
+            reason = "the cutoff epoch was already persisted under credits"
+        db.execute("DELETE FROM meta WHERE key='reward_decay_pending'")
+        if reason is None:
+            self._set_meta(db, "reward_decay", {**pending, "activated_at": self._now()})
+        else:
+            self._set_meta(db, "reward_decay_cancelled", {**pending, "reason": reason})
+
+    def reward_decay_status(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                key: self._meta_opt(self._db, "reward_decay" + suffix)
+                for key, suffix in (
+                    ("active", ""),
+                    ("pending", "_pending"),
+                    ("cancelled", "_cancelled"),
+                )
+            }
+
     # -- lanes ---------------------------------------------------------------
 
     def _calibration_raw(self, db: sqlite3.Connection) -> str | None:
@@ -364,6 +426,11 @@ class Store:
         """Schedule the 75/25 split from `epoch` on: once, and only past every persisted
         epoch, so no published epoch changes."""
         with self._tx() as db:
+            if (
+                self._meta_opt(db, "reward_decay") is not None
+                or self._meta_opt(db, "reward_decay_pending") is not None
+            ):
+                raise StoreError(409, "runtime lanes and reward decay are mutually exclusive")
             if self._meta_opt(db, "lanes_from_epoch") is not None:
                 raise StoreError(409, "the lane split is already scheduled")
             last = db.execute("SELECT max(epoch) FROM epochs").fetchone()[0]
@@ -1557,6 +1624,7 @@ class Store:
         """ponytail: no anchor telemetry (typed-decisions test, PhishNChips, Laya probes,
         jev-harness-lab) and so no automatic RT-7 pause; the operator pauses crowns by hand
         with PUT /v1/admin/crowns. Add an anchors job on the worker when anchors are wired."""
+        self._maybe_activate_decay(db)
         submission = db.execute(
             "SELECT * FROM submissions WHERE id=?", (job["submission_id"],)
         ).fetchone()
@@ -1592,11 +1660,12 @@ class Store:
         ).fetchone()[0]
         if duel_bank == bank.EMPTY_BANK.digest:
             amount = min(amount, int(self.settings.empty_bank_cap * ledger.UNITS))
-        db.execute(
-            "INSERT INTO entitlements (hotkey, champion_id, window_id, amount, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (submission["hotkey"], champion_id, window["id"], amount, self._now()),
-        )
+        if self._meta_opt(db, "reward_decay") is None:
+            db.execute(
+                "INSERT INTO entitlements (hotkey, champion_id, window_id, amount, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (submission["hotkey"], champion_id, window["id"], amount, self._now()),
+            )
         self._terminal(db, job["id"], "crowned", f"crowned as champion {champion_id}")
         self._retire_levels(db)
         self._expire_runtime(db)
@@ -1613,7 +1682,7 @@ class Store:
 
     # -- weights ---------------------------------------------------------------
 
-    def weights(self, epoch: int, slug: str) -> str:
+    def weights(self, epoch: int, slug: str, epoch_at: int | None = None) -> str:
         """The persisted body for an epoch; the first call pays the ledger FIFO.
 
         ponytail: publication is checked once, when the worker downloads the challenger
@@ -1623,6 +1692,15 @@ class Store:
             row = db.execute("SELECT body FROM epochs WHERE epoch=?", (epoch,)).fetchone()
             if row is not None:
                 return str(row["body"])
+            self._maybe_activate_decay(db, epoch)
+            cutoff = self._meta_opt(db, "reward_decay")
+            # an epoch before the cutoff keeps the credit rule: debt was zero at the switch
+            # and no credit is minted after it, so it pays nothing new and burns
+            if cutoff is not None and epoch >= cutoff["epoch"]:
+                # the master sends Timestamp.Now at the epoch's pinned end block; small skew ok
+                if type(epoch_at) is not int or epoch_at > self._now() + EPOCH_AT_SKEW:
+                    raise StoreError(422, "epoch_at (chain Unix seconds, not future) is required")
+                return self._decay_weights(db, epoch, slug, epoch_at)
             start = self._meta_opt(db, "lanes_from_epoch")
             split = start is not None and epoch >= start
             # before the split the historical rule holds: quality credits share one epoch-mass
@@ -1689,6 +1767,81 @@ class Store:
             text = json.dumps(body, sort_keys=True, separators=(",", ":"))
             db.execute("INSERT INTO epochs VALUES (?, ?)", (epoch, text))
             return text
+
+    def _decay_weights(self, db: sqlite3.Connection, epoch: int, slug: str, epoch_at: int) -> str:
+        """The champion reigning at `epoch_at` earns decayed_units of one epoch-mass; the rest
+        burns. Only a miner crown certified by its duel pays; the configured caps stay
+        cumulative, counting credits paid before the switch."""
+        champion = db.execute(
+            "SELECT * FROM champions WHERE crowned_at <= ? ORDER BY crowned_at DESC, id DESC "
+            "LIMIT 1",
+            (epoch_at,),
+        ).fetchone()
+        duel = None
+        if champion is not None and champion["hotkey"]:
+            duel = db.execute(
+                "SELECT j.verdict, w.bank_digest FROM jobs j JOIN windows w ON w.id=j.window_id "
+                "WHERE j.id=? AND j.state='crowned' AND j.lane='quality'",
+                (champion["job_id"],),
+            ).fetchone()
+        amount = 0
+        if duel is not None and json.loads(duel["verdict"]).get("crown") is True:
+            amount = ledger.decayed_units(champion["crowned_at"], epoch_at)
+            if duel["bank_digest"] == bank.EMPTY_BANK.digest:
+                amount = min(
+                    amount, self._cap_left(db, self.settings.empty_bank_cap, False, champion["id"])
+                )
+            if self.settings.window_cap is not None:
+                amount = min(
+                    amount,
+                    self._cap_left(db, self.settings.window_cap, True, champion["window_id"]),
+                )
+        if amount:
+            db.execute(
+                "INSERT INTO decay_payments VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    epoch,
+                    champion["id"],
+                    champion["hotkey"],
+                    champion["window_id"],
+                    amount,
+                    epoch_at,
+                ),
+            )
+        body = {
+            "challenge_slug": slug,
+            "epoch": epoch,
+            "weights": {champion["hotkey"]: amount / ledger.UNITS} if amount else {},
+            "full_share_mass": 1.0,
+            "metadata": {
+                "policy": "champion_decay",
+                "epoch_at": epoch_at,
+                "champion": None if champion is None else champion["id"],
+                "crowned_at": None if champion is None else champion["crowned_at"],
+                "paid": amount / ledger.UNITS,
+                "burned": (ledger.UNITS - amount) / ledger.UNITS,
+            },
+            "computed_at": _iso(self._now()),
+        }
+        text = json.dumps(body, sort_keys=True, separators=(",", ":"))
+        db.execute("INSERT INTO epochs VALUES (?, ?)", (epoch, text))
+        return text
+
+    @staticmethod
+    def _cap_left(db: sqlite3.Connection, cap: float, window: bool, value: int) -> int:
+        """Units still payable under a cumulative cap on one champion (or one window's
+        champions): quality credits paid before the switch plus decay paid since."""
+        match = "c.window_id=?" if window else "c.id=?"
+        spent = sum(
+            db.execute(query + match, (value,)).fetchone()[0]
+            for query in (
+                "SELECT coalesce(sum(e.paid), 0) FROM entitlements e JOIN champions c "
+                "ON c.id=e.champion_id WHERE e.lane='quality' AND ",
+                "SELECT coalesce(sum(d.amount), 0) FROM decay_payments d JOIN champions c "
+                "ON c.id=d.champion_id WHERE ",
+            )
+        )
+        return max(0, int(cap * ledger.UNITS) - spent)
 
     # -- public views ------------------------------------------------------------
 
@@ -1831,7 +1984,9 @@ class Store:
     def leaderboard(self) -> dict[str, Any]:
         with self._lock:
             rows = self._db.execute(
-                "SELECT c.*, e.amount, e.paid FROM champions c LEFT JOIN entitlements e "
+                "SELECT c.*, e.amount, e.paid, "
+                "(SELECT coalesce(sum(d.amount),0) FROM decay_payments d "
+                "WHERE d.champion_id=c.id) AS decay_paid FROM champions c LEFT JOIN entitlements e "
                 "ON e.champion_id=c.id AND e.lane='quality' ORDER BY c.id"
             ).fetchall()
         crowns = []
@@ -1847,6 +2002,16 @@ class Store:
                 total = totals.setdefault(row["hotkey"], {"entitlement": 0.0, "paid": 0.0})
                 total["entitlement"] += row["amount"] / ledger.UNITS
                 total["paid"] += row["paid"] / ledger.UNITS
+            if row["hotkey"]:
+                decay_paid = row["decay_paid"] / ledger.UNITS
+                entry["legacy_paid"] = (row["paid"] or 0) / ledger.UNITS
+                entry["decay_paid"] = decay_paid
+                entry["paid"] = entry["legacy_paid"] + decay_paid
+                entry.setdefault("outstanding", 0.0)
+                total = totals.setdefault(row["hotkey"], {"entitlement": 0.0, "paid": 0.0})
+                total["paid"] += decay_paid
+                total["decay_paid"] = total.get("decay_paid", 0.0) + decay_paid
+                total["outstanding"] = total.get("outstanding", 0.0) + entry["outstanding"]
             crowns.append(entry)
         return {"crowns": crowns, "hotkeys": totals}
 

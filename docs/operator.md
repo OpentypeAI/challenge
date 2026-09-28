@@ -258,6 +258,17 @@ digests.
 file. `Dockerfile` pins the Python, uv and vLLM images and the `structured_server.py`
 source and sha256. Changing any pin is a release.
 
+## 7b. Champion decay
+
+`PUT /v1/admin/rewards/decay {"epoch": n, "epoch_at": t}` (admin) schedules the switch from
+FIFO credits to champion decay (see mechanism §7): `n` past every served epoch, `t` a future
+Unix time. The switch happens in the same transaction as the first crown after `t` or the
+first request for epoch ≥ `n`. At that moment quality debt must be zero and no lane split
+scheduled; otherwise the schedule is cancelled with a reason, credits keep paying, and you
+schedule again once drained. `GET /v1/admin/rewards/decay` shows `active`, `pending`,
+`cancelled`. The active switch is permanent. Deploy the Cortex master that sends `epoch_at`
+first: without it every decay epoch is refused and the master postpones sealing.
+
 ## 8. Runtime lane
 
 Two lanes share the challenge's emission: **quality** 750 000 000 and **runtime**
@@ -272,22 +283,29 @@ From `n` on, quality debt, old debt included at its full amount, is repaid from 
 epoch. Check the Cortex emission mode before scheduling: nothing here changes the signed
 emission configuration.
 
+Public runtime intake requires a scheduled lane split, a valid calibration and an NVFP4
+quality champion; kernels also require their slot in `kernel_slots`. There is no independent
+public unpaid testing mode: zero credits do not bypass these gates or prevent runtime crowns.
+Credit rates and caps are operator policy, not pilot measurements. See the migration section
+below: the endpoint migrates only the base champion, never a mined BF16 champion.
+
 ### Calibration (required before any runtime submission)
 
 The runtime lane stays closed, and no timing is accepted, until you publish a calibration.
 Every threshold in it comes from your own pilot; this repository ships none.
 
-1. On the reference hardware (H200 first), run the worker with `--lane runtime` against a
+1. On B300 with NVFP4 weights, run the runtime worker through the sandbox controller against a
    staging container, reference against reference (stock options on both sides), with an
    explicit GPU budget. Nothing here launches it for you.
 2. Measure the B/B' drift and the block-to-block spread per cell; choose `max_drift`,
    `min_gain`, `blocks` and `bootstrap_resamples` so that a stock-vs-stock job is rejected.
 3. Publish `{"version", "profile", "cells", "blocks", "max_drift", "min_gain",
    "latency_tolerance", "fidelity_loss_tolerance", "fidelity_accuracy_tolerance",
-   "bootstrap_resamples", "credit_per_log_gain", "credit_cap"}`. `profile` must equal the
-   pinned serving profile (`runtime.PROFILE_FIXED`) plus the `gpu` and `driver` strings the
-   worker reads from `nvidia-smi` and the `vllm_version` it reads from the installed
-   package. The worker builds its profile from what it runs: `vllm_image` from
+   "divergence_tolerance", "bootstrap_resamples", "credit_per_log_gain", "credit_cap",
+   "kernel_slots"}`. `profile` must contain exactly `runtime.PROFILE_FIXED`, an allowlisted
+   `moe_backend`, and the measured `gpu`, `driver`, `vllm_version` and `compute_cap` strings.
+   Fixed fields must match their pinned values. The worker builds its profile from what it
+   runs: `vllm_image` from
    `/opt/opentype/build.json` (written by the Dockerfile's worker stage from its
    `VLLM_IMAGE` build argument), the installed vllm version, the reader's sha256 and its
    own dtype, canvas and length flags. It refuses a job (infrastructure retry) when any of

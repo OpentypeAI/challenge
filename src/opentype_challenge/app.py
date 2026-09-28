@@ -159,6 +159,11 @@ class Pause(Strict):
     paused: bool
 
 
+class RewardDecay(Strict):
+    epoch: int = Field(ge=0, lt=2**63, strict=True)
+    epoch_at: int = Field(ge=0, lt=2**63, strict=True)
+
+
 @dataclass
 class Config:
     slug: str
@@ -470,11 +475,12 @@ def create_app(
         epoch: Annotated[int, Query(ge=0, lt=2**64)],
         authorization: Annotated[str | None, Header()] = None,
         x_platform_challenge_slug: Annotated[str | None, Header()] = None,
+        epoch_at: Annotated[int | None, Query(ge=0, lt=2**63)] = None,
     ) -> Response:
         _require(config.internal_token_file, authorization)
         if x_platform_challenge_slug != config.slug:
             raise StoreError(403, "challenge slug mismatch")
-        text = await run(store.weights, epoch, config.slug)
+        text = await run(store.weights, epoch, config.slug, epoch_at)
         return Response(text, media_type="application/json")
 
     # -- public -----------------------------------------------------------------
@@ -714,6 +720,23 @@ def create_app(
         except runtime.RuntimeError_ as error:
             raise StoreError(422, str(error)) from None
         return {"calibration": published}
+
+    @app.get("/v1/admin/rewards/decay")
+    async def reward_decay_status(
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        admin(authorization)
+        return await run(store.reward_decay_status)
+
+    @app.put("/v1/admin/rewards/decay")
+    async def reward_decay(
+        request: Request,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        admin(authorization)
+        item: RewardDecay = await body(request, SUBMIT_BODY_MAX, RewardDecay)
+        await run(store.set_reward_decay, item.epoch, item.epoch_at)
+        return await run(store.reward_decay_status)
 
     @app.put("/v1/admin/lanes")
     async def lanes(

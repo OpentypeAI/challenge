@@ -18,7 +18,7 @@ from opentype_challenge import crypto, harness, ledger, runtime, tracks, worker
 from opentype_challenge.crypto import manifest_digest
 from opentype_challenge.miner import signed_runtime_submission, signed_submission
 from opentype_challenge.runtime import Calibration, Fidelity
-from opentype_challenge.store import Settings, Store, StoreError
+from opentype_challenge.store import SCHEMA_VERSION, Settings, Store, StoreError
 
 from .conftest import ADMIN, SLUG, WORKER, Clock, Miner, bearer, weights_manifest
 from .fake_inference import answer, blur, chat_reply
@@ -339,7 +339,7 @@ def test_v2_migrates_to_v3_preserving_debt_and_epochs(tmp_path):
     )
     db.close()
     migrated = store_of(tmp_path)
-    assert migrated._db.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert migrated._db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert {r[0] for r in migrated._db.execute("SELECT lane FROM entitlements")} == {"quality"}
     assert migrated.weights(1, SLUG) == first  # byte-identical replay
     assert body(migrated, 2)["weights"] == {"5A": 0.5}  # the debt survived
@@ -384,7 +384,7 @@ def test_a_v3_file_restamped_v2_by_an_older_binary_migrates(tmp_path):
     db.execute("PRAGMA user_version=2")
     db.close()
     again = store_of(tmp_path)
-    assert again._db.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert again._db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert again.weights(1, SLUG) == first
     assert {r[0] for r in again._db.execute("SELECT lane FROM entitlements")} == {"runtime"}
     assert again.runtime_status()["open"]
