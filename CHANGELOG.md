@@ -6,8 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-09-28
+
 ### Added
 
+- Champion decay replaces FIFO credits once scheduled: the certified champion reigning at
+  the epoch's chain time earns 100 % for 36 h, then a continuous 36 h half-life (50 % at
+  72 h, 25 % at 108 h); the rest burns. A new certified crown restarts at 100 %.
+  `PUT /v1/admin/rewards/decay {"epoch", "epoch_at"}` schedules it; the switch needs zero
+  quality debt at the cutoff and otherwise cancels with a reason. `get_weights` takes
+  `epoch_at` (chain seconds), required for decay epochs. Quality only; exclusive with the
+  lane split. Caps stay cumulative. `GET /v1/admin/rewards/decay` reports the state.
 - Two lanes in one challenge: quality (75 %) and runtime (25 %), with separate queues,
   champions, credits and FIFO. An unused lane burns its share. `PUT /v1/admin/lanes`
   schedules the split from a future epoch; earlier epochs replay unchanged.
@@ -19,6 +28,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- State schema v4 (adds `decay_payments`). Older binaries cannot open it.
 - State schema v3, migrated in place in one transaction that adds only missing columns
   (safe on a v3 file re-stamped v2 by an older binary); existing rows become quality.
   Older binaries cannot open a v3 file.

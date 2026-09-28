@@ -214,6 +214,19 @@ Amounts are integers in units of 1e-9 epoch-mass. The body of each epoch is pers
 replayed byte for byte. An entitlement survives dethronement. The base model is never paid.
 Splitting a gain into several crowns pays no more. It pays the LCB haircut at every step.
 
+### Champion decay (replaces the ledger once scheduled)
+
+```
+epoch e, chain time t_e (Timestamp.Now at the epoch's end block, sent by the master)
+champion c = latest certified miner crown with crowned_at ≤ t_e
+paid(e)    = floor(1e9 × 2^(-max(0, t_e − crowned_at − 36 h) / 36 h)) units; the rest burns
+```
+
+Full reward for 36 h, then a continuous half-life of 36 h: 50 % at 72 h, 25 % at 108 h. A new
+certified crown restarts at 100 %; the base model, an admin replacement or a restart never
+does. The empty-bank and window caps stay cumulative over credits and decay. Crowns after the
+switch mint no credit. Quality only: decay and the runtime lane split are mutually exclusive.
+
 ## 8. Anti-cheat
 
 | Attack | Defence |

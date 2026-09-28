@@ -21,6 +21,7 @@ from opentype_challenge.store import (
     JUDGE_DEADLINE_SECONDS,
     LEASE_SECONDS,
     PAGE_BYTES,
+    SCHEMA_VERSION,
     Settings,
     Store,
     judge_order,
@@ -479,7 +480,7 @@ def test_a_v1_database_migrates_in_place(tmp_path):
 
     store = store_of(tmp_path)
     version = store._db.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 3
+    assert version == SCHEMA_VERSION
     assert {r[0] for r in store._db.execute("SELECT track FROM results")} == {"decisions"}
     assert store.submission("s_1")["job"]["paired"] == 2
     assert store.window(2)["bank_digest"] == EMPTY_BANK.digest

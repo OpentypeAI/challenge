@@ -40,7 +40,7 @@ Liveness. Needs no state and no secrets.
 Readiness only: `200 {"ok": true}` when the state volume is writable and the internal
 token is readable, otherwise `503 {"ok": false}`.
 
-### `GET /internal/v1/get_weights?epoch=<u64>`
+### `GET /internal/v1/get_weights?epoch=<u64>[&epoch_at=<unix seconds>]`
 
 Headers: `Authorization: Bearer <internal.token>` (`401`) and
 `X-Platform-Challenge-Slug: opentype` (`403`). The master can reach this route only on the
@@ -62,6 +62,11 @@ private network.
 
 The first call for an epoch pays outstanding entitlements first in, first out, up to 1.0
 and persists the body. Every later call returns the same bytes.
+
+Once champion decay is active, `epoch_at` (the chain time at the epoch's end block) is
+required for a new epoch (`422` without it or in the future) and the body carries
+`metadata.policy = "champion_decay"`, `epoch_at`, `champion`, `crowned_at`, `paid`, `burned`.
+A frozen epoch replays its bytes whatever `epoch_at` says.
 
 ## Public
 

@@ -258,6 +258,17 @@ digests.
 file. `Dockerfile` pins the Python, uv and vLLM images and the `structured_server.py`
 source and sha256. Changing any pin is a release.
 
+## 7b. Champion decay
+
+`PUT /v1/admin/rewards/decay {"epoch": n, "epoch_at": t}` (admin) schedules the switch from
+FIFO credits to champion decay (see mechanism §7): `n` past every served epoch, `t` a future
+Unix time. The switch happens in the same transaction as the first crown after `t` or the
+first request for epoch ≥ `n`. At that moment quality debt must be zero and no lane split
+scheduled; otherwise the schedule is cancelled with a reason, credits keep paying, and you
+schedule again once drained. `GET /v1/admin/rewards/decay` shows `active`, `pending`,
+`cancelled`. The active switch is permanent. Deploy the Cortex master that sends `epoch_at`
+first: without it every decay epoch is refused and the master postpones sealing.
+
 ## 8. Runtime lane
 
 Two lanes share the challenge's emission: **quality** 750 000 000 and **runtime**
